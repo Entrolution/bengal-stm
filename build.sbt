@@ -1,5 +1,7 @@
 ThisBuild / tlBaseVersion := "0.9"
 
+ThisBuild / githubWorkflowJavaVersions := Seq(JavaSpec.temurin("21"))
+
 ThisBuild / organization     := "ai.entrolution"
 ThisBuild / organizationName := "Greg von Nessi"
 ThisBuild / startYear        := Some(2023)

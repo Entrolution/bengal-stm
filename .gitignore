@@ -1,4 +1,5 @@
 target
+.claude/
 /*/*.iml
 /.idea
 /.idea_modules
