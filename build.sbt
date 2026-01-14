@@ -1,5 +1,8 @@
 ThisBuild / tlBaseVersion := "0.9"
 
+// Only publish on tagged releases, not snapshots on main
+ThisBuild / tlCiReleaseBranches := Seq()
+
 ThisBuild / githubWorkflowJavaVersions := Seq(JavaSpec.temurin("21"))
 
 ThisBuild / organization     := "ai.entrolution"
