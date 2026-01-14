@@ -1,8 +1,8 @@
-<img align="right" src="https://github.com/gvonness/bengal-stm/blob/main/docs/assets/logo.svg?raw=true" height="200px" style="padding-left: 20px"/>
+<img align="right" src="https://github.com/gvonness-apolitical/bengal-stm/blob/main/docs/assets/logo.svg?raw=true" height="200px" style="padding-left: 20px"/>
 
 # Bengal STM
 
-[![Build Status](https://github.com/gvonness/bengal-stm/actions/workflows/ci.yml/badge.svg)](https://github.com/gvonness/bengal-stm/actions/workflows/ci.yml)
+[![Build Status](https://github.com/gvonness-apolitical/bengal-stm/actions/workflows/ci.yml/badge.svg)](https://github.com/gvonness-apolitical/bengal-stm/actions/workflows/ci.yml)
 [![Maven Central](https://img.shields.io/maven-central/v/ai.entrolution/bengal-stm_2.13)](https://maven-badges.herokuapp.com/maven-central/ai.entrolution/bengal-stm_2.13)
 [![Scala](https://img.shields.io/badge/Scala-2.13-red.svg)](https://www.scala-lang.org/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
