@@ -1,5 +1,3 @@
-<img align="right" src="https://github.com/gvonness-apolitical/bengal-stm/blob/main/docs/assets/logo.svg?raw=true" height="200px" style="padding-left: 20px"/>
-
 # Bengal STM
 
 [![Build Status](https://github.com/gvonness-apolitical/bengal-stm/actions/workflows/ci.yml/badge.svg)](https://github.com/gvonness-apolitical/bengal-stm/actions/workflows/ci.yml)
