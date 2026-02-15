@@ -1,4 +1,4 @@
-ThisBuild / tlBaseVersion := "0.9"
+ThisBuild / tlBaseVersion := "0.10"
 
 // Only publish on tagged releases, not snapshots on main
 ThisBuild / tlCiReleaseBranches := Seq()

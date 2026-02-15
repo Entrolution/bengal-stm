@@ -32,9 +32,7 @@ case class TxnVarMap[F[_]: STM: Async, K, V](
   private[stm] val id: TxnVarId,
   protected val value: Ref[F, VarIndex[F, K, V]],
   private[stm] val commitLock: Semaphore[F],
-  private val internalStructureLock: Semaphore[F],
-  // TODO: Unused — remove in next binary-breaking version bump (changes case class shape)
-  private val internalSignalLock: Semaphore[F]
+  private val internalStructureLock: Semaphore[F]
 ) extends TxnStateEntity[F, VarIndex[F, K, V]] {
 
   private def withLock[A](semaphore: Semaphore[F])(fa: F[A]): F[A] = semaphore.permit.use(_ => fa)
@@ -116,6 +114,5 @@ object TxnVarMap {
       valuesRef             <- Async[F].ref(MutableMap(values: _*))
       lock                  <- Semaphore[F](1)
       internalStructureLock <- Semaphore[F](1)
-      internalSignalLock    <- Semaphore[F](1)
-    } yield TxnVarMap(id, valuesRef, lock, internalStructureLock, internalSignalLock)
+    } yield TxnVarMap(id, valuesRef, lock, internalStructureLock)
 }
