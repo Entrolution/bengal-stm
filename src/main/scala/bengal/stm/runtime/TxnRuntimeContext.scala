@@ -26,6 +26,7 @@ import cats.effect.std.Semaphore
 import cats.effect.{ Deferred, Ref }
 import cats.syntax.all._
 
+import scala.collection.concurrent.TrieMap
 import scala.collection.mutable.{ Map => MutableMap }
 
 private[stm] trait TxnRuntimeContext[F[_]] {
@@ -58,133 +59,135 @@ private[stm] trait TxnRuntimeContext[F[_]] {
     override val toString: String = "TxnScheduler"
 
     def checkRetryQueue(idFootprint: IdFootprint): F[Unit] =
-      for {
-        _ <- retrySemaphore.acquire
-        triggeredFootprints <-
-          retryMap.keys.toList
-            .parTraverse { waitingFootprint =>
-              Async[F].ifM(
-                Async[F].delay(
-                  !idFootprint.isCompatibleWith(waitingFootprint)
+      retrySemaphore.permit.use { _ =>
+        for {
+          triggeredFootprints <-
+            retryMap.keys.toList
+              .parTraverse { waitingFootprint =>
+                Async[F].ifM(
+                  Async[F].delay(
+                    !idFootprint.isCompatibleWith(waitingFootprint)
+                  )
+                )(
+                  retryMap(waitingFootprint) >> Async[F].pure(
+                    Option(waitingFootprint)
+                  ),
+                  Async[F].pure(None.asInstanceOf[Option[IdFootprint]])
                 )
-              )(
-                retryMap(waitingFootprint) >> Async[F].pure(
-                  Option(waitingFootprint)
-                ),
-                Async[F].pure(None.asInstanceOf[Option[IdFootprint]])
-              )
-            }
-            .map(_.flatten)
-        _ <- triggeredFootprints.traverse(footprint => Async[F].delay(retryMap.remove(footprint)))
-        _ <- retrySemaphore.release
-      } yield ()
+              }
+              .map(_.flatten)
+          _ <- triggeredFootprints.traverse(footprint => Async[F].delay(retryMap.remove(footprint)))
+        } yield ()
+      }
 
     def submitTxnForRetry(analysedTxn: AnalysedTxn[_]): F[Unit] =
-      for {
-        _         <- retrySemaphore.acquire
-        footprint <- Async[F].delay(analysedTxn.idFootprint)
-        execSpec  <- Async[F].delay(retryMap.get(footprint))
-        _ <- Async[F].delay(execSpec match {
-               case Some(spec) =>
-                 retryMap.update(footprint, spec >> submitTxn(analysedTxn).start.void)
-               case None =>
-                 retryMap.addOne(footprint -> submitTxn(analysedTxn).start.void)
-             })
-        _ <- retrySemaphore.release
-      } yield ()
+      retrySemaphore.permit.use { _ =>
+        for {
+          footprint <- Async[F].delay(analysedTxn.idFootprint)
+          execSpec  <- Async[F].delay(retryMap.get(footprint))
+          _ <- Async[F].delay(execSpec match {
+                 case Some(spec) =>
+                   retryMap.update(footprint, spec >> submitTxn(analysedTxn).start.void)
+                 case None =>
+                   retryMap.addOne(footprint -> submitTxn(analysedTxn).start.void)
+               })
+        } yield ()
+      }
 
     def submitTxnForImmediateRetry(analysedTxn: AnalysedTxn[_]): F[Unit] =
       for {
         _ <- analysedTxn.resetDependencyTally
-        _ <- graphBuilderSemaphore.acquire
-        testAndLink <- activeTransactions.values.toList.parTraverse { aTxn =>
-                         (for {
-                           status <- aTxn.executionStatus.get
-                           _ <- status match {
-                                  case Running =>
-                                    Async[F].ifM(
-                                      Async[F].delay(
-                                        analysedTxn.idFootprint
-                                          .isCompatibleWith(
-                                            aTxn.idFootprint
-                                          )
-                                      )
-                                    )(
-                                      Async[F].unit,
-                                      aTxn.subscribeDownstreamDependency(
-                                        analysedTxn
-                                      )
-                                    )
-                                  case Scheduled =>
-                                    Async[F].ifM(
-                                      Async[F].delay(
-                                        analysedTxn.idFootprint
-                                          .isCompatibleWith(
-                                            aTxn.idFootprint
-                                          )
-                                      )
-                                    )(
-                                      Async[F].unit,
-                                      analysedTxn.subscribeDownstreamDependency(
-                                        aTxn
-                                      )
-                                    )
-                                  case _ =>
-                                    Async[F].unit
+        _ <- graphBuilderSemaphore.permit.use { _ =>
+               for {
+                 testAndLink <- activeTransactions.values.toList.parTraverse { aTxn =>
+                                  (for {
+                                    status <- aTxn.executionStatus.get
+                                    _ <- status match {
+                                           case Running =>
+                                             Async[F].ifM(
+                                               Async[F].delay(
+                                                 analysedTxn.idFootprint
+                                                   .isCompatibleWith(
+                                                     aTxn.idFootprint
+                                                   )
+                                               )
+                                             )(
+                                               Async[F].unit,
+                                               aTxn.subscribeDownstreamDependency(
+                                                 analysedTxn
+                                               )
+                                             )
+                                           case Scheduled =>
+                                             Async[F].ifM(
+                                               Async[F].delay(
+                                                 analysedTxn.idFootprint
+                                                   .isCompatibleWith(
+                                                     aTxn.idFootprint
+                                                   )
+                                               )
+                                             )(
+                                               Async[F].unit,
+                                               analysedTxn.subscribeDownstreamDependency(
+                                                 aTxn
+                                               )
+                                             )
+                                           case _ =>
+                                             Async[F].unit
+                                         }
+                                  } yield ()).start
                                 }
-                         } yield ()).start
-                       }
-        _ <- analysedTxn.executionStatus.set(Scheduled)
-        _ <-
-          Async[F].delay(
-            activeTransactions.addOne(analysedTxn.id -> analysedTxn)
-          )
-        _ <- testAndLink.parTraverse(_.joinWithNever)
-        _ <- analysedTxn.checkExecutionReadiness
-        _ <- graphBuilderSemaphore.release
+                 _ <- analysedTxn.executionStatus.set(Scheduled)
+                 _ <-
+                   Async[F].delay(
+                     activeTransactions.addOne(analysedTxn.id -> analysedTxn)
+                   )
+                 _ <- testAndLink.parTraverse(_.joinWithNever)
+                 _ <- analysedTxn.checkExecutionReadiness
+               } yield ()
+             }
         _ <- checkRetryQueue(analysedTxn.idFootprint).start
       } yield ()
 
     def submitTxn(analysedTxn: AnalysedTxn[_]): F[Unit] =
       for {
         _ <- analysedTxn.resetDependencyTally
-        _ <- graphBuilderSemaphore.acquire
-        testAndLink <- activeTransactions.values.toList.parTraverse { aTxn =>
-                         Async[F]
-                           .ifM(
-                             Async[F].delay(
-                               analysedTxn.idFootprint.isCompatibleWith(
-                                 aTxn.idFootprint
-                               )
-                             )
-                           )(Async[F].unit, aTxn.subscribeDownstreamDependency(analysedTxn))
-                           .start
-                       }
-        _ <- analysedTxn.executionStatus.set(Scheduled)
-        _ <-
-          Async[F].delay(
-            activeTransactions.addOne(analysedTxn.id -> analysedTxn)
-          )
-        _ <- testAndLink.parTraverse(_.joinWithNever)
-        _ <- analysedTxn.checkExecutionReadiness
-        _ <- graphBuilderSemaphore.release
+        _ <- graphBuilderSemaphore.permit.use { _ =>
+               for {
+                 testAndLink <- activeTransactions.values.toList.parTraverse { aTxn =>
+                                  Async[F]
+                                    .ifM(
+                                      Async[F].delay(
+                                        analysedTxn.idFootprint.isCompatibleWith(
+                                          aTxn.idFootprint
+                                        )
+                                      )
+                                    )(Async[F].unit, aTxn.subscribeDownstreamDependency(analysedTxn))
+                                    .start
+                                }
+                 _ <- analysedTxn.executionStatus.set(Scheduled)
+                 _ <-
+                   Async[F].delay(
+                     activeTransactions.addOne(analysedTxn.id -> analysedTxn)
+                   )
+                 _ <- testAndLink.parTraverse(_.joinWithNever)
+                 _ <- analysedTxn.checkExecutionReadiness
+               } yield ()
+             }
         _ <- checkRetryQueue(analysedTxn.idFootprint).start
       } yield ()
 
     def registerCompletion(analysedTxn: AnalysedTxn[_]): F[Unit] =
       for {
-        _ <- graphBuilderSemaphore.acquire
-        _ <- Async[F].delay(activeTransactions.remove(analysedTxn.id))
-        _ <- graphBuilderSemaphore.release
+        _ <- graphBuilderSemaphore.permit.use { _ =>
+               Async[F].delay(activeTransactions.remove(analysedTxn.id))
+             }
         _ <- analysedTxn.triggerUnsub.start
       } yield ()
 
     def registerRunning(analysedTxn: AnalysedTxn[_]): F[Unit] =
-      for {
-        _ <- graphBuilderSemaphore.acquire
-        _ <- Async[F].delay(analysedTxn.executionStatus.set(Running))
-        _ <- graphBuilderSemaphore.release
-      } yield ()
+      graphBuilderSemaphore.permit.use { _ =>
+        analysedTxn.executionStatus.set(Running)
+      }
   }
 
   private[stm] object TxnScheduler {
@@ -194,10 +197,10 @@ private[stm] trait TxnRuntimeContext[F[_]] {
       retrySemaphore: Semaphore[F]
     ): TxnScheduler =
       TxnScheduler(
-        activeTransactions    = MutableMap(),
+        activeTransactions    = TrieMap(),
         graphBuilderSemaphore = graphBuilderSemaphore,
         retrySemaphore        = retrySemaphore,
-        retryMap              = MutableMap()
+        retryMap              = TrieMap()
       )
 
   }
@@ -388,7 +391,7 @@ private[stm] trait TxnRuntimeContext[F[_]] {
               idFootprint      = staticAnalysisResult._1.getValidated,
               completionSignal = completionSignal,
               dependencyTally  = dependencyTally,
-              unsubSpecs       = MutableMap(),
+              unsubSpecs       = TrieMap(),
               executionStatus  = executionStatus,
               hasDownstream    = hasDownstream,
               scheduler        = scheduler
