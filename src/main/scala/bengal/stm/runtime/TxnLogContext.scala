@@ -1183,9 +1183,9 @@ private[stm] trait TxnLogContext[F[_]] {
 
     override private[stm] def withLock[A](fa: F[A]): F[A] =
       for {
-        locks <- log.values.toList.parTraverse(_.lock)
+        locks <- log.toList.sortBy(_._1.value).traverse(_._2.lock)
         result <-
-          locks.toSet.flatten
+          locks.flatten.distinct
             .foldLeft(Resource.eval(Async[F].unit))((i, j) => i >> j.permit)
             .use(_ => fa)
       } yield result
