@@ -41,6 +41,10 @@ private[stm] trait TxnCompilerContext[F[_]] {
     idFootprint: IdFootprint
   ) extends RuntimeException
 
+  // @nowarn on FunctionK.apply: The compiler cannot verify exhaustive pattern matching
+  // on TxnOrErr[V] (= Either[TxnErratum, TxnAdt[F, V]]) due to type erasure. The match
+  // is exhaustive in practice — all TxnAdt and TxnErratum cases are covered, with a
+  // fallback wildcard for safety.
   private[stm] def staticAnalysisCompiler: FunctionK[TxnOrErr, IdFootprintStore] =
     new (FunctionK[TxnOrErr, IdFootprintStore]) {
 

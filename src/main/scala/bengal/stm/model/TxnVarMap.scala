@@ -33,6 +33,7 @@ case class TxnVarMap[F[_]: STM: Async, K, V](
   protected val value: Ref[F, VarIndex[F, K, V]],
   private[stm] val commitLock: Semaphore[F],
   private val internalStructureLock: Semaphore[F],
+  // TODO: Unused — remove in next binary-breaking version bump (changes case class shape)
   private val internalSignalLock: Semaphore[F]
 ) extends TxnStateEntity[F, VarIndex[F, K, V]] {
 

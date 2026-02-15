@@ -291,6 +291,11 @@ private[stm] trait TxnLogContext[F[_]] {
 
     private[stm] def getVar[V](txnVar: TxnVar[F, V]): F[(TxnLog, V)]
 
+    // @nowarn on base TxnLog methods: These are no-op defaults that intentionally ignore
+    // their parameters (returning Unit cast to V, empty maps, or self unchanged). They exist
+    // so that terminal log states (TxnLogRetry, TxnLogError) inherit safe defaults without
+    // reimplementing every method. TxnLogValid overrides all of these with real logic.
+    // The compiler warns about unused parameters, which is expected and correct here.
     @nowarn
     private[stm] def delay[V](value: F[V]): F[(TxnLog, V)] =
       Async[F].delay(self, ().asInstanceOf[V])
@@ -369,7 +374,7 @@ private[stm] trait TxnLogContext[F[_]] {
 
     import TxnLogValid._
 
-    @nowarn
+    @nowarn // Type erasure: V in (TxnLog, V) cannot be verified at runtime
     override private[stm] def delay[V](
       value: F[V]
     ): F[(TxnLog, V)] =

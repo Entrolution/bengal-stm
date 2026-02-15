@@ -6,7 +6,7 @@ If you discover a security vulnerability in Bengal STM, please report it respons
 
 **Please do not report security vulnerabilities through public GitHub issues.**
 
-Instead, please send an email describing the vulnerability. You should receive a response within 48 hours acknowledging receipt of your report.
+Instead, please send an email to **greg.vonnessi@entrolution.ai** describing the vulnerability. You should receive a response within 48 hours acknowledging receipt of your report.
 
 Please include the following information in your report:
 
