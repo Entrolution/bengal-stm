@@ -2,7 +2,8 @@
 
 [![Build Status](https://github.com/gvonness-apolitical/bengal-stm/actions/workflows/ci.yml/badge.svg)](https://github.com/gvonness-apolitical/bengal-stm/actions/workflows/ci.yml)
 [![Maven Central](https://img.shields.io/maven-central/v/ai.entrolution/bengal-stm_2.13)](https://maven-badges.herokuapp.com/maven-central/ai.entrolution/bengal-stm_2.13)
-[![Scala](https://img.shields.io/badge/Scala-2.13-red.svg)](https://www.scala-lang.org/)
+[![Scala 2.13](https://img.shields.io/badge/Scala-2.13-red.svg)](https://www.scala-lang.org/)
+[![Scala 3](https://img.shields.io/badge/Scala-3-red.svg)](https://www.scala-lang.org/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
 Software Transactional Memory for [Cats Effect](https://typelevel.org/cats-effect/) with intelligent scheduling.
@@ -20,7 +21,7 @@ Bengal STM is a library for writing composable concurrency operations based on i
 ## Requirements
 
 - **Java**: 21 or later
-- **Scala**: 2.13.x
+- **Scala**: 2.13.x or 3.x
 
 ## Installation
 
@@ -42,13 +43,14 @@ import cats.effect.{IO, IOApp}
 
 object QuickStart extends IOApp.Simple {
   def run: IO[Unit] =
-    for {
-      stm     <- STM.runtime[IO]
-      counter <- stm.TxnVar.of(0)
-      _       <- counter.modify(_ + 1).commit(stm)
-      value   <- counter.get.commit(stm)
-      _       <- IO.println(s"Counter: $value")
-    } yield ()
+    STM.runtime[IO].flatMap { implicit stm =>
+      for {
+        counter <- TxnVar.of(0)
+        _       <- counter.modify(_ + 1).commit
+        value   <- counter.get.commit
+        _       <- IO.println(s"Counter: $value")
+      } yield ()
+    }
 }
 ```
 
@@ -139,22 +141,21 @@ object BankTransfer extends IOApp.Simple {
         _ <- IO.println(accounts.toList.map { case (k, v) => s"$k: $v" }.mkString(", "))
       } yield ()
 
-    for {
-      implicit0(stm: STM[IO]) <- STM.runtime[IO]
-      bankOpen                <- TxnVar.of(false)
-      accounts                <- TxnVarMap.of[IO, String, Int](Map())
-      _                       <- createAccount("David", 100, accounts)
-      _                       <- createAccount("Sasha", 0, accounts)
-      _                       <- printAccounts(accounts)
-      _                       <- openBank(bankOpen).start
-      _                       <- transferFunds(accounts, bankOpen, "Sasha", "David", 100)
-      _                       <- printAccounts(accounts)
-    } yield ()
+    STM.runtime[IO].flatMap { implicit stm =>
+      for {
+        bankOpen <- TxnVar.of(false)
+        accounts <- TxnVarMap.of[IO, String, Int](Map())
+        _        <- createAccount("David", 100, accounts)
+        _        <- createAccount("Sasha", 0, accounts)
+        _        <- printAccounts(accounts)
+        _        <- openBank(bankOpen).start
+        _        <- transferFunds(accounts, bankOpen, "Sasha", "David", 100)
+        _        <- printAccounts(accounts)
+      } yield ()
+    }
   }
 }
 ```
-
-Note: The example uses the [better-monadic-for](https://github.com/oleg-py/better-monadic-for) compiler plugin to expose the STM runtime as an implicit in the for-comprehension.
 
 ## Background
 
@@ -183,6 +184,13 @@ Additionally, Bengal treats `Map` as a fundamental transactional data structure 
 ### Why 'Bengal'?
 
 Bengals are a very playful and active cat breed. The name fits a library built on Cats.
+
+## Support
+
+If you find Bengal STM useful, consider supporting its development:
+
+- [GitHub Sponsors](https://github.com/sponsors/gvonness-apolitical)
+- [Patreon](https://www.patreon.com/Entrolution)
 
 ## Contributing
 
