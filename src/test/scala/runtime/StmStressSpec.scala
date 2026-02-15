@@ -61,51 +61,71 @@ class StmStressSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
     } yield v
 
   "counter with 100 concurrent writers" in {
-    (for {
-      case implicit0(stm: STM[IO]) <- STM.runtime[IO]
-      counter <- TxnVar.of(0)
-      _       <- (1 to 100).toList.parTraverse_(_ => counter.modify(_ + 1).commit)
-      result  <- counter.get.commit
-    } yield result).timeout(30.seconds).asserting(_ shouldBe 100)
+    STM
+      .runtime[IO]
+      .flatMap { implicit stm =>
+        for {
+          counter <- TxnVar.of(0)
+          _       <- (1 to 100).toList.parTraverse_(_ => counter.modify(_ + 1).commit)
+          result  <- counter.get.commit
+        } yield result
+      }
+      .timeout(30.seconds)
+      .asserting(_ shouldBe 100)
   }
 
   "account transfer with 100 concurrent transfers" in {
-    (for {
-      case implicit0(stm: STM[IO]) <- STM.runtime[IO]
-      accountA <- TxnVar.of(1000)
-      accountB <- TxnVar.of(1000)
-      _ <- (1 to 100).toList.parTraverse_ { i =>
-             if (i <= 50) transfer(accountA, accountB).commit
-             else transfer(accountB, accountA).commit
-           }
-      a <- accountA.get.commit
-      b <- accountB.get.commit
-    } yield a + b).timeout(30.seconds).asserting(_ shouldBe 2000)
+    STM
+      .runtime[IO]
+      .flatMap { implicit stm =>
+        for {
+          accountA <- TxnVar.of(1000)
+          accountB <- TxnVar.of(1000)
+          _ <- (1 to 100).toList.parTraverse_ { i =>
+                 if (i <= 50) transfer(accountA, accountB).commit
+                 else transfer(accountB, accountA).commit
+               }
+          a <- accountA.get.commit
+          b <- accountB.get.commit
+        } yield a + b
+      }
+      .timeout(30.seconds)
+      .asserting(_ shouldBe 2000)
   }
 
   "map contention with 20 concurrent writers" in {
     val keys       = List("k1", "k2", "k3", "k4", "k5")
     val initialMap = keys.map(_ -> 0).toMap
 
-    (for {
-      case implicit0(stm: STM[IO]) <- STM.runtime[IO]
-      tVarMap <- TxnVarMap.of(initialMap)
-      _       <- (1 to 20).toList.parTraverse_(_ => incrementAllKeys(tVarMap, keys).commit)
-      result  <- tVarMap.get.commit
-    } yield result).timeout(30.seconds).asserting(_ shouldBe keys.map(_ -> 20).toMap)
+    STM
+      .runtime[IO]
+      .flatMap { implicit stm =>
+        for {
+          tVarMap <- TxnVarMap.of(initialMap)
+          _       <- (1 to 20).toList.parTraverse_(_ => incrementAllKeys(tVarMap, keys).commit)
+          result  <- tVarMap.get.commit
+        } yield result
+      }
+      .timeout(30.seconds)
+      .asserting(_ shouldBe keys.map(_ -> 20).toMap)
   }
 
   "waitFor under contention" in {
-    (for {
-      case implicit0(stm: STM[IO]) <- STM.runtime[IO]
-      counter     <- TxnVar.of(0)
-      writerFiber <- (1 to 10).toList.traverse_(_ => counter.modify(_ + 1).commit).start
-      readers     <- (1 to 10).toList.parTraverse(_ => readWaitFor(counter, 10).commit)
-      _           <- writerFiber.joinWithNever
-      result      <- counter.get.commit
-    } yield (result, readers)).timeout(30.seconds).asserting { case (finalValue, readerResults) =>
-      finalValue shouldBe 10
-      readerResults shouldBe List.fill(10)(10)
-    }
+    STM
+      .runtime[IO]
+      .flatMap { implicit stm =>
+        for {
+          counter     <- TxnVar.of(0)
+          writerFiber <- (1 to 10).toList.traverse_(_ => counter.modify(_ + 1).commit).start
+          readers     <- (1 to 10).toList.parTraverse(_ => readWaitFor(counter, 10).commit)
+          _           <- writerFiber.joinWithNever
+          result      <- counter.get.commit
+        } yield (result, readers)
+      }
+      .timeout(30.seconds)
+      .asserting { case (finalValue, readerResults) =>
+        finalValue shouldBe 10
+        readerResults shouldBe List.fill(10)(10)
+      }
   }
 }

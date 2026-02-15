@@ -29,33 +29,45 @@ import org.scalatest.matchers.should.Matchers
 class TxnVarSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
   "TxnVar.get" - {
     "return the value of a transactional variable" in {
-      (for {
-        case implicit0(stm: STM[IO]) <- STM.runtime[IO]
-        tVar   <- TxnVar.of(123)
-        result <- tVar.get.commit
-      } yield result).asserting(_ shouldBe 123)
+      STM
+        .runtime[IO]
+        .flatMap { implicit stm =>
+          for {
+            tVar   <- TxnVar.of(123)
+            result <- tVar.get.commit
+          } yield result
+        }
+        .asserting(_ shouldBe 123)
     }
   }
 
   "TxnVar.set" - {
     "update the value of a transactional variable" in {
-      (for {
-        case implicit0(stm: STM[IO]) <- STM.runtime[IO]
-        tVar   <- TxnVar.of(123)
-        _      <- tVar.set(2718).commit
-        result <- tVar.get.commit
-      } yield result).asserting(_ shouldBe 2718)
+      STM
+        .runtime[IO]
+        .flatMap { implicit stm =>
+          for {
+            tVar   <- TxnVar.of(123)
+            _      <- tVar.set(2718).commit
+            result <- tVar.get.commit
+          } yield result
+        }
+        .asserting(_ shouldBe 2718)
     }
   }
 
   "TxnVar.modify" - {
     "modify the value of a transactional variable" in {
-      (for {
-        case implicit0(stm: STM[IO]) <- STM.runtime[IO]
-        tVar   <- TxnVar.of("foo")
-        _      <- tVar.modify(_ + "bar").commit
-        result <- tVar.get.commit
-      } yield result).asserting(_ shouldBe "foobar")
+      STM
+        .runtime[IO]
+        .flatMap { implicit stm =>
+          for {
+            tVar   <- TxnVar.of("foo")
+            _      <- tVar.modify(_ + "bar").commit
+            result <- tVar.get.commit
+          } yield result
+        }
+        .asserting(_ shouldBe "foobar")
     }
   }
 }

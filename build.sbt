@@ -1,4 +1,6 @@
-ThisBuild / tlBaseVersion := "0.10"
+ThisBuild / tlBaseVersion := "0.11"
+
+ThisBuild / tlVersionIntroduced := Map("3" -> "0.11.0")
 
 // Only publish on tagged releases, not snapshots on main
 ThisBuild / tlCiReleaseBranches := Seq()
@@ -15,25 +17,30 @@ ThisBuild / developers ++= List(
 
 ThisBuild / scalaVersion := DependencyVersions.scala2p13Version
 ThisBuild / crossScalaVersions := Seq(
-  DependencyVersions.scala2p13Version
+  DependencyVersions.scala2p13Version,
+  DependencyVersions.scala3Version
 )
 
 Global / idePackagePrefix := Some("ai.entrolution")
 Global / excludeLintKeys += idePackagePrefix
 
 lazy val commonSettings = Seq(
-  scalaVersion := DependencyVersions.scala2p13Version,
-  scalacOptions ++= Seq(
-    "-deprecation",
-    "-feature",
-    "-unchecked",
-    "-encoding",
-    "UTF-8",
-    "-Xlint:_",
-    "-Ywarn-unused:-implicits",
-    "-Ywarn-value-discard",
-    "-Ywarn-dead-code"
-  )
+  scalacOptions ++= {
+    CrossVersion.partialVersion(scalaVersion.value) match {
+      case Some((2, _)) =>
+        Seq(
+          "-Xlint:_",
+          "-Ywarn-unused:-implicits",
+          "-Ywarn-value-discard",
+          "-Ywarn-dead-code"
+        )
+      case Some((3, _)) =>
+        Seq(
+          "-Wconf:cat=unchecked:s"
+        )
+      case _ => Seq()
+    }
+  }
 )
 
 lazy val bengalStm = (project in file("."))

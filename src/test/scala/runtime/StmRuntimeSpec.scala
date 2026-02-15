@@ -74,17 +74,21 @@ class StmRuntimeSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
         _  <- STM[IO].unit
       } yield v0 + v1 + v2.values.sum // -6
 
-      (for {
-        case implicit0(stm: STM[IO]) <- STM.runtime[IO]
-        txnVarTest    <- TxnVar.of(11)
-        txnVarMapTest <- TxnVarMap.of(Map("foo" -> 5, "bar" -> 1))
-        result <- for {
-                    result2f <- program2(txnVarTest, txnVarMapTest).commit.start
-                    result1f <- program1(txnVarTest, txnVarMapTest).commit.start
-                    result2  <- result2f.joinWithNever // -6
-                    result1  <- result1f.joinWithNever // 131
-                  } yield result1 + result2 // 125
-      } yield result).asserting(_ shouldBe 125)
+      STM
+        .runtime[IO]
+        .flatMap { implicit stm =>
+          for {
+            txnVarTest    <- TxnVar.of(11)
+            txnVarMapTest <- TxnVarMap.of(Map("foo" -> 5, "bar" -> 1))
+            result <- for {
+                        result2f <- program2(txnVarTest, txnVarMapTest).commit.start
+                        result1f <- program1(txnVarTest, txnVarMapTest).commit.start
+                        result2  <- result2f.joinWithNever // -6
+                        result1  <- result1f.joinWithNever // 131
+                      } yield result1 + result2 // 125
+          } yield result
+        }
+        .asserting(_ shouldBe 125)
     }
 
     "correctly execute with transient evaluation errors in the static analysis" in {
@@ -107,19 +111,23 @@ class StmRuntimeSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
         _ <- txnVarQueue.modify(_.enqueue(28))
       } yield () // -6
 
-      (for {
-        case implicit0(stm: STM[IO]) <- STM.runtime[IO]
-        txnVarQueue <- TxnVar.of(Queue[Int]())
-        txnVar      <- TxnVar.of(0)
-        result <- for {
-                    result1f    <- program1(txnVarQueue, txnVar).commit.start
-                    result2f    <- program2(txnVarQueue).commit.start
-                    _           <- result2f.joinWithNever
-                    _           <- result1f.joinWithNever
-                    innerResult <- txnVar.get.commit
-                    resultQueue <- txnVarQueue.get.commit
-                  } yield (innerResult, resultQueue)
-      } yield result).asserting(_ shouldBe (27, Queue(18, 28)))
+      STM
+        .runtime[IO]
+        .flatMap { implicit stm =>
+          for {
+            txnVarQueue <- TxnVar.of(Queue[Int]())
+            txnVar      <- TxnVar.of(0)
+            result <- for {
+                        result1f    <- program1(txnVarQueue, txnVar).commit.start
+                        result2f    <- program2(txnVarQueue).commit.start
+                        _           <- result2f.joinWithNever
+                        _           <- result1f.joinWithNever
+                        innerResult <- txnVar.get.commit
+                        resultQueue <- txnVarQueue.get.commit
+                      } yield (innerResult, resultQueue)
+          } yield result
+        }
+        .asserting(_ shouldBe (27, Queue(18, 28)))
     }
   }
 }

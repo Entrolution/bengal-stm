@@ -333,9 +333,11 @@ private[stm] trait TxnRuntimeContext[F[_]] {
                  _      <- ex.registerCompletion(this)
                  _ <- result match {
                         case TxnResultSuccess(result) =>
-                          completionSignal.complete(
-                            Right[Throwable, V](result.asInstanceOf[V])
-                          )
+                          completionSignal
+                            .complete(
+                              Right[Throwable, V](result.asInstanceOf[V])
+                            )
+                            .void
                         case TxnResultRetry =>
                           Async[F].ifM(hasDownstream.get)(
                             ex.submitTxn(this),
@@ -346,7 +348,9 @@ private[stm] trait TxnRuntimeContext[F[_]] {
                             this.copy(idFootprint = idFootprintRefinement.getValidated)
                           )
                         case TxnResultFailure(err) =>
-                          completionSignal.complete(Left[Throwable, V](err))
+                          completionSignal
+                            .complete(Left[Throwable, V](err))
+                            .void
                       }
                } yield ()
              }

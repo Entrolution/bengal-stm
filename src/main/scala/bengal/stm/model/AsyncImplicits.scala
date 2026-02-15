@@ -20,5 +20,5 @@ package bengal.stm.model
 import cats.effect.kernel.Async
 
 abstract private[stm] class AsyncImplicits[F[_]](implicit
-  protected val asyncF: Async[F]
+  private[stm] val asyncF: Async[F]
 )
