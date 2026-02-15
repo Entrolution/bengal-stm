@@ -19,7 +19,12 @@ package bengal.stm
 
 import cats.free.Free
 
+/** Core model types for Bengal STM. */
 package object model {
+
+  /** A composable transaction that produces a value of type `V` when committed. Built using a free monad over the STM
+    * algebra, enabling static analysis of transaction variable domains before execution.
+    */
   type Txn[V]                   = Free[TxnOrErr, V]
   private[stm] type TxnOrErr[V] = Either[TxnErratum, TxnAdt[V]]
 }

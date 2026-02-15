@@ -25,6 +25,16 @@ import cats.effect.kernel.Async
 import cats.effect.std.Semaphore
 import cats.syntax.all._
 
+/** A mutable transactional variable holding a single value of type `T`.
+  *
+  * `TxnVar` instances are created outside the `Txn` monad via [[TxnVar.of]] and then read/written within transactions
+  * using the syntax extensions provided by the `STM` implicit class or `bengal.stm.syntax.all._`.
+  *
+  * @tparam F
+  *   the effect type
+  * @tparam T
+  *   the value type
+  */
 case class TxnVar[F[_], T](
   private[stm] val id: TxnVarId,
   protected val value: Ref[F, T],
@@ -38,6 +48,7 @@ case class TxnVar[F[_], T](
 
 object TxnVar {
 
+  /** Creates a new `TxnVar` with the given initial value. Requires an implicit `STM[F]` runtime. */
   def of[F[_]: STM: Async, T](value: T): F[TxnVar[F, T]] =
     for {
       id       <- STM[F].txnVarIdGen.updateAndGet(_ + 1)

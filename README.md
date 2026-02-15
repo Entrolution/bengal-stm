@@ -75,6 +75,15 @@ object QuickStart extends IOApp.Simple {
 | `abort(new RuntimeException("foo"))` | Aborts the current transaction | `def abort(ex: Throwable): Txn[Unit]` | Variables/Maps changes will not be persisted if the transaction is aborted |
 | `txn.handleErrorWith(_ => pure("bar"))` | Absorbs an error/abort and remaps to another transaction | `def handleErrorWith(f: Throwable => Txn[V]): Txn[V]` | |
 | `waitFor(value > 10)` | Semantically blocks a transaction until a condition is met | `def waitFor(predicate: => Boolean): Txn[Unit]` | Blocking is semantic (no thread locking). Implemented via retries initiated by variable/map updates. |
+| `txnVar.setF(Async[F].pure(100))` | Sets value via an effect `F[V]` | `def setF(newValue: F[V]): Txn[Unit]` | Requires `syntax.all._` import |
+| `txnVar.modifyF(v => Async[F].pure(v + 1))` | Modifies value via an effectful function | `def modifyF(f: V => F[V]): Txn[Unit]` | Requires `syntax.all._` import |
+| `txnVarMap.set(Async[F].pure(Map("k" -> 1)))` | Sets map state via an effect | `def set(newValueMap: F[Map[K, V]]): Txn[Unit]` | Requires `syntax.all._` import |
+| `txnVarMap.modifyF(m => Async[F].pure(m))` | Modifies map via an effectful function | `def modifyF(f: Map[K,V] => F[Map[K,V]]): Txn[Unit]` | Requires `syntax.all._` import |
+| `txnVarMap.setF(key, Async[F].pure(100))` | Upserts key-value via an effect | `def setF(key: => K, newValue: F[V]): Txn[Unit]` | Requires `syntax.all._` import |
+| `txnVarMap.modifyF(key, v => Async[F].pure(v))` | Modifies key-value via an effectful function | `def modifyF(key: => K, f: V => F[V]): Txn[Unit]` | Requires `syntax.all._` import |
+| `txn.handleErrorWithF(e => Async[F].pure(pure("fallback")))` | Effectful error recovery | `def handleErrorWithF(f: Throwable => F[Txn[V]]): Txn[V]` | Requires `syntax.all._` import |
+
+**Note on F-variant methods:** The methods suffixed with `F` (e.g. `setF`, `modifyF`, `handleErrorWithF`) are available via the `import bengal.stm.syntax.all._` import. The `F[_]` arguments passed to these methods **must not encapsulate side effects** — they are evaluated during transaction attempts and may be retried.
 
 ## Example: Bank Transfer
 

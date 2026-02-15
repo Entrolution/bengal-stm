@@ -28,6 +28,18 @@ import cats.syntax.all._
 import java.util.UUID
 import scala.collection.mutable.{ Map => MutableMap }
 
+/** A mutable transactional map from keys of type `K` to values of type `V`.
+  *
+  * Unlike wrapping a `Map` in a `TxnVar`, `TxnVarMap` tracks individual keys as separate transactional entities,
+  * enabling finer-grained conflict detection and better concurrency. Create instances via [[TxnVarMap.of]].
+  *
+  * @tparam F
+  *   the effect type
+  * @tparam K
+  *   the key type
+  * @tparam V
+  *   the value type
+  */
 case class TxnVarMap[F[_]: STM: Async, K, V](
   private[stm] val id: TxnVarId,
   protected val value: Ref[F, VarIndex[F, K, V]],
@@ -105,6 +117,7 @@ case class TxnVarMap[F[_]: STM: Async, K, V](
 
 object TxnVarMap {
 
+  /** Creates a new `TxnVarMap` with the given initial entries. Requires an implicit `STM[F]` runtime. */
   def of[F[_]: STM: Async, K, V](valueMap: Map[K, V]): F[TxnVarMap[F, K, V]] =
     for {
       id <- STM[F].txnVarIdGen.updateAndGet(_ + 1)

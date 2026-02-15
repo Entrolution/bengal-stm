@@ -7,10 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-02-15
+
+### Breaking
+- Removed unused `internalSignalLock` field from `TxnVarMap` (binary-incompatible)
+
 ### Changed
-- Updated deprecated `continuationIndent` keys to `indent` in scalafmt config
-- Added security contact email to SECURITY.md
+- Bumped Scala to 2.13.16
+- Bumped cats-effect to 3.6.3, cats-free to 2.13.0
+- Bumped ScalaCheck to 1.18.1, ScalaTest to 3.2.19, cats-effect-testing to 1.6.0
+- Bumped sbt-scoverage to 2.4.1, Scalafmt to 3.8.6
+- Added explicit ScalaTest dependency
+- Updated sbt-typelevel to 0.8.4
+- Updated deprecated scalafmt config keys
 - Removed orphaned `docs/assets/logo.svg`
+
+### Added
+- Comprehensive test suite: IdFootprint unit & property tests, concurrency stress tests (62 total)
+- CONTRIBUTING.md, CODE_OF_CONDUCT.md, SECURITY.md
+- Bug report and feature request issue templates
 
 ## [0.9.6] - 2026-01-10
 
