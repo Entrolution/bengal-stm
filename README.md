@@ -185,13 +185,6 @@ Additionally, Bengal treats `Map` as a fundamental transactional data structure 
 
 Bengals are a very playful and active cat breed. The name fits a library built on Cats.
 
-## Support
-
-If you find Bengal STM useful, consider supporting its development:
-
-- [GitHub Sponsors](https://github.com/sponsors/Entrolution)
-- [Patreon](https://www.patreon.com/Entrolution)
-
 ## Contributing
 
 Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
