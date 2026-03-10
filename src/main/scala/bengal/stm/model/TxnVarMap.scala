@@ -82,38 +82,34 @@ case class TxnVarMap[F[_]: STM: Async, K, V](
   ): F[TxnVarRuntimeId] =
     Async[F].delay(getRuntimeExistentialId(key).addParent(runtimeId))
 
-  // Only called when key is known to not exist
-  private def add(newKey: K, newValue: V): F[Unit] =
-    for {
-      newTxnVar <- TxnVar.of(newValue)
-      _ <- withLock(internalStructureLock)(
-             value.update(_ += (newKey -> newTxnVar))
-           )
-    } yield ()
-
   private[stm] def addOrUpdate(key: K, newValue: V): F[Unit] =
-    for {
-      txnVarMap <- value.get
-      _ <- txnVarMap.get(key) match {
-             case Some(tVar) =>
-               withLock(internalStructureLock)(
+    withLock(internalStructureLock) {
+      for {
+        txnVarMap <- value.get
+        _ <- txnVarMap.get(key) match {
+               case Some(tVar) =>
                  tVar.set(newValue)
-               )
-             case None =>
-               add(key, newValue)
-           }
-    } yield ()
+               case None =>
+                 for {
+                   newTxnVar <- TxnVar.of(newValue)
+                   _         <- value.update(_ += (key -> newTxnVar))
+                 } yield ()
+             }
+      } yield ()
+    }
 
   private[stm] def delete(key: K): F[Unit] =
-    for {
-      txnVarMap <- value.get
-      _ <- txnVarMap.get(key) match {
-             case Some(_) =>
-               withLock(internalStructureLock)(value.update(_ -= key))
-             case None =>
-               Async[F].unit
-           }
-    } yield ()
+    withLock(internalStructureLock) {
+      for {
+        txnVarMap <- value.get
+        _ <- txnVarMap.get(key) match {
+               case Some(_) =>
+                 value.update(_ -= key)
+               case None =>
+                 Async[F].unit
+             }
+      } yield ()
+    }
 }
 
 object TxnVarMap {

@@ -18,6 +18,7 @@ package ai.entrolution
 package model
 
 import cats.effect.IO
+import cats.effect.implicits._
 import cats.effect.testing.scalatest.AsyncIOSpec
 import org.scalatest.EitherValues
 import org.scalatest.freespec.AsyncFreeSpec
@@ -233,6 +234,40 @@ class TxnVarMapSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers with Ei
           } yield result
         }
         .asserting(_ shouldBe None)
+    }
+  }
+
+  "concurrent new-key operations" - {
+    "concurrent set of same new key" in {
+      STM
+        .runtime[IO]
+        .flatMap { implicit stm =>
+          for {
+            tVarMap <- TxnVarMap.of(Map.empty[String, Int])
+            _ <- (
+                   tVarMap.set("x", 1).commit,
+                   tVarMap.set("x", 2).commit
+                 ).parTupled
+            result <- tVarMap.get("x").commit
+          } yield result
+        }
+        .asserting(_ shouldBe defined)
+    }
+
+    "concurrent delete of different keys" in {
+      STM
+        .runtime[IO]
+        .flatMap { implicit stm =>
+          for {
+            tVarMap <- TxnVarMap.of(Map("a" -> 1, "b" -> 2))
+            _ <- (
+                   tVarMap.remove("a").commit,
+                   tVarMap.remove("b").commit
+                 ).parTupled
+            result <- tVarMap.get.commit
+          } yield result
+        }
+        .asserting(_ shouldBe empty)
     }
   }
 }
