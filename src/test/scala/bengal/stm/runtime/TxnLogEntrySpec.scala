@@ -485,5 +485,13 @@ class TxnLogEntrySpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
         footprint.updatedIds shouldBe Set(rid)
       }
     }
+
+    "lock returns Some for new key (falls back to map commitLock)" in withRuntime { implicit stm =>
+      for {
+        tvarMap <- TxnVarMap.of(Map("a" -> 1))
+        entry = stm.TxnLogUpdateVarMapEntry[String, Int]("newkey", None, Some(5), tvarMap)
+        lock <- entry.lock
+      } yield lock shouldBe Some(tvarMap.commitLock)
+    }
   }
 }

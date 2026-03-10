@@ -276,7 +276,7 @@ private[stm] trait TxnLogContext[F[_]] {
     override private[stm] lazy val lock: F[Option[Semaphore[F]]] =
       for {
         oTxnVar <- txnVarMap.getTxnVar(key)
-      } yield oTxnVar.map(_.commitLock)
+      } yield Some(oTxnVar.map(_.commitLock).getOrElse(txnVarMap.commitLock))
 
     override private[stm] lazy val idFootprint: F[IdFootprint] =
       txnVarMap.getRuntimeId(key).map { rid =>
