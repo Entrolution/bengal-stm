@@ -328,7 +328,7 @@ private[stm] trait TxnRuntimeContext[F[_]] {
       for {
         _ <- ex.registerRunning(this)
         _ <- Async[F].uncancelable { poll =>
-               for {
+               (for {
                  result <- poll(commit)
                  _      <- ex.registerCompletion(this)
                  _ <- result match {
@@ -352,7 +352,10 @@ private[stm] trait TxnRuntimeContext[F[_]] {
                             .complete(Left[Throwable, V](err))
                             .void
                       }
-               } yield ()
+               } yield ()).handleErrorWith { unexpectedErr =>
+                 ex.registerCompletion(this).attempt >>
+                 completionSignal.complete(Left[Throwable, V](unexpectedErr)).void
+               }
              }
       } yield ()
   }
@@ -401,7 +404,12 @@ private[stm] trait TxnRuntimeContext[F[_]] {
               scheduler        = scheduler
             )
           )
-        _          <- scheduler.submitTxn(analysedTxn).start
+        _ <- (scheduler
+               .submitTxn(analysedTxn)
+               .handleErrorWith { err =>
+                 completionSignal.complete(Left[Throwable, V](err)).void
+               })
+               .start
         completion <- completionSignal.get
         result <- completion match {
                     case Right(res) => Async[F].pure(res)
