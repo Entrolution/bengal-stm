@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-03-10
+
+### Fixed
+- `TxnRetryException` caught by generic `handleErrorWith` in the `TxnHandleError` compiler case, causing `retry` inside `handleErrorWith` to fail instead of retrying
+- `TxnVarMap` commit-time lock returning `None` for new keys, leaving commits unlocked when the underlying `TxnVar` doesn't exist yet — now falls back to the map's structural `commitLock`
+- TOCTOU race in `TxnVarMap.addOrUpdate`: check for key existence and the add/update were not atomic — moved inside `internalStructureLock`
+- TOCTOU race in `TxnVarMap.delete`: same pattern — moved the check-then-act inside the lock
+- `completionSignal` not completed on unexpected exceptions in `execute`, causing caller deadlocks — wrapped in `handleErrorWith` that ensures `registerCompletion` and signal completion
+- Unsupervised fiber in `commit`: errors from `submitTxn` before `execute` is reached now complete the signal with `Left` to prevent hangs
+
+### Added
+- 4 new tests (139 → 143): retry-through-handleErrorWith, concurrent new-key set/delete, new-key lock fallback, error-completes-not-hangs
+
 ## [0.12.0] - 2026-02-27
 
 ### Fixed
@@ -139,7 +152,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Semantic blocking via `waitFor` / retry mechanism
 - `handleErrorWith` for transaction-level error recovery
 
-[Unreleased]: https://github.com/Entrolution/bengal-stm/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/Entrolution/bengal-stm/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/Entrolution/bengal-stm/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/Entrolution/bengal-stm/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/Entrolution/bengal-stm/compare/v0.10.1...v0.11.0
 [0.10.1]: https://github.com/Entrolution/bengal-stm/compare/v0.10.0...v0.10.1

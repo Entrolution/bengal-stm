@@ -1,4 +1,4 @@
-ThisBuild / tlBaseVersion := "0.12"
+ThisBuild / tlBaseVersion := "0.13"
 
 ThisBuild / tlVersionIntroduced := Map("3" -> "0.12.0")
 
