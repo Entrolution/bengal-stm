@@ -18,6 +18,7 @@ package ai.entrolution
 package runtime
 
 import scala.collection.immutable.Queue
+import scala.concurrent.duration._
 
 import cats.effect.IO
 import cats.effect.testing.scalatest.AsyncIOSpec
@@ -128,6 +129,20 @@ class StmRuntimeSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
           } yield result
         }
         .asserting(_ shouldBe (27, Queue(18, 28)))
+    }
+
+    "transaction error completes rather than hanging" in {
+      STM
+        .runtime[IO]
+        .flatMap { implicit stm =>
+          STM[IO]
+            .abort(new RuntimeException("test error"))
+            .flatMap(_ => STM[IO].pure("unreachable"))
+            .commit
+            .attempt
+            .timeout(5.seconds)
+        }
+        .asserting(_.isLeft shouldBe true)
     }
   }
 }
