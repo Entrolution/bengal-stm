@@ -255,8 +255,9 @@ private[stm] trait TxnCompilerContext[F[_]] {
                                      case _ =>
                                        Async[F].pure(originalResult)
                                    }
-                  } yield (finalResult._1, finalResult._2)).handleErrorWith { ex =>
-                    s.raiseError(ex).map((_, ().asInstanceOf[V]))
+                  } yield (finalResult._1, finalResult._2)).handleErrorWith {
+                    case ex: TxnRetryException => Async[F].raiseError(ex)
+                    case ex                    => s.raiseError(ex).map((_, ().asInstanceOf[V]))
                   }
                 }
               case _ =>

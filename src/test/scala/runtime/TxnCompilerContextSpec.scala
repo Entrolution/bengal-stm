@@ -210,6 +210,39 @@ class TxnCompilerContextSpec extends AsyncFreeSpec with AsyncIOSpec with Matcher
         }
         .asserting(_ shouldBe "recovered")
     }
+
+    "retry propagates through handleErrorWith" in {
+      STM
+        .runtime[IO]
+        .flatMap { implicit stm =>
+          for {
+            tVar <- TxnVar.of(0)
+            readerFiber <- (for {
+                             v <- tVar.get
+                             _ <- STM[IO].waitFor(v > 0)
+                           } yield v)
+                             .handleErrorWith(_ => STM[IO].pure(-1))
+                             .commit
+                             .start
+            _      <- tVar.set(42).commit
+            result <- readerFiber.joinWithNever
+          } yield result
+        }
+        .asserting(_ shouldBe 42)
+    }
+
+    "handleErrorWith still recovers real errors" in {
+      STM
+        .runtime[IO]
+        .flatMap { implicit stm =>
+          STM[IO]
+            .abort(new RuntimeException("boom"))
+            .flatMap(_ => STM[IO].pure("unreachable"))
+            .handleErrorWith(_ => STM[IO].pure("recovered"))
+            .commit
+        }
+        .asserting(_ shouldBe "recovered")
+    }
   }
 
   "pure/delay transaction" - {
