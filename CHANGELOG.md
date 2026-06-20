@@ -37,7 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - sbt-typelevel bumped from 0.8.4 to 0.8.5
 - Refactored `TxnLogContext`: extracted `getLogEntry` helper, unified duplicate entry/value write methods (−12% lines)
 - Adjusted CI stress test timeouts for reliability
-- Repository moved from `gvonness-apolitical` to `Entrolution` organisation
+- Repository moved from `gvonnessi` to `Entrolution` organisation
 - Updated CONTRIBUTING.md with cross-build guidance and CODE_OF_CONDUCT.md contact
 
 ## [0.11.0] - 2026-02-15
