@@ -121,6 +121,7 @@ fiber bound.
 |----------|---------|----------|
 | `LemmaCompatSymmetric`, `LemmaValidatedIdempotent`, `LemmaValidatedPreservesUpdates`, `LemmaValidatedMonotoneCompat`, `LemmaWriterSelfIncompatible` | **HOLD** (exhaustive at 4-id universe) | `FootprintLemmas.cfg`, clean |
 | `DocumentsReadGapH5` — parent-structure read vs child-entry write judged **compatible** | **PINNED** (current behaviour; relation-level H5 premise confirmed) | `FootprintLemmas.cfg`; flips RED when the relation is fixed |
+| **H5 phantom write skew — behavioural** (whole-map read + new-key insert: both txns observe the empty map, both commit; no serial order exists) | **CONFIRMED in the shipped library — pinned in the test suite** (~98% of contended reps on a 12-core host; the static-analysis walker does not close the gap) | `SerializabilityOracleSpec` ("H5 phantom write skew"); flips RED when fixed |
 | `DocumentsSiblingInsertsCompatible` — two new-key inserts to one map compatible (H2 enabler) | **PINNED** (correct behaviour; the hazard is the lock aliasing, Spec A) | `FootprintLemmas.cfg` |
 | `NoDoubleExec` | **RED — organic, pinned in CI** (TLC search depth ~50, 49-state trace) | H4 counterexample, narrative below |
 | `ContractC` | **RED — organic** (depth ~51) | same root cause; drop-and-rerun procedure below |
@@ -298,7 +299,17 @@ Measured on 12 cores (Apple x86_64, JDK 21, TLC 2026-07 build):
 2. **Pinned expectations** via `specs/check_expected.sh` in CI — clean specs
    must stay clean, and confirmed counterexamples must keep reproducing
    until the code is fixed.
-3. **Semantic property tests** (planned, plan §7): a serializability oracle
-   test in `src/test/scala/spec/` exercising generated workloads against a
-   global-lock reference STM, plus deterministic replay/stress tests for
-   each confirmed trace as fixes land.
+3. **Semantic property tests** (`src/test/scala/spec/SerializabilityOracleSpec.scala`,
+   runs in the normal 2.13/3 matrix): ScalaCheck-generated concurrent
+   point-op workloads against the real STM, with every outcome checked
+   against all serial orders of a sequential reference model (green — the
+   scheduler serializes footprint-visible conflicts correctly), an
+   increment canary for the H4 double-execution family, and a **pinned H5
+   reproduction** — the whole-map-read + new-key-insert phantom write skew
+   reproduces in the shipped library (measured ~98% of contended reps, on both a
+   12-core host and a 2-thread pool) and the test
+   asserts it keeps reproducing until fixed, exactly as `check_expected.sh`
+   pins TLC counterexamples. Whole-map reads are excluded from the
+   *generated* suite for that reason; `waitUntil`/retry workloads join in
+   Phase 2. Deterministic replay tests for other confirmed traces arrive
+   with their fixes.
