@@ -61,6 +61,11 @@ class CommitLockOrderSpec extends AnyFreeSpec with Matchers {
     */
   private val Keys: List[String] = (1 to 24).map(i => s"k$i").toList
 
+  /** The same 24 keys, pre-paired. Built directly rather than by `grouped(2)` so the match stays total — CI compiles
+    * with `-Werror`.
+    */
+  private val KeyPairs: List[(String, String)] = (1 to 12).map(i => (s"k${2 * i - 1}", s"k${2 * i}")).toList
+
   /** One fresh key, inserted into BOTH maps. Neither key exists, so both entries fall back to their map's structural
     * lock — which is what puts this transaction on the H2 path at all.
     */
@@ -98,9 +103,7 @@ class CommitLockOrderSpec extends AnyFreeSpec with Matchers {
       .flatMap { implicit stm =>
         for {
           m <- TxnVarMap.of[IO, String, Int](Map.empty)
-          _ <- Keys.grouped(2).toList.parTraverse { case k1 :: k2 :: Nil =>
-                 insertTwoKeysIntoOneMap(m, k1, k2).commit
-               }
+          _ <- KeyPairs.parTraverse { case (k1, k2) => insertTwoKeysIntoOneMap(m, k1, k2).commit }
           r <- m.get.commit
         } yield r
       }
