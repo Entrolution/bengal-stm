@@ -38,7 +38,11 @@ private[stm] trait TxnRuntimeContext[F[_]] {
   sealed private[stm] trait TxnResult
   private[stm] case class TxnResultSuccess[V](result: V) extends TxnResult
 
-  private[stm] case object TxnResultRetry extends TxnResult
+  // Carries the valid log so the park path can re-check the READ set
+  // against live state before committing to the park (see
+  // submitTxnForRetry) — the commit-time dirty check cannot do this
+  // because read-only entries are never validated there.
+  private[stm] case class TxnResultRetry(validLog: TxnLogValid) extends TxnResult
 
   private[stm] case class TxnResultLogDirty(idFootprintRefinement: IdFootprint) extends TxnResult
 
@@ -54,53 +58,95 @@ private[stm] trait TxnRuntimeContext[F[_]] {
     graphBuilderSemaphore: Semaphore[F],
     activeTransactions: MutableMap[TxnId, AnalysedTxn[_]],
     retrySemaphore: Semaphore[F],
-    retryMap: MutableMap[IdFootprint, F[Unit]]
+    // Keyed by TxnId, not footprint: a sweep must be able to skip the
+    // submitting transaction's OWN parked entry (its submission cannot
+    // satisfy its own predicate — it retried rather than committed), and
+    // footprint keys made that impossible while also forcing distinct
+    // transactions with equal footprints to share a chained wake.
+    retryMap: MutableMap[TxnId, (IdFootprint, F[Unit])]
   ) {
     override val toString: String = "TxnScheduler"
 
-    def checkRetryQueue(idFootprint: IdFootprint): F[Unit] =
+    // Wakes every parked transaction whose footprint conflicts with the one
+    // just submitted — EXCEPT the submitter itself. The retry map is read
+    // when this acquires the semaphore, not when it was spawned, so a sweep
+    // spawned while a transaction is mid-park blocks and then finds it:
+    // that rescue is load-bearing for the park-time checks (see
+    // submitTxnForRetry).
+    def checkRetryQueue(submitterId: TxnId, idFootprint: IdFootprint): F[Unit] =
       retrySemaphore.permit.use { _ =>
         for {
-          triggeredFootprints <-
-            retryMap.keys.toList
-              .parTraverse { waitingFootprint =>
-                Async[F].ifM(
-                  Async[F].delay(
-                    !idFootprint.isCompatibleWith(waitingFootprint)
-                  )
-                )(
-                  retryMap(waitingFootprint) >> Async[F].pure(
-                    Option(waitingFootprint)
-                  ),
-                  Async[F].pure(None.asInstanceOf[Option[IdFootprint]])
-                )
+          triggered <-
+            Async[F].delay(
+              retryMap.toList.filter { case (parkedId, (parkedFootprint, _)) =>
+                parkedId != submitterId && !idFootprint.isCompatibleWith(parkedFootprint)
               }
-              .map(_.flatten)
-          _ <- triggeredFootprints.traverse(footprint => Async[F].delay(retryMap.remove(footprint)))
+            )
+          _ <- triggered.parTraverse { case (_, (_, wake)) => wake }
+          _ <- triggered.traverse { case (parkedId, _) => Async[F].delay(retryMap.remove(parkedId)) }
         } yield ()
       }
 
-    def submitTxnForRetry(analysedTxn: AnalysedTxn[_]): F[Unit] =
-      retrySemaphore.permit.use { _ =>
-        for {
-          footprint <- Async[F].delay(analysedTxn.idFootprint)
-          execSpec  <- Async[F].delay(retryMap.get(footprint))
-          // The wake action builds a fresh incarnation AT WAKE TIME so a
-          // parked transaction never re-enters the scheduler with stale
-          // bookkeeping from its previous run.
-          wake = analysedTxn
-                   .freshIncarnation(analysedTxn.idFootprint)
-                   .flatMap(submitTxn)
-                   .start
-                   .void
-          _ <- Async[F].delay(execSpec match {
-                 case Some(spec) =>
-                   retryMap.update(footprint, spec >> wake)
-                 case None =>
-                   retryMap.addOne(footprint -> wake)
-               })
-        } yield ()
-      }
+    // SPEC: NoLostWakeup — the H1 fix. Wakes fire only from submission-time
+    // sweeps (checkRetryQueue), and a sweep runs BEFORE its transaction
+    // commits, so a transaction parking "in the gap" would sleep forever:
+    // the conflictor's sweep saw a retry map that did not yet contain it,
+    // and the commit that satisfies its predicate never sweeps again.
+    //
+    // Two checks close the window, and THE ORDER MATTERS:
+    //
+    //   1. scan activeTransactions for a footprint conflict — catches
+    //      conflictors that have NOT yet committed (their sweep is already
+    //      spent). We resubmit instead of parking; the resubmission's graph
+    //      scan subscribes to them and re-runs us after they complete.
+    //   2. re-check the READ SET against live state (anyReadChangedSinceRead
+    //      — a real comparison, unlike commit-time validation, which never
+    //      checks read-only entries) — catches conflictors that already
+    //      COMMITTED and left.
+    //
+    // The staleness check must come LAST, immediately before the insert.
+    // The retry semaphore serializes this region against sweeps but NOT
+    // against commits or completions, so a conflictor CAN move between the
+    // two reads. In this order that is safe: a conflictor committing after
+    // the staleness check was necessarily still in activeTransactions when
+    // we scanned (removal follows its commit), or its sweep is still
+    // blocked on the semaphore we hold and will find us parked and wake us.
+    // Reversing the checks loses wakeups — a conflictor commits after the
+    // staleness read and leaves activeTransactions before the scan,
+    // escaping both — which TLC finds as a deadlock (Scheduler.tla).
+    def submitTxnForRetry(analysedTxn: AnalysedTxn[_], validLog: TxnLogValid): F[Unit] =
+      retrySemaphore.permit
+        .use { _ =>
+          for {
+            // ORDER IS LOAD-BEARING (see the comment above): the scan first,
+            // the staleness check LAST, immediately before the insert.
+            conflictActive <-
+              Async[F].delay(
+                activeTransactions.values.exists(aTxn => !analysedTxn.idFootprint.isCompatibleWith(aTxn.idFootprint))
+              )
+            stale <- validLog.anyReadChangedSinceRead
+            park = !(stale || conflictActive)
+            _ <- Async[F].whenA(park) {
+                   // The wake action builds a fresh incarnation AT WAKE TIME
+                   // so a parked transaction never re-enters the scheduler
+                   // with stale bookkeeping from its previous run.
+                   val wake = analysedTxn
+                     .freshIncarnation(analysedTxn.idFootprint)
+                     .flatMap(submitTxn)
+                     .start
+                     .void
+                   Async[F].delay(
+                     retryMap.addOne(analysedTxn.id -> ((analysedTxn.idFootprint, wake)))
+                   )
+                 }
+          } yield park
+        }
+        .flatMap { parkedNow =>
+          // The window was live: skip the park and resubmit immediately.
+          Async[F].whenA(!parkedNow)(
+            analysedTxn.freshIncarnation(analysedTxn.idFootprint).flatMap(submitTxn)
+          )
+        }
 
     def submitTxnForImmediateRetry(analysedTxn: AnalysedTxn[_]): F[Unit] =
       for {
@@ -153,7 +199,7 @@ private[stm] trait TxnRuntimeContext[F[_]] {
                  _ <- analysedTxn.checkExecutionReadiness
                } yield ()
              }
-        _ <- checkRetryQueue(analysedTxn.idFootprint).start
+        _ <- checkRetryQueue(analysedTxn.id, analysedTxn.idFootprint).start
       } yield ()
 
     def submitTxn(analysedTxn: AnalysedTxn[_]): F[Unit] =
@@ -184,7 +230,7 @@ private[stm] trait TxnRuntimeContext[F[_]] {
                  _ <- analysedTxn.checkExecutionReadiness
                } yield ()
              }
-        _ <- checkRetryQueue(analysedTxn.idFootprint).start
+        _ <- checkRetryQueue(analysedTxn.id, analysedTxn.idFootprint).start
       } yield ()
 
     def registerCompletion(analysedTxn: AnalysedTxn[_]): F[Unit] =
@@ -381,7 +427,7 @@ private[stm] trait TxnRuntimeContext[F[_]] {
                                 .asInstanceOf[TxnResult]
                             ),
                             Async[F].delay(
-                              TxnResultRetry.asInstanceOf[TxnResult]
+                              TxnResultRetry(retry.validLog).asInstanceOf[TxnResult]
                             )
                           )
                         }
@@ -411,10 +457,10 @@ private[stm] trait TxnRuntimeContext[F[_]] {
                          Right[Throwable, V](result.asInstanceOf[V])
                        )
                        .void
-                   case TxnResultRetry =>
+                   case TxnResultRetry(validLog) =>
                      Async[F].ifM(hasDownstream.get)(
                        freshIncarnation(idFootprint).flatMap(ex.submitTxn),
-                       ex.submitTxnForRetry(this)
+                       ex.submitTxnForRetry(this, validLog)
                      )
                    case TxnResultLogDirty(idFootprintRefinement) =>
                      freshIncarnation(idFootprintRefinement.getValidated)

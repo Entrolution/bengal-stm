@@ -40,6 +40,18 @@
  *       collapse soundly (pre-fix these were kept separate because
  *       double-spawned cascades could race a clear()).
  *
+ * TWO REDUCTIONS ARE DELIBERATELY *NOT* TAKEN in the retry machinery, and
+ * both were tried and rejected during the H1 work:
+ *   - Sweeps are NOT skipped when the retry map is empty at spawn time. A
+ *     sweep reads the map when it ACQUIRES the retry semaphore, so one
+ *     spawned while a transaction is mid-park blocks and then rescues it.
+ *     Skipping empty-map sweeps deletes that path and makes the model
+ *     unsound (it would report a fixed protocol as deadlocking).
+ *   - The park region is NOT collapsed into one atomic step. The retry
+ *     semaphore serializes it against sweeps but NOT against commits or
+ *     completions, so a conflictor can move between its two checks — which
+ *     is exactly where the ordering defect lives (see ExecParkScan).
+ *
  * THE H4 FIX IS MODELLED (matching the code): admitForExecution admits at
  * most one fiber per incarnation into the commit window (status CAS +
  * tally==0 under the graph semaphore — ExecAdmit); every resubmission is a
@@ -62,19 +74,27 @@
 EXTENDS Footprint, Integers, FiniteSets, Sequences
 
 CONSTANTS
+    Txns,            \* the scenario's transaction set (see the catalogue below)
     MaxInc,          \* dirty-resubmission bound per txn (action-level
                      \* truncation: ExecResubTruncate retires the fiber)
     MaxVer,          \* version bound per var (CONSTRAINT backstop)
     AbortsEnabled    \* enable the nondeterministic failure injections
 
 ---------------------------------------------------------------------------
-(* Scenario — edit this section to vary the workload (Phase 2 may split
-   scenarios into their own modules). Runtime ids are arbitrary distinct
-   naturals; hash-derived order in the real system makes every ordering
-   class reachable (TxnStateEntity.runtimeId). *)
+(* Scenario catalogue — each cfg picks its Txns subset. Runtime ids are
+   arbitrary distinct naturals; hash-derived order in the real system makes
+   every ordering class reachable (TxnStateEntity.runtimeId).
+
+     t1, t2, t3 : the H4 scenario (t1 under-declared, t2 conflicting
+                  writer, t3 reader-writer bystander) — safety configs
+     tr         : a waitFor transaction — reads V1, retries until
+                  version[V1] >= 1, then writes V2 (retry/park configs)
+     tw         : the writer whose commit satisfies tr's predicate
+   *)
 ---------------------------------------------------------------------------
 
-Txns == {"t1", "t2", "t3"}
+AllTxns == {"t1", "t2", "t3", "tr", "tw"}
+ASSUME Txns \subseteq AllTxns
 
 V1 == [val |-> 1, par |-> NoParent]
 V2 == [val |-> 2, par |-> NoParent]
@@ -85,17 +105,33 @@ ActualFP(t) ==
     CASE t = "t1" -> FP({}, {V1})
       [] t = "t2" -> FP({}, {V1})
       [] t = "t3" -> FP({V1}, {V2})
+      [] t = "tr" -> FP({V1}, {V2})
+      [] t = "tw" -> FP({}, {V1})
 
 (* Declared base footprints: t1 under-declares (models the static-analysis
    fallback in TxnRuntime.commit's handleErrorWith) — this is what lets t1
-   and t2 run concurrently, forces a dirty commit, and opens the H4 window. *)
+   and t2 run concurrently, forces a dirty commit, and opens the H4 window.
+   tr/tw declare accurately. *)
 DeclaredBase(t) ==
     CASE t = "t1" -> EmptyFootprint
       [] t = "t2" -> FP({}, {V1})
       [] t = "t3" -> FP({V1}, {V2})
+      [] t = "tr" -> FP({V1}, {V2})
+      [] t = "tw" -> FP({}, {V1})
+
+(* Retry transactions and their predicates over versions. A non-retry
+   transaction's predicate is vacuously TRUE. The predicate is evaluated
+   against the fiber's SNAPSHOT (the log's read values), exactly as the
+   code's log run decides TxnLogRetry — a write committed after the
+   snapshot does not rescue a stale decision (that gap is H1's home). *)
+IsRetryTxn(t) == t = "tr"
+RetryPred(t, versionsFn) ==
+    IF t = "tr" THEN versionsFn[V1] >= 1 ELSE TRUE
 
 Writes(t) == ActualFP(t).updates
-TxnRank(t) == CASE t = "t1" -> 1 [] t = "t2" -> 2 [] t = "t3" -> 3
+TxnRank(t) ==
+    CASE t = "t1" -> 1 [] t = "t2" -> 2 [] t = "t3" -> 3
+      [] t = "tr" -> 4 [] t = "tw" -> 5
 
 ---------------------------------------------------------------------------
 (* State *)
@@ -139,19 +175,41 @@ VARIABLES
     \* --- scheduler-wide ---
     active,          \* activeTransactions keys
     graphSem,        \* graphBuilderSemaphore holder: txn id or "none"
-    version          \* var id -> commit counter (values abstracted away)
+    version,         \* var id -> commit counter (values abstracted away)
+    \* --- retry machinery (Phase 2) ---
+    parked,          \* retryMap membership: txns parked awaiting a wake
+                     \* (keyed by footprint in code; compat is computed from
+                     \* declared[t], which is stable while parked)
+    retrySem,        \* retrySemaphore holder: [kind |-> "park"/"sweep",
+                     \* t |-> txn] or "none"
+    sweep,           \* checkRetryQueue fibers, two slots per submitting txn:
+                     \* [ph |-> "none"/"acq"/"scan", pend |-> SUBSET Txns,
+                     \*  fp |-> the submitted footprint]. Spawned on EVERY
+                     \* submission — a sweep evaluates the retry map only
+                     \* when it ACQUIRES the semaphore, so one spawned while
+                     \* a parker holds it blocks, then finds the parker and
+                     \* wakes it. That rescue path is load-bearing (see the
+                     \* park region), so sweeps must not be optimised away.
+    droppedSweep,    \* ghost: a sweep spawn found its slot busy
+    truncatedWake,   \* ghost: a wake was dropped at the MaxInc bound
+    parkChk          \* per-fiber park-region check results: [cf, st]
 
 txnVars    == <<status, tally, unsubs, hasDown, completedCount, inc, declared,
                 publishedInc, doublePub, cascadeFired, droppedSpawn, snap>>
 submitVars == <<submitPc, submitMode, scanPending, curTarget, curDir, curContained>>
 schedVars  == <<active, graphSem, version>>
-vars       == <<txnVars, submitVars, exec, unsubW, schedVars>>
+retryVars  == <<parked, retrySem, sweep, droppedSweep, truncatedWake, parkChk>>
+vars       == <<txnVars, submitVars, exec, unsubW, schedVars, retryVars>>
 
 ExecSlots  == Txns \X {"A", "B"}
 UnsubSlots == Txns \X {"u1", "u2"}
 
+SweepSlots == Txns \X {"s1", "s2", "s3"}  \* one per possible submission (MaxInc + 1)
+NoSweep    == [ph |-> "none", pend |-> {}, fp |-> EmptyFootprint]
+
 NoExec  == [pc |-> "none", out |-> "none", fInc |-> 0]
 NoUnsub == [ph |-> "none", pend |-> {}, ownerInc |-> 0]
+NoHolder == [kind |-> "idle", t |-> "none"]
 
 (* Exec pcs that constitute the execute/commit window. "regRun" (parked at
    the admission gate) is deliberately NOT in the window: multiple fibers
@@ -230,6 +288,12 @@ Init ==
     /\ active         = {}
     /\ graphSem       = "none"
     /\ version        = [v \in VarIds |-> 0]
+    /\ parked         = {}
+    /\ retrySem       = NoHolder
+    /\ sweep          = [sl \in SweepSlots |-> NoSweep]
+    /\ droppedSweep   = FALSE
+    /\ truncatedWake  = FALSE
+    /\ parkChk        = [sl \in ExecSlots |-> [cf |-> FALSE, st |-> FALSE]]
 
 ---------------------------------------------------------------------------
 (* Submit workflow — submitTxn and
@@ -250,7 +314,7 @@ SubmitReset1(t) ==
     /\ UNCHANGED <<status, unsubs, hasDown, completedCount, inc, declared,
                    publishedInc, doublePub, cascadeFired, droppedSpawn, snap, submitMode,
                    scanPending, curTarget, curDir, curContained, exec,
-                   unsubW, schedVars>>
+                   unsubW, schedVars, retryVars>>
 
 SubmitReset2(t) ==
     /\ submitPc[t] = "reset2"
@@ -259,7 +323,7 @@ SubmitReset2(t) ==
     /\ UNCHANGED <<status, tally, unsubs, completedCount, inc, declared,
                    publishedInc, doublePub, cascadeFired, droppedSpawn, snap, submitMode,
                    scanPending, curTarget, curDir, curContained, exec,
-                   unsubW, schedVars>>
+                   unsubW, schedVars, retryVars>>
 
 (* graphBuilderSemaphore.permit acquire + activeTransactions.values snapshot
    (the snapshot is taken before this txn is inserted, so the
@@ -271,7 +335,7 @@ SubmitAcquire(t) ==
     /\ scanPending' = [scanPending EXCEPT ![t] = active]
     /\ submitPc'    = [submitPc EXCEPT ![t] = "setSched"]
     /\ UNCHANGED <<txnVars, submitMode, curTarget, curDir, curContained,
-                   exec, unsubW, active, version>>
+                   exec, unsubW, active, version, retryVars>>
 
 (* executionStatus.set(Scheduled) *)
 SubmitSetScheduled(t) ==
@@ -281,7 +345,7 @@ SubmitSetScheduled(t) ==
     /\ UNCHANGED <<tally, unsubs, hasDown, completedCount, inc, declared,
                    publishedInc, doublePub, cascadeFired, droppedSpawn, snap, submitMode,
                    scanPending, curTarget, curDir, curContained, exec,
-                   unsubW, schedVars>>
+                   unsubW, schedVars, retryVars>>
 
 (* activeTransactions.addOne *)
 SubmitInsertActive(t) ==
@@ -289,7 +353,7 @@ SubmitInsertActive(t) ==
     /\ active'   = active \cup {t}
     /\ submitPc' = [submitPc EXCEPT ![t] = "scanPick"]
     /\ UNCHANGED <<txnVars, submitMode, scanPending, curTarget, curDir,
-                   curContained, exec, unsubW, graphSem, version>>
+                   curContained, exec, unsubW, graphSem, version, retryVars>>
 
 (* Scan loop head; empty pending = all scan fibers joined (joinWithNever) *)
 SubmitScanPick(t) ==
@@ -301,7 +365,7 @@ SubmitScanPick(t) ==
             /\ scanPending' = [scanPending EXCEPT ![t] = @ \ {PickTarget(scanPending[t])}]
             /\ submitPc'    = [submitPc EXCEPT ![t] = "scanCheck"]
     /\ UNCHANGED <<txnVars, submitMode, curDir, curContained, exec, unsubW,
-                   schedVars>>
+                   schedVars, retryVars>>
 
 (* Per-target compatibility/status dispatch.
    plain (submitTxn): incompatible -> target.subscribeDownstreamDependency(me).
@@ -329,7 +393,7 @@ SubmitScanCheck(t) ==
                         /\ submitPc' = [submitPc EXCEPT ![t] = "scanPick"]
                         /\ UNCHANGED curDir
     /\ UNCHANGED <<txnVars, submitMode, scanPending, curTarget, curContained,
-                   exec, unsubW, schedVars>>
+                   exec, unsubW, schedVars, retryVars>>
 
 (* subscribeDownstreamDependency's contains-check — its OWN step:
    the gap between this read and the apply below is where H4's staleness
@@ -345,7 +409,7 @@ SubmitSubCheck(t) ==
     /\ UNCHANGED <<status, tally, unsubs, hasDown, completedCount, inc,
                    declared, publishedInc, doublePub, cascadeFired,
                    droppedSpawn, snap, submitMode, scanPending, curTarget,
-                   curDir, exec, unsubW, schedVars>>
+                   curDir, exec, unsubW, schedVars, retryVars>>
 
 (* The subscribe triple, reduction R2: upstream-tally increment
    (subscribeUpstreamDependency) + unsubSpecs insert + hasDownstream set.
@@ -371,7 +435,7 @@ SubmitSubApply(t) ==
     /\ UNCHANGED <<status, completedCount, inc, declared, publishedInc,
                    doublePub, cascadeFired, droppedSpawn, snap, submitMode,
                    scanPending, curTarget, curDir, curContained, exec,
-                   unsubW, schedVars>>
+                   unsubW, schedVars, retryVars>>
 
 (* checkExecutionReadiness: tally read + spawn,
    still inside the region *)
@@ -383,18 +447,32 @@ SubmitReadiness(t) ==
     /\ UNCHANGED <<status, tally, unsubs, hasDown, completedCount, inc,
                    declared, publishedInc, doublePub, cascadeFired, snap, submitMode,
                    scanPending, curTarget, curDir, curContained, unsubW,
-                   schedVars>>
+                   schedVars, retryVars>>
 
-(* permit release; checkRetryQueue is a no-op in Phase 1 —
-   the retry map is empty by construction *)
+(* permit release, then checkRetryQueue(footprint).start — a fire-and-forget
+   sweep that wakes parked txns whose footprints conflict with the one just
+   submitted. One sweep slot per submitter; a busy slot drops the spawn and
+   sets the droppedSweep ghost (NoDroppedSweep detects the truncation). *)
 SubmitRelease(t) ==
     /\ submitPc[t] = "rel"
     /\ graphSem = t
     /\ graphSem'  = "none"
     /\ submitPc'  = [submitPc EXCEPT ![t] = "idle"]
     /\ curTarget' = [curTarget EXCEPT ![t] = "none"]
+    \* checkRetryQueue(footprint).start — spawned unconditionally, exactly
+    \* as the code does: the map is read at ACQUIRE time, not at spawn
+    \* time, so a sweep spawned while a parker holds the retry semaphore
+    \* blocks and then rescues that parker.
+    /\ IF \E k \in {"s1", "s2", "s3"} : sweep[<<t, k>>].ph = "none"
+       THEN /\ sweep' = [sweep EXCEPT ![<<t,
+                            (CHOOSE k \in {"s1", "s2", "s3"} : sweep[<<t, k>>].ph = "none")>>] =
+                            [ph |-> "acq", pend |-> {}, fp |-> declared[t]]]
+            /\ UNCHANGED droppedSweep
+       ELSE /\ droppedSweep' = TRUE
+            /\ UNCHANGED sweep
     /\ UNCHANGED <<txnVars, submitMode, scanPending, curDir, curContained,
-                   exec, unsubW, active, version>>
+                   exec, unsubW, active, version, parked, retrySem,
+                   truncatedWake, parkChk>>
 
 (* The submit wrapper's handleErrorWith (TxnRuntime.commit): an exception
    anywhere in a PLAIN submission completes the signal with the error and
@@ -412,7 +490,7 @@ SubmitAbort(t) ==
     /\ UNCHANGED <<status, tally, unsubs, hasDown, inc, declared,
                    publishedInc, doublePub, cascadeFired, droppedSpawn, snap, submitMode,
                    scanPending, curTarget, curDir, curContained, exec,
-                   unsubW, active, version>>
+                   unsubW, active, version, retryVars>>
 
 ---------------------------------------------------------------------------
 (* Execute fibers — execute with the atomic-commit
@@ -434,7 +512,7 @@ ExecAdmit(t, s) ==
             /\ UNCHANGED status
     /\ UNCHANGED <<tally, unsubs, hasDown, completedCount, inc, declared,
                    publishedInc, doublePub, cascadeFired, droppedSpawn,
-                   snap, submitVars, unsubW, schedVars>>
+                   snap, submitVars, unsubW, schedVars, retryVars>>
 
 (* Log construction abstracted to one snapshot of the footprint's versions,
    PER FIBER — each execute run builds a private log in the code, so
@@ -447,7 +525,7 @@ ExecSnapshot(t, s) ==
     /\ exec' = [exec EXCEPT ![<<t, s>>].pc = "commit"]
     /\ UNCHANGED <<status, tally, unsubs, hasDown, completedCount, inc,
                    declared, publishedInc, doublePub, cascadeFired,
-                   droppedSpawn, submitVars, unsubW, schedVars>>
+                   droppedSpawn, submitVars, unsubW, schedVars, retryVars>>
 
 (* The atomic commit: dirty iff a written var moved since the snapshot
    (models the commit pipeline withLock{isDirty}/commit, at
@@ -455,7 +533,17 @@ ExecSnapshot(t, s) ==
 ExecCommit(t, s) ==
     /\ exec[<<t, s>>].pc = "commit"
     /\ LET dirtyNow == \E v \in Writes(t) : version[v] /= snap[<<t, s>>][v]
-       IN IF dirtyNow
+           retryNow == ~RetryPred(t, snap[<<t, s>>])
+       IN IF retryNow
+          \* TxnLogRetry: the predicate failed against the SNAPSHOT. The
+          \* code's park-time re-validation under lock is vacuous for
+          \* read-only logs (RO entries hardcode isDirty = false), so a
+          \* write committed since the snapshot does not rescue this
+          \* outcome — modelled by deciding on snap, not version.
+          THEN /\ exec' = [exec EXCEPT ![<<t, s>>] =
+                              [pc |-> "regComp", out |-> "retry", fInc |-> exec[<<t, s>>].fInc]]
+               /\ UNCHANGED <<version, publishedInc, doublePub>>
+          ELSE IF dirtyNow
           THEN /\ exec' = [exec EXCEPT ![<<t, s>>] =
                               [pc |-> "regComp", out |-> "dirty", fInc |-> exec[<<t, s>>].fInc]]
                /\ UNCHANGED <<version, publishedInc, doublePub>>
@@ -468,7 +556,7 @@ ExecCommit(t, s) ==
                               [pc |-> "regComp", out |-> "success", fInc |-> exec[<<t, s>>].fInc]]
     /\ UNCHANGED <<status, tally, unsubs, hasDown, completedCount, inc,
                    declared, cascadeFired, droppedSpawn, snap, submitVars, unsubW, active,
-                   graphSem>>
+                   graphSem, retryVars>>
 
 (* Commit throws before publishing — poll(commit) raises, execute's
    handleErrorWith takes over: registerCompletion (first time) + complete.
@@ -478,7 +566,7 @@ ExecCommitFail(t, s) ==
     /\ AbortsEnabled
     /\ exec[<<t, s>>].pc = "commit"
     /\ exec' = [exec EXCEPT ![<<t, s>>] = [pc |-> "eRegComp", out |-> "fail", fInc |-> exec[<<t, s>>].fInc]]
-    /\ UNCHANGED <<txnVars, submitVars, unsubW, schedVars>>
+    /\ UNCHANGED <<txnVars, submitVars, unsubW, schedVars, retryVars>>
 
 (* registerCompletion: semaphore-guarded remove (R3)... *)
 ExecRegComplete(t, s) ==
@@ -486,7 +574,7 @@ ExecRegComplete(t, s) ==
     /\ graphSem = "none"
     /\ active' = active \ {t}
     /\ exec'   = [exec EXCEPT ![<<t, s>>].pc = "spawnU"]
-    /\ UNCHANGED <<txnVars, submitVars, unsubW, graphSem, version>>
+    /\ UNCHANGED <<txnVars, submitVars, unsubW, graphSem, version, retryVars>>
 
 (* ...followed by triggerUnsub.start (fire-and-forget): the cascade races
    everything that follows, including the dirty resubmission — but the
@@ -500,12 +588,20 @@ ExecSpawnUnsub(t, s) ==
             /\ cascadeFired' = [cascadeFired EXCEPT ![t] = TRUE]
             /\ droppedSpawn' = (droppedSpawn \/ (unsubs[t] /= {} /\ UnsubSlotsFull(unsubW, t)))
        ELSE UNCHANGED <<unsubW, cascadeFired, droppedSpawn>>
+    \* Dispatch: success completes; dirty resubmits (imm); retry either
+    \* resubmits (plain) when hasDownstream — someone subscribed during the
+    \* run, so a conflicting write may already have landed — or parks. The
+    \* hasDownstream read is collapsed into this step: the txn left
+    \* activeTransactions at regComp, so no new subscriber can flip it.
     /\ exec' = [exec EXCEPT ![<<t, s>>].pc =
-                   IF exec[<<t, s>>].out = "success" THEN "complete"
-                                                     ELSE "resubInit"]
+                   CASE exec[<<t, s>>].out = "success" -> "complete"
+                     [] exec[<<t, s>>].out = "dirty"   -> "resubInit"
+                     [] exec[<<t, s>>].out = "retry"   ->
+                            IF hasDown[t] THEN "resubInit" ELSE "parkAcq"
+                     [] OTHER                          -> "complete"]
     /\ UNCHANGED <<status, tally, unsubs, hasDown, completedCount, inc,
                    declared, publishedInc, doublePub, snap, submitVars,
-                   active, graphSem, version>>
+                   active, graphSem, version, retryVars>>
 
 (* completionSignal.complete(Right) — TxnResultSuccess dispatch. The code
    never demotes executionStatus (nothing writes it after Running except a
@@ -517,7 +613,7 @@ ExecComplete(t, s) ==
     /\ exec'   = [exec EXCEPT ![<<t, s>>] = NoExec]
     /\ UNCHANGED <<status, tally, unsubs, hasDown, inc, declared,
                    publishedInc, doublePub, cascadeFired, droppedSpawn, snap, submitVars,
-                   unsubW, schedVars>>
+                   unsubW, schedVars, retryVars>>
 
 (* TxnResultLogDirty dispatch: refine the declared footprint to the actual
    one (log-derived, getValidated) and resubmit via
@@ -537,7 +633,12 @@ ExecResubInit(t, s) ==
     /\ exec[<<t, s>>].pc = "resubInit"
     /\ inc[t] < MaxInc
     /\ submitPc[t] = "idle"
-    /\ declared'     = [declared EXCEPT ![t] = Validated(ActualFP(t))]
+    \* dirty refines the declared footprint from the log and resubmits via
+    \* submitTxnForImmediateRetry; a retry-with-downstream keeps its
+    \* footprint and resubmits via plain submitTxn (both freshIncarnation).
+    /\ declared'     = [declared EXCEPT ![t] =
+                           IF exec[<<t, s>>].out = "dirty"
+                           THEN Validated(ActualFP(t)) ELSE @]
     /\ inc'          = [inc EXCEPT ![t] = @ + 1]
     /\ publishedInc' = [publishedInc EXCEPT ![t] = FALSE]
     \* freshIncarnation: brand-new tally / unsub-edge map / status /
@@ -552,24 +653,33 @@ ExecResubInit(t, s) ==
     /\ cascadeFired' = [cascadeFired EXCEPT ![t] = FALSE]
     /\ hasDown'      = [hasDown EXCEPT ![t] = FALSE]
     /\ submitPc'     = [submitPc EXCEPT ![t] = "reset1"]
-    /\ submitMode'   = [submitMode EXCEPT ![t] = "imm"]
+    /\ submitMode'   = [submitMode EXCEPT ![t] =
+                           IF exec[<<t, s>>].out = "dirty" THEN "imm" ELSE "plain"]
     /\ exec'         = [exec EXCEPT ![<<t, s>>].pc = "resubWait"]
     /\ UNCHANGED <<completedCount, doublePub, droppedSpawn, snap,
                    scanPending, curTarget, curDir, curContained, unsubW,
-                   schedVars>>
+                   schedVars, retryVars>>
 
-(* A dirty fiber at the incarnation bound retires its slot: the code would
-   resubmit unboundedly; the model truncates the behaviour here and frees
-   the slot (leaving it pinned would compound the two-slot masking that
-   droppedSpawn guards against). Safety-only truncation — and with deadlock
-   detection enabled, a truncation that ever mattered would strand its
-   transaction and surface as a deadlock; the clean run therefore also
-   proves MaxInc never binds in this scenario (README sweeps section). *)
+(* A fiber at the incarnation bound retires its slot: the code would
+   resubmit unboundedly; the model truncates the behaviour here, frees the
+   slot, and raises truncatedWake so the state counts as a legitimate
+   exploration horizon (Terminating stutters on it) rather than a protocol
+   deadlock. The retry/park scenarios NEED this: a retrier can consume an
+   incarnation per spin while its conflictor sits mid-submission, so every
+   finite MaxInc is exhaustible by adversarial scheduling — in the code the
+   spin is bounded by the conflictor's real progress (a fairness argument,
+   noted in the README). In the H4 safety scenario the clean run shows the
+   bound never binds (truncatedWake stays FALSE — checked by the
+   BoundsNeverBind invariant there). *)
 ExecResubTruncate(t, s) ==
     /\ exec[<<t, s>>].pc = "resubInit"
     /\ inc[t] >= MaxInc
     /\ exec' = [exec EXCEPT ![<<t, s>>] = NoExec]
-    /\ UNCHANGED <<txnVars, submitVars, unsubW, schedVars>>
+    /\ truncatedWake' = TRUE
+    /\ UNCHANGED <<status, tally, unsubs, hasDown, completedCount, inc,
+                   declared, publishedInc, doublePub, cascadeFired,
+                   droppedSpawn, snap, submitVars, unsubW, schedVars,
+                   parked, retrySem, sweep, droppedSweep, parkChk>>
 
 (* The imm submission ran to completion inside this fiber; execute returns. *)
 ExecResubDone(t, s) ==
@@ -577,7 +687,7 @@ ExecResubDone(t, s) ==
     /\ submitPc[t] = "idle"
     /\ submitMode[t] = "imm"
     /\ exec' = [exec EXCEPT ![<<t, s>>] = NoExec]
-    /\ UNCHANGED <<txnVars, submitVars, unsubW, schedVars>>
+    /\ UNCHANGED <<txnVars, submitVars, unsubW, schedVars, retryVars>>
 
 (* An exception inside the imm submission propagates to execute's
    handleErrorWith: registerCompletion runs a SECOND time
@@ -591,7 +701,7 @@ ExecResubAbort(t, s) ==
     /\ submitPc' = [submitPc EXCEPT ![t] = "idle"]
     /\ exec'     = [exec EXCEPT ![<<t, s>>] = [pc |-> "eRegComp", out |-> "fail", fInc |-> exec[<<t, s>>].fInc]]
     /\ UNCHANGED <<txnVars, submitMode, scanPending, curTarget, curDir,
-                   curContained, unsubW, active, version>>
+                   curContained, unsubW, active, version, retryVars>>
 
 (* Error path: registerCompletion (possibly the second time — idempotent on
    the active set, NOT on the unsub cascade), then complete(Left). *)
@@ -600,7 +710,7 @@ ExecErrRegComplete(t, s) ==
     /\ graphSem = "none"
     /\ active' = active \ {t}
     /\ exec'   = [exec EXCEPT ![<<t, s>>].pc = "eSpawnU"]
-    /\ UNCHANGED <<txnVars, submitVars, unsubW, graphSem, version>>
+    /\ UNCHANGED <<txnVars, submitVars, unsubW, graphSem, version, retryVars>>
 
 ExecErrSpawnUnsub(t, s) ==
     /\ exec[<<t, s>>].pc = "eSpawnU"
@@ -612,7 +722,7 @@ ExecErrSpawnUnsub(t, s) ==
     /\ exec' = [exec EXCEPT ![<<t, s>>].pc = "eComplete"]
     /\ UNCHANGED <<status, tally, unsubs, hasDown, completedCount, inc,
                    declared, publishedInc, doublePub, snap, submitVars,
-                   active, graphSem, version>>
+                   active, graphSem, version, retryVars>>
 
 ExecErrComplete(t, s) ==
     /\ exec[<<t, s>>].pc = "eComplete"
@@ -620,7 +730,7 @@ ExecErrComplete(t, s) ==
     /\ exec'   = [exec EXCEPT ![<<t, s>>] = NoExec]
     /\ UNCHANGED <<status, tally, unsubs, hasDown, inc, declared,
                    publishedInc, doublePub, cascadeFired, droppedSpawn, snap, submitVars,
-                   unsubW, schedVars>>
+                   unsubW, schedVars, retryVars>>
 
 ---------------------------------------------------------------------------
 (* triggerUnsub cascades — detached fibers, NO semaphore. Post-fix, a
@@ -647,7 +757,7 @@ UnsubDrain(o, u) ==
              /\ UNCHANGED <<tally, exec, droppedSpawn>>
     /\ UNCHANGED <<status, unsubs, hasDown, completedCount, inc, declared,
                    publishedInc, doublePub, cascadeFired, snap, submitVars,
-                   schedVars>>
+                   schedVars, retryVars>>
 
 (* unsubSpecs.clear() — a no-op if the owner re-incarnated (the cascade
    holds the old, dead map; the new incarnation's map is already fresh). *)
@@ -660,18 +770,151 @@ UnsubClear(o, u) ==
     /\ unsubW' = [unsubW EXCEPT ![<<o, u>>] = NoUnsub]
     /\ UNCHANGED <<status, tally, hasDown, completedCount, inc, declared,
                    publishedInc, doublePub, cascadeFired, droppedSpawn,
-                   snap, submitVars, exec, schedVars>>
+                   snap, submitVars, exec, schedVars, retryVars>>
 
 ---------------------------------------------------------------------------
 (* Next *)
 ---------------------------------------------------------------------------
+
+---------------------------------------------------------------------------
+(* Retry machinery (Phase 2): submitTxnForRetry parks under the retry
+   semaphore; checkRetryQueue sweeps run fire-and-forget after every
+   submission's release and wake parked txns whose footprints conflict
+   with the submitted one — wakes fire ONLY from these sweeps. The H1
+   window: the parking fiber left activeTransactions at regComp and lands
+   in the retry map only at ParkAdd; a conflicting writer whose sweep runs
+   in that gap sees the parker in neither structure. *)
+---------------------------------------------------------------------------
+
+(* retrySemaphore.permit acquire for the park region *)
+ExecParkAcq(t, s) ==
+    /\ exec[<<t, s>>].pc = "parkAcq"
+    /\ retrySem = NoHolder
+    /\ retrySem' = [kind |-> "park", t |-> t]
+    /\ exec'     = [exec EXCEPT ![<<t, s>>].pc = "parkScan"]
+    /\ UNCHANGED <<txnVars, submitVars, unsubW, active, graphSem, version,
+                   parked, sweep, droppedSweep, truncatedWake, parkChk>>
+
+(* Park region, split in CODE ORDER — NOT collapsed. The retry semaphore
+   serializes this region against SWEEPS but NOT against commits or
+   completions, so each read is its own step and a conflictor can move
+   between the reads. THE ORDER IS LOAD-BEARING (H1):
+
+     ExecParkScan  — activeTransactions scan, catching conflictors that
+                     have not yet committed (their submission sweep already
+                     ran, against a map not yet containing us).
+     ExecParkStale — read-set staleness, catching conflictors that already
+                     COMMITTED. It must be the LAST read before the insert:
+                     a conflictor committing after it is either still in
+                     activeTransactions at scan time (removal follows its
+                     commit, and the scan precedes the stale read) or has a
+                     sweep still blocked on the retry semaphore we hold —
+                     which will find us parked and wake us.
+
+   The reverse order (stale, then scan) LOSES WAKEUPS: a conflictor can
+   commit after the stale read and leave activeTransactions before the
+   scan, escaping both — TLC finds that deadlock at depth 55. *)
+ExecParkStale(t, s) ==
+    /\ exec[<<t, s>>].pc = "parkStale"
+    /\ retrySem = [kind |-> "park", t |-> t]
+    /\ parkChk' = [parkChk EXCEPT ![<<t, s>>].st =
+                      \E v \in CombinedIds(ActualFP(t)) : version[v] /= snap[<<t, s>>][v]]
+    /\ exec' = [exec EXCEPT ![<<t, s>>].pc = "parkInsert"]
+    /\ UNCHANGED <<txnVars, submitVars, unsubW, active, graphSem, version,
+                   parked, retrySem, sweep, droppedSweep, truncatedWake>>
+
+ExecParkScan(t, s) ==
+    /\ exec[<<t, s>>].pc = "parkScan"
+    /\ retrySem = [kind |-> "park", t |-> t]
+    /\ parkChk' = [parkChk EXCEPT ![<<t, s>>].cf =
+                      \E a \in active : ~IsCompatible(declared[t], declared[a])]
+    /\ exec' = [exec EXCEPT ![<<t, s>>].pc = "parkStale"]
+    /\ UNCHANGED <<txnVars, submitVars, unsubW, active, graphSem, version,
+                   parked, retrySem, sweep, droppedSweep, truncatedWake>>
+
+ExecParkInsert(t, s) ==
+    /\ exec[<<t, s>>].pc = "parkInsert"
+    /\ retrySem = [kind |-> "park", t |-> t]
+    /\ parkChk' = [parkChk EXCEPT ![<<t, s>>] = [cf |-> FALSE, st |-> FALSE]]
+    /\ retrySem' = NoHolder
+    /\ IF parkChk[<<t, s>>].cf \/ parkChk[<<t, s>>].st
+       THEN /\ exec' = [exec EXCEPT ![<<t, s>>] =
+                           [pc |-> "resubInit", out |-> "retry",
+                            fInc |-> exec[<<t, s>>].fInc]]
+            /\ UNCHANGED parked
+       ELSE /\ parked' = parked \cup {t}
+            /\ exec'   = [exec EXCEPT ![<<t, s>>] = NoExec]
+    /\ UNCHANGED <<txnVars, submitVars, unsubW, active, graphSem, version,
+                   sweep, droppedSweep, truncatedWake>>
+
+(* checkRetryQueue: acquire the retry semaphore and snapshot the parked
+   set (retryMap.keys.toList) — evaluated HERE, not at spawn time. *)
+SweepAcquire(t, k) ==
+    /\ sweep[<<t, k>>].ph = "acq"
+    /\ retrySem = NoHolder
+    /\ retrySem' = [kind |-> "sweep", t |-> t]
+    /\ sweep'    = [sweep EXCEPT ![<<t, k>>] =
+                       [ph |-> "scan", pend |-> parked, fp |-> sweep[<<t, k>>].fp]]
+    /\ UNCHANGED <<txnVars, submitVars, exec, unsubW, active, graphSem,
+                   version, parked, droppedSweep, truncatedWake, parkChk>>
+
+(* Per parked txn: if it is NOT the submitter itself and its footprint
+   conflicts with the submitted one, run the stored wake — freshIncarnation
+   >>= submitTxn, .start'ed — and drop it from the map. The self-skip
+   (p /= t) matters: a parked transaction is footprint-incompatible with
+   ITSELF (it writes), so without it a transaction's own in-flight
+   submission sweep wakes it, it re-runs, re-parks, and the next sweep can
+   do it again — an unbounded spurious spin. Its own submission cannot
+   satisfy its own predicate: it retried rather than committed. This is why
+   the retry map is keyed by TxnId rather than by footprint. *)
+SweepWake(t, k) ==
+    /\ sweep[<<t, k>>].ph = "scan"
+    /\ sweep[<<t, k>>].pend /= {}
+    /\ retrySem = [kind |-> "sweep", t |-> t]
+    /\ \E p \in sweep[<<t, k>>].pend :
+        IF p /= t /\ ~IsCompatible(sweep[<<t, k>>].fp, declared[p]) /\ p \in parked
+        THEN /\ parked' = parked \ {p}
+             /\ IF inc[p] < MaxInc
+                THEN /\ inc'          = [inc EXCEPT ![p] = @ + 1]
+                     /\ tally'        = [tally EXCEPT ![p] = 0]
+                     /\ unsubs'       = [unsubs EXCEPT ![p] = {}]
+                     /\ status'       = [status EXCEPT ![p] = "NotScheduled"]
+                     /\ cascadeFired' = [cascadeFired EXCEPT ![p] = FALSE]
+                     /\ hasDown'      = [hasDown EXCEPT ![p] = FALSE]
+                     /\ publishedInc' = [publishedInc EXCEPT ![p] = FALSE]
+                     /\ submitPc'     = [submitPc EXCEPT ![p] = "reset1"]
+                     /\ submitMode'   = [submitMode EXCEPT ![p] = "plain"]
+                     /\ UNCHANGED truncatedWake
+                ELSE /\ truncatedWake' = TRUE
+                     /\ UNCHANGED <<inc, tally, unsubs, status, cascadeFired,
+                                    hasDown, publishedInc, submitPc, submitMode>>
+             /\ sweep' = [sweep EXCEPT ![<<t, k>>].pend = @ \ {p}]
+        ELSE /\ sweep' = [sweep EXCEPT ![<<t, k>>].pend = @ \ {p}]
+             /\ UNCHANGED <<parked, inc, tally, unsubs, status, cascadeFired,
+                            hasDown, publishedInc, submitPc, submitMode,
+                            truncatedWake>>
+    /\ UNCHANGED <<completedCount, declared, doublePub, droppedSpawn, snap,
+                   scanPending, curTarget, curDir, curContained, exec,
+                   unsubW, active, graphSem, version, retrySem, droppedSweep,
+                   parkChk>>
+
+(* Sweep done: permit release *)
+SweepRelease(t, k) ==
+    /\ sweep[<<t, k>>].ph = "scan"
+    /\ sweep[<<t, k>>].pend = {}
+    /\ retrySem = [kind |-> "sweep", t |-> t]
+    /\ retrySem' = NoHolder
+    /\ sweep'    = [sweep EXCEPT ![<<t, k>>] = NoSweep]
+    /\ UNCHANGED <<txnVars, submitVars, exec, unsubW, active, graphSem,
+                   version, parked, droppedSweep, truncatedWake, parkChk>>
 
 (* Legitimate terminal states stutter: every submitted transaction's
    completion signal has fired. Anything else with no enabled action is a
    REAL protocol deadlock, and TLC's deadlock detection (now enabled for
    organic runs — no -deadlock flag) reports it. *)
 Terminating ==
-    /\ \A t \in Txns : completedCount[t] >= 1
+    /\ \/ \A t \in Txns : completedCount[t] >= 1
+       \/ truncatedWake
     /\ UNCHANGED vars
 
 Next ==
@@ -689,8 +932,12 @@ Next ==
         \/ ExecResubDone(t, s)  \/ ExecResubAbort(t, s)
         \/ ExecErrRegComplete(t, s) \/ ExecErrSpawnUnsub(t, s)
         \/ ExecErrComplete(t, s)
+        \/ ExecParkAcq(t, s)    \/ ExecParkScan(t, s)
+        \/ ExecParkStale(t, s)  \/ ExecParkInsert(t, s)
     \/ \E o \in Txns, u \in {"u1", "u2"} :
         \/ UnsubDrain(o, u) \/ UnsubClear(o, u)
+    \/ \E t \in Txns, k \in {"s1", "s2", "s3"} :
+        \/ SweepAcquire(t, k) \/ SweepWake(t, k) \/ SweepRelease(t, k)
     \/ Terminating
 
 Spec == Init /\ [][Next]_vars
@@ -759,6 +1006,13 @@ CompletionAtMostOnce == \A t \in Txns : completedCount[t] <= 1
 
 (* A transaction's writes are published at most once per incarnation *)
 NoDoublePublish == \A t \in Txns : ~doublePub[t]
+
+(* For scenarios whose behaviour fits inside the exploration bounds (the
+   H4 safety scenario does), no truncation and no dropped sweep occurred —
+   the verdicts are exhaustive, not horizon-clipped. Retry scenarios omit
+   this: a retrier can legitimately spin to the incarnation bound while
+   its conflictor is mid-submission. *)
+BoundsNeverBind == ~truncatedWake /\ ~droppedSweep
 
 
 ===============================================================================

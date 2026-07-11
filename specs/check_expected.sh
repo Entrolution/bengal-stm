@@ -50,6 +50,21 @@ if [[ "$EXPECTED" == "NONE" ]]; then
   exit 1
 fi
 
+# EXPECTED=DEADLOCK pins a reachable dead-end state (e.g. a transaction
+# parked forever — the H1 class): the spec's Terminating stutter covers
+# legitimate ends, so a reported deadlock is the pinned defect.
+if [[ "$EXPECTED" == "DEADLOCK" ]]; then
+  if grep -q "Deadlock reached" "$OUT"; then
+    echo "OK: $TLA ($CFG) — reproduced the pinned deadlock."
+    exit 0
+  fi
+  echo "UNEXPECTED: $TLA ($CFG) did not reproduce the pinned deadlock (exit $TLC_EXIT)." >&2
+  echo "If the protocol was fixed, update the verdict table in specs/README.md," >&2
+  echo "the hypothesis rows in docs/plans/formal-specs.md, and this CI expectation." >&2
+  tail -40 "$OUT" >&2
+  exit 1
+fi
+
 if grep -q "Invariant $EXPECTED is violated" "$OUT"; then
   echo "OK: $TLA ($CFG) — reproduced the pinned counterexample ($EXPECTED)."
   exit 0
