@@ -1,0 +1,1 @@
+../common/Footprint.tla

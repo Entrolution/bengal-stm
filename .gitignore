@@ -10,3 +10,11 @@ target
 /src/main/resources/dataDecrypted/
 scoverage-data/
 scoverage-report/
+
+# TLA+ tooling (specs/) — jar downloaded in CI, TLC run artifacts never committed
+specs/tla2tools.jar
+specs/**/*_TTrace_*
+specs/**/states/
+
+# TLC drops states/ in the working directory
+/states/

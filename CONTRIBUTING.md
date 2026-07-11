@@ -84,6 +84,18 @@ Key conventions:
 - Tests are located in `src/test/scala`
 - Run tests with `sbt test`
 
+## Formal Specifications
+
+The scheduler and commit protocols carry TLA+ specifications under `specs/`
+(see `specs/README.md`). PRs touching `TxnRuntimeContext.scala`,
+`TxnLogContext.scala`, `IdFootprint.scala`, or `TxnVarRuntimeId.scala` must
+update the specs to match — or state in the PR description why no protocol
+behaviour changed. CI enforces two things on these paths: `// SPEC:` anchors
+listed in `specs/README.md` must exist, and pinned model-checking
+expectations must reproduce (a pinned counterexample that stops reproducing
+means the protocol changed — update the spec, the verdict table, and
+`docs/plans/formal-specs.md` together).
+
 ## License
 
 By contributing to Bengal STM, you agree that your contributions will be licensed under the Apache License 2.0.

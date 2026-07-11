@@ -1,0 +1,84 @@
+name: TLA+ Specs
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['**', '!update/**', '!pr/**']
+    paths:
+      - 'specs/**'
+      - '.github/workflows/specs.yml'
+      - 'src/main/scala/bengal/stm/runtime/TxnRuntimeContext.scala'
+      - 'src/main/scala/bengal/stm/runtime/TxnLogContext.scala'
+      - 'src/main/scala/bengal/stm/model/runtime/IdFootprint.scala'
+      - 'src/main/scala/bengal/stm/model/runtime/TxnVarRuntimeId.scala'
+  pull_request:
+    paths:
+      - 'specs/**'
+      - '.github/workflows/specs.yml'
+      - 'src/main/scala/bengal/stm/runtime/TxnRuntimeContext.scala'
+      - 'src/main/scala/bengal/stm/runtime/TxnLogContext.scala'
+      - 'src/main/scala/bengal/stm/model/runtime/IdFootprint.scala'
+      - 'src/main/scala/bengal/stm/model/runtime/TxnVarRuntimeId.scala'
+
+concurrency:
+  group: ${{ github.workflow }} @ ${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify-anchors:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Verify SPEC anchors
+        run: ./specs/verify_anchors.sh
+
+  model-check:
+    runs-on: ubuntu-latest
+    needs: verify-anchors
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-java@v5
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      # The v1.8.0 tag is a rolling pre-release (current nightly), so local
+      # and CI jars track each other but are not byte-stable over time — a
+      # pinned-red flip can therefore also mean TLC-version drift, not only
+      # a protocol change; check_expected.sh's failure text says to
+      # investigate before updating pins.
+      - name: Download TLA+ tools
+        run: |
+          curl -fsSL --retry 3 -o specs/tla2tools.jar \
+            https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
+          echo "TLC version:"
+          java -cp specs/tla2tools.jar tlc2.TLC -h 2>&1 | head -3
+
+      - name: Check Footprint lemmas (expected clean)
+        run: |
+          ./specs/check_expected.sh \
+            specs/common/FootprintLemmas.cfg \
+            specs/common/FootprintLemmas.tla \
+            NONE
+
+      - name: Check Scheduler (pinned H4 counterexample)
+        run: |
+          ./specs/check_expected.sh \
+            specs/scheduler/Scheduler.cfg \
+            specs/scheduler/Scheduler.tla \
+            NoDoubleExec
+
+      - name: Check Scheduler robustness (pinned, dispatch only)
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          ./specs/check_expected.sh \
+            specs/scheduler/SchedulerAborts.cfg \
+            specs/scheduler/Scheduler.tla \
+            CompletionAtMostOnce
