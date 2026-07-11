@@ -151,12 +151,12 @@ class TxnLogEntrySpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
       }
     }
 
-    "lock returns Some with commitLock" in withRuntime { implicit stm =>
+    "lock returns the commitLock paired with its OWNER's runtime id" in withRuntime { implicit stm =>
       for {
         tvar <- TxnVar.of(42)
         entry = stm.TxnLogUpdateVarEntry(42, 99, tvar)
         lock <- entry.lock
-      } yield lock shouldBe Some(tvar.commitLock)
+      } yield lock shouldBe Some((tvar.runtimeId, tvar.commitLock))
     }
 
     "idFootprint contains updatedIds only" in withRuntime { implicit stm =>
@@ -292,12 +292,12 @@ class TxnLogEntrySpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
       }
     }
 
-    "lock returns Some with commitLock" in withRuntime { implicit stm =>
+    "lock returns the map's commitLock paired with the MAP's runtime id" in withRuntime { implicit stm =>
       for {
         tvarMap <- TxnVarMap.of(Map("a" -> 1))
         entry = stm.TxnLogUpdateVarMapStructureEntry(Map("a" -> 1), Map("a" -> 2), tvarMap)
         lock <- entry.lock
-      } yield lock shouldBe Some(tvarMap.commitLock)
+      } yield lock shouldBe Some((tvarMap.runtimeId, tvarMap.commitLock))
     }
 
     "idFootprint contains updatedIds only" in withRuntime { implicit stm =>
@@ -465,13 +465,17 @@ class TxnLogEntrySpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
       }
     }
 
-    "lock returns commit lock from key's TxnVar" in withRuntime { implicit stm =>
+    // This test and the new-key one below are the H2 fix at unit level. A map
+    // entry's lock owner is NOT recoverable from the id the log keys it by, so
+    // the owner has to travel WITH the lock — which is why `lock` returns a
+    // pair. Here the key EXISTS, so the owner is the entry's own TxnVar.
+    "lock returns the entry TxnVar's commitLock paired with THAT TxnVar's runtime id" in withRuntime { implicit stm =>
       for {
         tvarMap <- TxnVarMap.of(Map("a" -> 1))
         entry = stm.TxnLogUpdateVarMapEntry("a", Some(1), Some(2), tvarMap)
         lock    <- entry.lock
         oTxnVar <- tvarMap.getTxnVar("a")
-      } yield lock shouldBe oTxnVar.map(_.commitLock)
+      } yield lock shouldBe oTxnVar.map(txnVar => (txnVar.runtimeId, txnVar.commitLock))
     }
 
     "idFootprint contains updatedIds only" in withRuntime { implicit stm =>
@@ -486,12 +490,24 @@ class TxnLogEntrySpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
       }
     }
 
-    "lock returns Some for new key (falls back to map commitLock)" in withRuntime { implicit stm =>
-      for {
-        tvarMap <- TxnVarMap.of(Map("a" -> 1))
-        entry = stm.TxnLogUpdateVarMapEntry[String, Int]("newkey", None, Some(5), tvarMap)
-        lock <- entry.lock
-      } yield lock shouldBe Some(tvarMap.commitLock)
+    // A NEW key has no TxnVar yet, so it falls back to the MAP's structural
+    // commitLock — and the owner id must be the MAP's runtimeId, NOT the key's
+    // existential id. That distinction is the whole of H2: the log keys this
+    // entry by the existential id, so sorting log entries ordered acquisitions
+    // by a hash of the KEY while the lock taken belonged to the MAP
+    // (specs/commit/CommitH2.cfg, NoWaitsForCycle).
+    "lock for a NEW key falls back to the map's commitLock paired with the MAP's runtime id" in withRuntime {
+      implicit stm =>
+        for {
+          tvarMap <- TxnVarMap.of(Map("a" -> 1))
+          entry = stm.TxnLogUpdateVarMapEntry[String, Int]("newkey", None, Some(5), tvarMap)
+          lock          <- entry.lock
+          existentialId <- tvarMap.getRuntimeId("newkey")
+        } yield {
+          lock shouldBe Some((tvarMap.runtimeId, tvarMap.commitLock))
+          // and emphatically NOT the existential id the log keys it by
+          lock.map(_._1) should not be Some(existentialId)
+        }
     }
   }
 }

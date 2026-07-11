@@ -44,7 +44,20 @@ private[stm] trait TxnLogContext[F[_]] {
     // conflicting commits that landed after the log ran but whose wake
     // sweep has already been spent (the H1 lost-wakeup fix).
     private[stm] def hasChangedSinceRead: F[Boolean]
-    private[stm] def lock: F[Option[Semaphore[F]]]
+
+    // The commitLock this entry must hold to publish, PAIRED WITH THE RUNTIME
+    // ID OF THE ENTITY THAT OWNS IT. Read-only entries hold no lock at all.
+    //
+    // The owner id is not decoration: it is what withLock sorts on, and it has
+    // to travel WITH the lock because it cannot be recovered from the log key.
+    // A map entry whose key does not yet exist is LOGGED under the existential
+    // id hashed from (mapId, key) but LOCKS the map's structural commitLock —
+    // two unrelated id spaces (see TxnLogUpdateVarMapEntry.lock). Sorting log
+    // entries would therefore order the acquisitions by a hash of the KEY while
+    // the locks acquired belong to the MAPS. That was H2: a circular wait
+    // between two transactions the scheduler had (correctly) judged compatible.
+    private[stm] def lock: F[Option[(TxnVarRuntimeId, Semaphore[F])]]
+
     private[stm] def idFootprint: F[IdFootprint]
 
   }
@@ -95,7 +108,7 @@ private[stm] trait TxnLogContext[F[_]] {
     override private[stm] lazy val hasChangedSinceRead: F[Boolean] =
       txnVar.get.map(_ != initial)
 
-    override private[stm] lazy val lock: F[Option[Semaphore[F]]] =
+    override private[stm] lazy val lock: F[Option[(TxnVarRuntimeId, Semaphore[F])]] =
       Async[F].pure(None)
 
     override private[stm] lazy val idFootprint: F[IdFootprint] =
@@ -136,8 +149,8 @@ private[stm] trait TxnLogContext[F[_]] {
     override private[stm] lazy val hasChangedSinceRead: F[Boolean] =
       isDirty
 
-    override private[stm] lazy val lock: F[Option[Semaphore[F]]] =
-      Async[F].delay(Some(txnVar.commitLock))
+    override private[stm] lazy val lock: F[Option[(TxnVarRuntimeId, Semaphore[F])]] =
+      Async[F].delay(Some((txnVar.runtimeId, txnVar.commitLock)))
 
     override private[stm] lazy val idFootprint: F[IdFootprint] =
       Async[F].delay(txnVar.runtimeId).map { rid =>
@@ -174,7 +187,7 @@ private[stm] trait TxnLogContext[F[_]] {
     override private[stm] lazy val hasChangedSinceRead: F[Boolean] =
       txnVarMap.get.map(_ != initial)
 
-    override private[stm] lazy val lock: F[Option[Semaphore[F]]] =
+    override private[stm] lazy val lock: F[Option[(TxnVarRuntimeId, Semaphore[F])]] =
       Async[F].pure(None)
 
     override private[stm] lazy val idFootprint: F[IdFootprint] =
@@ -215,8 +228,8 @@ private[stm] trait TxnLogContext[F[_]] {
     override private[stm] lazy val hasChangedSinceRead: F[Boolean] =
       isDirty
 
-    override private[stm] lazy val lock: F[Option[Semaphore[F]]] =
-      Async[F].delay(Some(txnVarMap.commitLock))
+    override private[stm] lazy val lock: F[Option[(TxnVarRuntimeId, Semaphore[F])]] =
+      Async[F].delay(Some((txnVarMap.runtimeId, txnVarMap.commitLock)))
 
     override private[stm] lazy val idFootprint: F[IdFootprint] =
       Async[F].delay(txnVarMap.runtimeId).map { rid =>
@@ -255,7 +268,7 @@ private[stm] trait TxnLogContext[F[_]] {
     override private[stm] lazy val hasChangedSinceRead: F[Boolean] =
       txnVarMap.get(key).map(_ != initial)
 
-    override private[stm] lazy val lock: F[Option[Semaphore[F]]] =
+    override private[stm] lazy val lock: F[Option[(TxnVarRuntimeId, Semaphore[F])]] =
       Async[F].pure(None)
 
     override private[stm] lazy val idFootprint: F[IdFootprint] =
@@ -313,10 +326,18 @@ private[stm] trait TxnLogContext[F[_]] {
     override private[stm] lazy val hasChangedSinceRead: F[Boolean] =
       isDirty
 
-    override private[stm] lazy val lock: F[Option[Semaphore[F]]] =
+    // The map-lock fallback, and the reason the owner id has to be carried:
+    // a key that does not yet exist has no TxnVar, so this entry locks the
+    // MAP's structural commitLock while being logged under the existential id
+    // hashed from (mapId, key). Owner and log key are different entities.
+    override private[stm] lazy val lock: F[Option[(TxnVarRuntimeId, Semaphore[F])]] =
       for {
         oTxnVar <- txnVarMap.getTxnVar(key)
-      } yield Some(oTxnVar.map(_.commitLock).getOrElse(txnVarMap.commitLock))
+      } yield Some(
+        oTxnVar
+          .map(txnVar => (txnVar.runtimeId, txnVar.commitLock))
+          .getOrElse((txnVarMap.runtimeId, txnVarMap.commitLock))
+      )
 
     override private[stm] lazy val idFootprint: F[IdFootprint] =
       txnVarMap.getRuntimeId(key).map { rid =>
@@ -1075,26 +1096,36 @@ private[stm] trait TxnLogContext[F[_]] {
         }
         .map(_.reduce(_ mergeWith _))
 
-    // SPEC: NoWaitsForCycle — EXPECTED-RED; this is the H2 mechanism site.
-    // The sort key and the lock identity live in DIFFERENT id spaces. We sort
-    // log entries by their LOG KEY (_._1.value), but a map entry for an ABSENT
-    // key resolves its lock to the MAP's structural commitLock
-    // (TxnLogUpdateVarMapEntry.lock) while being logged under the existential
-    // id hashed from (mapId, key). So a new-key insert takes the map's lock at
-    // a sort position that has nothing to do with that lock — and sorting
-    // therefore cannot order the acquired locks consistently across
-    // transactions. Two transactions inserting fresh keys into two maps have
-    // COMPATIBLE footprints (the scheduler deliberately runs them
-    // concurrently), both hold {M1.lock, M2.lock}, and hash-derived order can
-    // invert their acquisition order: circular wait, both fibers blocked
-    // forever on Semaphore.permit. specs/commit/CommitH2.cfg pins the
-    // counterexample; the fix is to sort by the LOCK'S OWNER id, not the log
-    // key (negative control NC-1 in specs/README.md).
+    // SPEC: NoWaitsForCycle — the H2 fix. Acquire the write set's commitLocks
+    // in ascending order of THE ID OF THE ENTITY THAT OWNS EACH LOCK. Because
+    // owner -> lock is injective, one ascending order is a single global total
+    // order over locks, and a set of transactions that all respect it cannot
+    // form a circular wait (the classic resource-ordering argument).
+    //
+    // This used to sort the LOG ENTRIES by their log key, which is NOT the same
+    // thing and did not order the locks at all: a map entry for a key that does
+    // not yet exist is logged under the existential id hashed from (mapId, key)
+    // but locks the MAP's structural commitLock. Sorting by the log key
+    // therefore ordered acquisitions by a hash of the KEY while the locks
+    // acquired belonged to the MAPS — two unrelated id spaces. Two transactions
+    // inserting fresh keys into two maps have COMPATIBLE footprints, so the
+    // scheduler runs them concurrently by design; both then hold
+    // {M1.lock, M2.lock}, and hash-derived key order could invert their
+    // acquisition order into a deadlock. specs/commit/CommitH2.cfg pins it.
+    //
+    // .distinct dedupes on the (owner id, Semaphore) pair, so the two entries
+    // of a double insert into ONE map — which alias to that map's single lock —
+    // collapse to one acquisition rather than self-deadlocking a 1-permit
+    // Semaphore. It compares the Semaphore by reference, so distinct locks that
+    // suffered a runtime-id hash collision are both still acquired (id
+    // collisions are assumed away — see specs/README.md).
     override private[stm] def withLock[A](fa: F[A]): F[A] =
       for {
-        locks <- log.toList.sortBy(_._1.value).traverse(_._2.lock)
+        locks <- log.values.toList.traverse(_.lock)
         result <-
           locks.flatten.distinct
+            .sortBy(_._1.value)
+            .map(_._2)
             .foldLeft(Resource.eval(Async[F].unit))((i, j) => i >> j.permit)
             .use(_ => fa)
       } yield result
