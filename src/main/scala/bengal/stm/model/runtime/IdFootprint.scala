@@ -20,7 +20,26 @@ package bengal.stm.model.runtime
 private[stm] case class IdFootprint(
   readIds: Set[TxnVarRuntimeId],
   updatedIds: Set[TxnVarRuntimeId],
-  isValidated: Boolean = false
+  isValidated: Boolean = false,
+  // SPEC: CommitSnapshotValid — the H3 fix. TRUE when the static-analysis
+  // walker could not determine the full access set, so this footprint is an
+  // UNDER-APPROXIMATION: some ids the transaction really touches are missing.
+  //
+  // That is categorically different from an empty footprint. "I touch nothing"
+  // is a fact the scheduler can act on; "I don't know what I touch" is not, and
+  // treating the two alike is unsound rather than merely imprecise. Reads are
+  // never commit-validated and hold no lock, so the scheduler's footprint
+  // conflict-avoidance is the ONLY defence against a stale read; a missing id
+  // silently switches it off. Unsound in BOTH directions, too: an under-declared
+  // transaction reads what a peer overwrites, AND its undeclared writes
+  // invalidate a correctly-declared peer's reads (a transaction with no reads at
+  // all still breaks its peer). See specs/commit/CommitH3*.cfg.
+  //
+  // An under-approximated footprint is therefore incompatible with EVERYTHING
+  // (isCompatibleWith below), which serializes such a transaction against all
+  // others. It then runs alone, so nothing can change under it, so its reads are
+  // trivially valid. The cost is throughput on that path only.
+  isUnderApproximated: Boolean = false
 ) {
 
   // SPEC: LemmaValidatedIdempotent — one application of this transform is a
@@ -56,7 +75,19 @@ private[stm] case class IdFootprint(
     this.copy(updatedIds = updatedIds + id)
 
   private[stm] def mergeWith(idScope: IdFootprint): IdFootprint =
-    this.copy(readIds = readIds ++ idScope.readIds, updatedIds = updatedIds ++ idScope.updatedIds)
+    this.copy(
+      readIds    = readIds ++ idScope.readIds,
+      updatedIds = updatedIds ++ idScope.updatedIds,
+      // Incompleteness is contagious: a merge is only as trustworthy as its
+      // least trustworthy half.
+      isUnderApproximated = isUnderApproximated || idScope.isUnderApproximated
+    )
+
+  // The static analysis could not see the whole access set. Everything after
+  // the throw point in the free recursion went unrecorded, so what we hold is a
+  // subset of the truth and must not be trusted as if it were the truth.
+  private[stm] def markUnderApproximated: IdFootprint =
+    this.copy(isUnderApproximated = true)
 
   // SPEC: DocumentsParentReadChildWriteCaught — the conflict matrix over the
   // parent hierarchy is: raw-id overlap with the other side's writes (first
@@ -76,8 +107,21 @@ private[stm] case class IdFootprint(
       _.parent.exists(p => input.readRawIds.contains(p.value))
     )
 
+  // SPEC: CommitSnapshotValid — the H3 fix, first clause. A footprint that
+  // under-approximates its transaction's access set is incompatible with every
+  // other transaction, itself included, because the ids that would have
+  // revealed the conflict are precisely the ids that are missing. There is no
+  // sound way to compare against a set you know to be incomplete: any
+  // "compatible" verdict would be an inference from absent evidence.
+  //
+  // The transaction is therefore serialized against all others and runs alone,
+  // which makes its unvalidated reads trivially safe. The dirty path then
+  // refines the footprint from the ACTUAL log (which is complete by
+  // construction, being built from real entries), so the retry runs at full
+  // concurrency.
   private[stm] def isCompatibleWith(input: IdFootprint): Boolean =
-    asymmetricCompatibleWith(input) && input.asymmetricCompatibleWith(this)
+    !isUnderApproximated && !input.isUnderApproximated &&
+      asymmetricCompatibleWith(input) && input.asymmetricCompatibleWith(this)
 }
 
 private[stm] object IdFootprint {

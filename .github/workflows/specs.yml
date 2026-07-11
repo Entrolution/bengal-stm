@@ -92,9 +92,11 @@ jobs:
             ALLOW_DEADLOCK
 
       # --- Commit protocol (Spec A) ---
-      # H2 and H3 are CONFIRMED, OPEN defects. Their counterexamples are pinned
-      # so that CI fails if they stop reproducing — which is what forces the
-      # fix, the verdict table and the plan to move together.
+      # H2 and H3 are both FIXED; every config below is expected clean. The
+      # negative controls that keep these verdicts honest (reverting each fix
+      # must reproduce its counterexample) are documented in specs/README.md
+      # and run manually — a green run here means the fix works, not that the
+      # model stopped looking.
 
       - name: Check commit protocol — H2 lock ordering (expected clean since the H2 fix)
         run: |
@@ -103,26 +105,26 @@ jobs:
             specs/commit/CommitProtocol.tla \
             NONE
 
-      - name: Check commit protocol — H3 under-declared read skew (pinned RED)
+      - name: Check commit protocol — H3 under-declared read skew (expected clean since the H3 fix)
         run: |
           ./specs/check_expected.sh \
             specs/commit/CommitH3.cfg \
             specs/commit/CommitProtocol.tla \
-            CommitSnapshotValid
+            NONE
 
-      - name: Check commit protocol — H3 on the PARTIAL footprint ordinary code produces (pinned RED)
+      - name: Check commit protocol — H3 on the PARTIAL footprint ordinary code produces (expected clean since the H3 fix)
         run: |
           ./specs/check_expected.sh \
             specs/commit/CommitH3Partial.cfg \
             specs/commit/CommitProtocol.tla \
-            CommitSnapshotValid
+            NONE
 
-      - name: Check commit protocol — H3 under-declared writer (pinned RED)
+      - name: Check commit protocol — H3 under-declared writer (expected clean since the H3 fix)
         run: |
           ./specs/check_expected.sh \
             specs/commit/CommitH3Writer.cfg \
             specs/commit/CommitProtocol.tla \
-            CommitSnapshotValid
+            NONE
 
       - name: Check commit protocol — dirty refinement (expected clean)
         run: |

@@ -167,41 +167,83 @@ class StaticAnalysisFallbackSpec extends AnyFreeSpec with Matchers {
   }
 
   // -------------------------------------------------------------------
-  // H3 pinned reproduction (EXPECTED ANOMALY — flips red when fixed)
+  // H3 regression (was a pinned defect until 2026-07-11)
   // -------------------------------------------------------------------
 
-  "H3 static-analysis fallback: read-your-own-write defeats footprint declaration" - {
+  "H3 regression — read-your-own-write can no longer defeat footprint declaration" - {
     /* Two transactions in the r x / w y and r y / w x skew shape, each prefixed
      * with an ordinary read-your-own-write whose continuation is partial. The
      * prelude throws during static analysis (the analyser never applied the
-     * write, so the read-back is None), TxnRuntime.commit falls back to the
-     * partial footprint gathered up to that point, and neither x nor y appears
-     * in it. The scheduler therefore sees two mutually-compatible transactions
-     * and runs them concurrently; neither is dirty at commit (their write sets
-     * are disjoint) and neither holds a read lock, so both publish having read
-     * what the other overwrote. Measured on first probe: 198/200 reps skewed on
-     * a 12-core host — i.e. under contention the anomaly is the DEFAULT outcome,
-     * exactly as for H5 before its fix.
+     * write, so the read-back is None); TxnRuntime.commit falls back to the
+     * PARTIAL footprint gathered up to that point, and neither x nor y appears
+     * in it.
      *
-     * This test PINS the defect the way check_expected.sh pins TLC
-     * counterexamples: it asserts the anomaly still reproduces. IF THIS GOES RED
-     * the fallback was made sound — update the verdict table in
-     * specs/README.md, the H3 row in docs/plans/formal-specs.md, flip
-     * specs/commit/CommitH3.cfg and CommitH3Writer.cfg to expected-clean, and
-     * rewrite this test to assert that no rep skews.
+     * BEFORE THE FIX the scheduler trusted that partial footprint as though it
+     * were complete, judged the two transactions compatible, and ran them
+     * concurrently. Neither was dirty at commit (their write sets are disjoint)
+     * and neither held a read lock, so both published having read what the other
+     * overwrote. Measured: 198/200 reps skewed on a 12-core host — under
+     * contention the anomaly was the DEFAULT outcome, exactly as for H5 pre-fix.
+     *
+     * THE FIX flags an under-approximated footprint (IdFootprint
+     * .isUnderApproximated) and the relation makes it incompatible with
+     * EVERYTHING, so such a transaction is serialized against all others and
+     * runs alone. Running alone, nothing can change under it, so its unvalidated
+     * reads are trivially safe. Post-fix: 0 skews in 1000 reps.
+     *
+     * If this ever goes red again, the fallback lost its flag somewhere — check
+     * that getValidated still copies it through and that every under-approximating
+     * handler still calls markUnderApproximated (TxnRuntime.commit has two, and
+     * TxnCompilerContext has three that swallow silently).
      */
-    "reproduces (pinned defect — see specs/README.md verdict table)" in {
+    "no rep skews" in {
       val maxReps = 1000
-      val anomaly = (1 to maxReps).exists { _ =>
+      val skews = (1 to maxReps).count { _ =>
         runPair { (x, y, scratch) => implicit stm =>
           List(skewTxn(x, y, scratch, "a"), skewTxn(y, x, scratch, "b"))
         }
       }
       withClue(
-        s"no write skew observed in $maxReps reps — if the static-analysis fallback " +
-          "was made sound, flip this pin (see the comment above)"
+        s"write skew reappeared in $skews of $maxReps reps — an under-approximated " +
+          "footprint is being trusted again (see the comment above): "
       ) {
-        anomaly shouldBe true
+        skews shouldBe 0
+      }
+    }
+
+    /* The fix must not cost correctness on the refinement path. An
+     * under-approximated transaction runs alone, so it can never be dirty; but a
+     * transaction whose footprint diverges WITHOUT a throw still can, and it must
+     * still refine and re-run. Here both transactions really write x while one
+     * declares it accurately, so they contend on x's commitLock, the loser goes
+     * dirty, refines from the ACTUAL log (which is complete, hence unflagged) and
+     * re-runs at full concurrency. Modelled in specs/commit/CommitDirty.cfg.
+     */
+    "an under-declared transaction still commits its effects exactly once" in {
+      val reps = 100
+      val results = (1 to reps).map { _ =>
+        STM
+          .runtime[IO]
+          .flatMap { implicit stm =>
+            for {
+              x       <- TxnVar.of[IO, Int](0)
+              y       <- TxnVar.of[IO, Int](0)
+              scratch <- TxnVarMap.of[IO, String, Int](Map.empty)
+              _ <- List(
+                     skewTxn(x, y, scratch, "a").commit,
+                     skewTxn(y, x, scratch, "b").commit
+                   ).parSequence
+              fx <- x.get.commit
+              fy <- y.get.commit
+            } yield (fx, fy)
+          }
+          .timeout(30.seconds)
+          .unsafeRunSync()
+      }
+      // Serialized either way round, the outcome is one of the two serial orders
+      // — never the skewed (1, 1), and never a double-applied effect.
+      withClue(s"observed outcomes: ${results.distinct.mkString(", ")}: ") {
+        results.foreach(r => Set((2, 1), (1, 2)) should contain(r))
       }
     }
   }

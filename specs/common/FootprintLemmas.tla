@@ -43,7 +43,10 @@ E2  == [val |-> 5, par |-> 3]
 
 Ids == {PV1, S, E1, E2}
 
-Footprints == [reads : SUBSET Ids, updates : SUBSET Ids]
+(* The full footprint universe now includes the UNDER-APPROXIMATION flag (the
+   H3 fix), so every algebraic lemma below is checked over both trustworthy and
+   untrustworthy footprints — 512 footprints, 262,144 ordered pairs. *)
+Footprints == [reads : SUBSET Ids, updates : SUBSET Ids, under : BOOLEAN]
 
 -------------------------------------------------------------------------------
 (* Algebraic properties of the relation as encoded *)
@@ -83,6 +86,36 @@ ASSUME LemmaValidatedMonotoneCompat ==
 ASSUME LemmaWriterSelfIncompatible ==
     \A f \in Footprints :
         f.updates /= {} => ~IsCompatible(f, f)
+
+(* THE H3 FIX, as an algebraic property. An UNDER-APPROXIMATED footprint is
+   incompatible with EVERY footprint — the empty one, a pure reader, itself,
+   everything. The ids that would reveal a conflict are precisely the ids that
+   are missing, so no "compatible" verdict is available from the evidence; any
+   such verdict would be an inference from absent information.
+
+   This is what serializes a transaction whose static analysis threw, which in
+   turn makes its unvalidated reads trivially safe (it runs alone, so nothing
+   can change under it). Before the fix, an empty-because-unknown footprint was
+   treated exactly like an empty-because-it-touches-nothing one, and was
+   therefore compatible with everything — the scheduler's entire defence
+   switched off for that transaction. *)
+ASSUME LemmaUnderApproximatedIncompatibleWithAll ==
+    \A f \in Footprints, g \in Footprints :
+        (f.under \/ g.under) => ~IsCompatible(f, g)
+
+(* Validation must PRESERVE the flag. IdFootprint.getValidated is a `copy`, so
+   it carries isUnderApproximated through — if it ever reset it, a validated
+   footprint would silently regain the scheduler's trust, and since the runtime
+   compares getValidated footprints everywhere, the fix would be a no-op. *)
+ASSUME LemmaValidatedPreservesUnderApproximation ==
+    \A f \in Footprints :
+        Validated(f).under = f.under
+
+(* Incompleteness is contagious under merge: IdFootprint.mergeWith ORs the flag,
+   so a merge is only as trustworthy as its least trustworthy half. *)
+ASSUME LemmaMergePropagatesUnderApproximation ==
+    \A f \in Footprints, g \in Footprints :
+        MergeWith(f, g).under = (f.under \/ g.under)
 
 -------------------------------------------------------------------------------
 (* Positive controls: conflicts the relation DOES catch *)
@@ -138,6 +171,26 @@ ASSUME DocumentsParentReadChildReadCompatible ==
  *)
 ASSUME DocumentsSiblingInsertsCompatible ==
     IsCompatible(FP({}, {E1}), FP({}, {E2}))
+
+(*
+ * The H3 fix's two edges, pinned as concrete cases.
+ *
+ * "I do not know what I touch" (FPU) must NOT be compatible with a transaction
+ * that touches nothing — that exact conflation is what H3 exploited, since
+ * TxnRuntime.commit's `case _ => IdFootprint.empty` branch produced an EMPTY
+ * footprint meaning UNKNOWN, and the relation read it as meaning NOTHING.
+ *)
+ASSUME DocumentsUnknownIsNotTheSameAsEmpty ==
+    /\ ~IsCompatible(FPU({}, {}), EmptyFootprint)
+    /\ IsCompatible(EmptyFootprint, EmptyFootprint)
+
+(*
+ * ...and the flag must not serialize anything it should not: two COMPLETE,
+ * genuinely disjoint footprints stay compatible. The fix costs throughput only
+ * on the path that actually threw.
+ *)
+ASSUME DocumentsCompleteFootprintsStillCompatible ==
+    IsCompatible(FP({PV1}, {}), FP({}, {E1}))
 
 -------------------------------------------------------------------------------
 (* Trivial behaviour so TLC has a spec to run; the ASSUMEs are the payload *)

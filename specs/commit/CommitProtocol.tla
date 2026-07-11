@@ -331,7 +331,7 @@ LockOfWrite(e, exists) ==
    *)
 ---------------------------------------------------------------------------
 
-AllTxns == {"h2a", "h2b", "dbl", "h3a", "h3b", "h5a", "h5b", "wwa", "wwb", "pfa", "pfb", "ro"}
+AllTxns == {"h2a", "h2b", "dbl", "h3a", "h3b", "h5a", "h5b", "wwa", "wwb", "pfa", "pfb", "ddw", "ro"}
 ASSUME Txns \subseteq AllTxns
 ASSUME UnderDeclared \subseteq Txns
 
@@ -393,6 +393,8 @@ ActualFP(t) ==
       \* served from the log (and getValidated would drop it anyway).
       [] t = "pfa" -> FP({X},  {Y, M1a})
       [] t = "pfb" -> FP({Y},  {X, M1b})
+      \* ddw really writes X, though it declared Y (see StaticFP).
+      [] t = "ddw" -> FP({},   {X})
       [] t = "ro"  -> FP({X},  {})
 
 (* What the STATIC ANALYSER declares — which is NOT always the actual access
@@ -412,11 +414,25 @@ ActualFP(t) ==
    Both are under-approximations, and an under-approximation is unsound
    whatever its size. That is H3's premise. *)
 StaticFP(t) ==
-    CASE t = "pfa" -> FP({}, {M1a})   \* the walker threw after the scratch write
-      [] t = "pfb" -> FP({}, {M1b})
+    \* pfa/pfb: the walker threw AFTER recording the scratch write, so it holds a
+    \* PARTIAL footprint. Post-fix that partial footprint is FLAGGED (FPU) --
+    \* TxnRuntime.commit calls .markUnderApproximated on it. Under-approximation
+    \* is unsound whatever its size, so the flag, not the content, is what counts.
+    CASE t = "pfa" -> FPU({}, {M1a})
+      [] t = "pfb" -> FPU({}, {M1b})
+      \* ddw DECLARES a write to Y but ACTUALLY writes X. Its static analysis
+      \* COMPLETED -- nothing threw -- so it is NOT flagged and the scheduler
+      \* trusts it. This is the data-dependent-footprint divergence recorded in
+      \* plan section 10: a key or target computed from a value read BEFORE the
+      \* transaction was submitted, which then changed. Post-H3-fix it is the ONLY
+      \* remaining way declared can differ from actual, and therefore the only way
+      \* a transaction can still go DIRTY -- see CommitDirty.cfg.
+      [] t = "ddw" -> FP({}, {Y})
       [] OTHER     -> ActualFP(t)
 
-DeclaredInit(t) == IF t \in UnderDeclared THEN EmptyFootprint ELSE StaticFP(t)
+\* The H3 fix: an under-approximated footprint is FLAGGED, not merely empty, and
+\* the relation makes it incompatible with everything (common/Footprint.tla).
+DeclaredInit(t) == IF t \in UnderDeclared THEN FPU({}, {}) ELSE StaticFP(t)
 
 Writes(t)   == ActualFP(t).updates
 Accessed(t) == CombinedIds(ActualFP(t))
@@ -430,6 +446,7 @@ TxnRank(t) ==
     CASE t = "h2a" -> 1 [] t = "h2b" -> 2 [] t = "h3a" -> 3 [] t = "h3b" -> 4
       [] t = "h5a" -> 5 [] t = "h5b" -> 6 [] t = "wwa" -> 7 [] t = "wwb" -> 8
       [] t = "pfa" -> 9 [] t = "pfb" -> 10 [] t = "ro" -> 11 [] t = "dbl" -> 12
+      [] t = "ddw" -> 13
 
 ---------------------------------------------------------------------------
 (* State *)
@@ -720,6 +737,10 @@ DirtyRestart(t) ==
     /\ lockHolder' = [l \in Locks |->
                         IF lockHolder[l] = t THEN "none" ELSE lockHolder[l]]
     /\ inc'        = [inc      EXCEPT ![t] = inc[t] + 1]
+    \* Refined from the ACTUAL log, which is complete by construction (it is built
+    \* from real log entries), so the refinement is NOT under-approximated. The
+    \* transaction therefore pays the serialization cost once and then runs at
+    \* full concurrency.
     /\ declared'   = [declared EXCEPT ![t] = Validated(ActualFP(t))]
     /\ pc'         = [pc       EXCEPT ![t] = "start"]
     /\ lockSeq'    = [lockSeq  EXCEPT ![t] = << >>]

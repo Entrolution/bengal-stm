@@ -33,7 +33,13 @@ EXTENDS Naturals, FiniteSets
 
 CONSTANT NoParent
 
-FP(reads, updates) == [reads |-> reads, updates |-> updates]
+FP(reads, updates) == [reads |-> reads, updates |-> updates, under |-> FALSE]
+
+(* An UNDER-APPROXIMATED footprint: the static-analysis walker threw, so some
+   ids the transaction really touches are missing (IdFootprint.isUnderApproximated).
+   Categorically different from an empty footprint — "I touch nothing" is a fact,
+   "I do not know what I touch" is not — and conflating the two was H3. *)
+FPU(reads, updates) == [reads |-> reads, updates |-> updates, under |-> TRUE]
 
 EmptyFootprint == FP({}, {})
 
@@ -49,9 +55,11 @@ UpdateRawIds(f) == { id.val : id \in f.updates }
 (* readRawIds *)
 ReadRawIds(f) == { id.val : id \in f.reads }
 
-(* mergeWith *)
+(* mergeWith — incompleteness is contagious *)
 MergeWith(f, g) ==
-    FP(f.reads \cup g.reads, f.updates \cup g.updates)
+    [reads   |-> f.reads \cup g.reads,
+     updates |-> f.updates \cup g.updates,
+     under   |-> f.under \/ g.under]
 
 (*
  * asymmetricCompatibleWith:
@@ -74,8 +82,19 @@ AsymCompat(f, g) ==
     /\ ~\E id \in f.updates :
             id.par /= NoParent /\ id.par \in ReadRawIds(g)
 
-(* isCompatibleWith *)
-IsCompatible(f, g) == AsymCompat(f, g) /\ AsymCompat(g, f)
+(*
+ * isCompatibleWith. THE FIRST CLAUSE IS THE H3 FIX: a footprint that
+ * under-approximates its transaction's access set is incompatible with
+ * EVERYTHING, because the ids that would have revealed a conflict are exactly
+ * the ids that are missing. Any "compatible" verdict would be an inference from
+ * absent evidence. Such a transaction is therefore serialized against all
+ * others and runs alone, which makes its unvalidated reads trivially safe.
+ *)
+IsCompatible(f, g) ==
+    /\ ~f.under
+    /\ ~g.under
+    /\ AsymCompat(f, g)
+    /\ AsymCompat(g, f)
 
 (*
  * getValidated:
@@ -85,8 +104,9 @@ IsCompatible(f, g) == AsymCompat(f, g) /\ AsymCompat(g, f)
  * and drop reads whose parent's raw value is among this footprint's updates.
  *)
 Validated(f) ==
-    FP({ id \in (f.reads \ f.updates) :
-            id.par = NoParent \/ id.par \notin UpdateRawIds(f) },
-       f.updates)
+    [reads   |-> { id \in (f.reads \ f.updates) :
+                       id.par = NoParent \/ id.par \notin UpdateRawIds(f) },
+     updates |-> f.updates,
+     under   |-> f.under]   \* preserved, as IdFootprint.getValidated's copy does
 
 ===============================================================================

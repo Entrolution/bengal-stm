@@ -125,8 +125,16 @@ private[stm] trait TxnCompilerContext[F[_]] {
                         result <- Async[F].delay(s.addWriteId(eRId)).map((_, ()))
                       } yield result
                     }
+                    // The key thunk threw, so this write's id was never
+                    // recorded. Unlike the read paths, this handler does NOT
+                    // short-circuit: analysis carries on and the resulting
+                    // footprint silently omits a write, never reaching
+                    // TxnRuntime.commit's handleErrorWith. Flag it here or the
+                    // omission is invisible. (An undeclared WRITE is not benign:
+                    // it invalidates a correctly-declared peer's reads —
+                    // specs/commit/CommitH3Writer.cfg.)
                     .handleErrorWith { _ =>
-                      Async[F].delay((s, ()))
+                      Async[F].delay((s.markUnderApproximated, ()))
                     }
                 }
               case adt: TxnModifyVarMapValue[_, _] =>
@@ -140,8 +148,16 @@ private[stm] trait TxnCompilerContext[F[_]] {
                                     .map((_, ()))
                       } yield result
                     }
+                    // The key thunk threw, so this write's id was never
+                    // recorded. Unlike the read paths, this handler does NOT
+                    // short-circuit: analysis carries on and the resulting
+                    // footprint silently omits a write, never reaching
+                    // TxnRuntime.commit's handleErrorWith. Flag it here or the
+                    // omission is invisible. (An undeclared WRITE is not benign:
+                    // it invalidates a correctly-declared peer's reads —
+                    // specs/commit/CommitH3Writer.cfg.)
                     .handleErrorWith { _ =>
-                      Async[F].delay((s, ()))
+                      Async[F].delay((s.markUnderApproximated, ()))
                     }
                 }
               case adt: TxnDeleteVarMapValue[_, _] =>
@@ -153,8 +169,16 @@ private[stm] trait TxnCompilerContext[F[_]] {
                         result <- Async[F].delay(s.addWriteId(eRId)).map((_, ()))
                       } yield result
                     }
+                    // The key thunk threw, so this write's id was never
+                    // recorded. Unlike the read paths, this handler does NOT
+                    // short-circuit: analysis carries on and the resulting
+                    // footprint silently omits a write, never reaching
+                    // TxnRuntime.commit's handleErrorWith. Flag it here or the
+                    // omission is invisible. (An undeclared WRITE is not benign:
+                    // it invalidates a correctly-declared peer's reads —
+                    // specs/commit/CommitH3Writer.cfg.)
                     .handleErrorWith { _ =>
-                      Async[F].delay((s, ()))
+                      Async[F].delay((s.markUnderApproximated, ()))
                     }
                 }
               case adt: TxnHandleError[_] =>
