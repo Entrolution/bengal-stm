@@ -19,15 +19,25 @@
 # interpreted below instead. Adding -e would kill every pinned-red check.
 set -uo pipefail
 
-CFG="${1:?usage: check_expected.sh <cfg> <tla> <NONE|InvariantName>}"
-TLA="${2:?usage: check_expected.sh <cfg> <tla> <NONE|InvariantName>}"
-EXPECTED="${3:?usage: check_expected.sh <cfg> <tla> <NONE|InvariantName>}"
+CFG="${1:?usage: check_expected.sh <cfg> <tla> <NONE|InvariantName> [ALLOW_DEADLOCK]}"
+TLA="${2:?usage: check_expected.sh <cfg> <tla> <NONE|InvariantName> [ALLOW_DEADLOCK]}"
+EXPECTED="${3:?usage: check_expected.sh <cfg> <tla> <NONE|InvariantName> [ALLOW_DEADLOCK]}"
+# Optional 4th arg ALLOW_DEADLOCK passes TLC's -deadlock flag (suppresses
+# deadlock detection). Default is detection ON: specs with legitimate
+# terminal states model them as an explicit Terminating stutter, so any
+# reported deadlock is a real protocol deadlock. Failure-injection configs
+# (SchedulerAborts) keep the flag — aborted zombies legitimately strand
+# their dependents.
+DEADLOCK_FLAG=""
+if [[ "${4:-}" == "ALLOW_DEADLOCK" ]]; then
+  DEADLOCK_FLAG="-deadlock"
+fi
 
 OUT="$(mktemp)"
 trap 'rm -f "$OUT"' EXIT
 
 java -XX:+UseParallelGC -cp specs/tla2tools.jar tlc2.TLC \
-    -config "$CFG" "$TLA" -workers auto -deadlock >"$OUT" 2>&1
+    -config "$CFG" "$TLA" -workers auto $DEADLOCK_FLAG >"$OUT" 2>&1
 TLC_EXIT=$?
 
 if [[ "$EXPECTED" == "NONE" ]]; then

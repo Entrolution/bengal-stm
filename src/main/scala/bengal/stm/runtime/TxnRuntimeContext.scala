@@ -85,11 +85,19 @@ private[stm] trait TxnRuntimeContext[F[_]] {
         for {
           footprint <- Async[F].delay(analysedTxn.idFootprint)
           execSpec  <- Async[F].delay(retryMap.get(footprint))
+          // The wake action builds a fresh incarnation AT WAKE TIME so a
+          // parked transaction never re-enters the scheduler with stale
+          // bookkeeping from its previous run.
+          wake = analysedTxn
+                   .freshIncarnation(analysedTxn.idFootprint)
+                   .flatMap(submitTxn)
+                   .start
+                   .void
           _ <- Async[F].delay(execSpec match {
                  case Some(spec) =>
-                   retryMap.update(footprint, spec >> submitTxn(analysedTxn).start.void)
+                   retryMap.update(footprint, spec >> wake)
                  case None =>
-                   retryMap.addOne(footprint -> submitTxn(analysedTxn).start.void)
+                   retryMap.addOne(footprint -> wake)
                })
         } yield ()
       }
@@ -187,12 +195,26 @@ private[stm] trait TxnRuntimeContext[F[_]] {
         _ <- analysedTxn.triggerUnsub.start
       } yield ()
 
-    // SPEC: NoExecOnCompleted — registerRunning re-checks nothing (no tally
-    // guard, no completion guard), so a stale execute spawn runs to commit;
-    // Scheduler.tla checks no execute fiber starts for a completed txn.
-    def registerRunning(analysedTxn: AnalysedTxn[_]): F[Unit] =
+    // SPEC: NoExecOnCompleted — the admission gate: an execute fiber may
+    // proceed only if, atomically under the graph semaphore, this
+    // incarnation is still Scheduled AND its dependency tally is zero.
+    // Stale or duplicate spawns lose the compare-and-set and exit without
+    // side effects, which is what makes spurious wakeups harmless and the
+    // resubmission path's reversed edges sound: a Scheduled transaction
+    // whose tally was raised under the semaphore cannot slip into
+    // execution, because admission is serialized against the scan that
+    // raised it. (Losing is never a lost execution — whoever holds the
+    // last dependency edge spawns a fresh execute when its cascade drains
+    // the tally to zero.)
+    def admitForExecution(analysedTxn: AnalysedTxn[_]): F[Boolean] =
       graphBuilderSemaphore.permit.use { _ =>
-        analysedTxn.executionStatus.set(Running)
+        Async[F].ifM(analysedTxn.dependencyTally.get.map(_ == 0))(
+          analysedTxn.executionStatus.modify {
+            case Scheduled => (Running, true)
+            case other => (other, false)
+          },
+          Async[F].pure(false)
+        )
       }
   }
 
@@ -220,15 +242,39 @@ private[stm] trait TxnRuntimeContext[F[_]] {
     unsubSpecs: MutableMap[TxnId, F[Unit]],
     executionStatus: Ref[F, ExecutionStatus],
     hasDownstream: Ref[F, Boolean],
+    cascadeFired: Ref[F, Boolean],
     scheduler: TxnScheduler
   ) {
+
+    // Every resubmission gets FRESH protocol bookkeeping — tally, unsub
+    // edges, status, cascade gate — sharing only the transaction, its id,
+    // and the caller's completion signal. In-flight unsubscribe cascades
+    // from the previous incarnation then drain refs nothing reads any
+    // more, instead of corrupting the new incarnation's dependency
+    // arithmetic (the H4 double-execution family; see the H4 narrative in
+    // specs/README.md).
+    private[stm] def freshIncarnation(newFootprint: IdFootprint): F[AnalysedTxn[V]] =
+      for {
+        newTally   <- Ref.of[F, Int](0)
+        newHasDown <- Ref.of[F, Boolean](false)
+        newStatus  <- Ref.of[F, ExecutionStatus](NotScheduled)
+        newCascade <- Ref.of[F, Boolean](false)
+      } yield this.copy(
+        idFootprint     = newFootprint,
+        dependencyTally = newTally,
+        unsubSpecs      = TrieMap(),
+        executionStatus = newStatus,
+        hasDownstream   = newHasDown,
+        cascadeFired    = newCascade
+      )
 
     private[stm] val resetDependencyTally: F[Unit] =
       dependencyTally.set(0) >> hasDownstream.set(false)
 
     // SPEC: NoDoubleExec — execute fibers are spawned here (readiness) and in
-    // unsubscribeUpstreamDependency (tally zero-test) with no dedup guard;
-    // Scheduler.tla checks that at most one fiber is ever in the commit window.
+    // unsubscribeUpstreamDependency (tally zero-test); spawning is deliberately
+    // unguarded and duplicates are harmless because admitForExecution admits
+    // at most one fiber per incarnation into the commit window.
     private[stm] val checkExecutionReadiness: F[Unit] =
       Async[F].ifM(dependencyTally.get.map(_ == 0))(
         execute(scheduler).start.void,
@@ -236,8 +282,10 @@ private[stm] trait TxnRuntimeContext[F[_]] {
       )
 
     // SPEC: TallyNonNegative — the getAndUpdate decrement below is the only
-    // tally sink; a negative tally means an unsubscribe was delivered for an
-    // edge the tally no longer counts (stale edge from a shared unsubSpecs).
+    // tally sink. Every incarnation has its own tally and its own unsub
+    // edges (freshIncarnation), and the cascade drains them exactly once
+    // (cascadeFired), so each decrement pairs with exactly one increment
+    // and the tally can never go negative.
     private val unsubscribeUpstreamDependency: F[Unit] =
       Async[F].ifM(dependencyTally.getAndUpdate(_ - 1).map(_ == 1))(
         execute(scheduler).start.void,
@@ -265,13 +313,19 @@ private[stm] trait TxnRuntimeContext[F[_]] {
         } yield ()
       )
 
+    // The cascade fires exactly once per incarnation: the error-recovery
+    // path in execute can call registerCompletion twice, and a second
+    // drain of the same edges would double-decrement downstream tallies.
     private[stm] val triggerUnsub: F[Unit] =
-      Async[F].ifM(Async[F].delay(unsubSpecs.nonEmpty))(
-        for {
-          _ <- unsubSpecs.values.toList.parTraverse(unsubSpec => unsubSpec)
-          _ <- Async[F].delay(unsubSpecs.clear())
-        } yield (),
-        Async[F].unit
+      Async[F].ifM(cascadeFired.getAndSet(true))(
+        Async[F].unit,
+        Async[F].ifM(Async[F].delay(unsubSpecs.nonEmpty))(
+          for {
+            _ <- unsubSpecs.values.toList.parTraverse(unsubSpec => unsubSpec)
+            _ <- Async[F].delay(unsubSpecs.clear())
+          } yield (),
+          Async[F].unit
+        )
       )
 
     private[stm] def getTxnLogResult: F[(TxnLog, Option[V])] =
@@ -340,42 +394,47 @@ private[stm] trait TxnRuntimeContext[F[_]] {
     private[stm] def execute(
       ex: TxnScheduler
     ): F[Unit] =
-      for {
-        _ <- ex.registerRunning(this)
-        _ <- Async[F].uncancelable { poll =>
-               (for {
-                 result <- poll(commit)
-                 _      <- ex.registerCompletion(this)
-                 // SPEC: CompletionAtMostOnce — completes here, in the error
-                 // handler below, and in the submit wrapper (all Deferred
-                 // first-wins); Scheduler.tla counts completions per txn.
-                 _ <- result match {
-                        case TxnResultSuccess(result) =>
-                          completionSignal
-                            .complete(
-                              Right[Throwable, V](result.asInstanceOf[V])
-                            )
-                            .void
-                        case TxnResultRetry =>
-                          Async[F].ifM(hasDownstream.get)(
-                            ex.submitTxn(this),
-                            ex.submitTxnForRetry(this)
-                          )
-                        case TxnResultLogDirty(idFootprintRefinement) =>
-                          ex.submitTxnForImmediateRetry(
-                            this.copy(idFootprint = idFootprintRefinement.getValidated)
-                          )
-                        case TxnResultFailure(err) =>
-                          completionSignal
-                            .complete(Left[Throwable, V](err))
-                            .void
-                      }
-               } yield ()).handleErrorWith { unexpectedErr =>
-                 ex.registerCompletion(this).attempt >>
-                 completionSignal.complete(Left[Throwable, V](unexpectedErr)).void
-               }
-             }
-      } yield ()
+      Async[F].ifM(ex.admitForExecution(this))(
+        Async[F].uncancelable { poll =>
+          (for {
+            result <- poll(commit)
+            _      <- ex.registerCompletion(this)
+            // SPEC: CompletionAtMostOnce — completes here, in the error
+            // handler below, and in the submit wrapper (all Deferred
+            // first-wins); the admission gate guarantees at most one
+            // execute window per incarnation, so the success/failure
+            // completion fires at most once organically.
+            _ <- result match {
+                   case TxnResultSuccess(result) =>
+                     completionSignal
+                       .complete(
+                         Right[Throwable, V](result.asInstanceOf[V])
+                       )
+                       .void
+                   case TxnResultRetry =>
+                     Async[F].ifM(hasDownstream.get)(
+                       freshIncarnation(idFootprint).flatMap(ex.submitTxn),
+                       ex.submitTxnForRetry(this)
+                     )
+                   case TxnResultLogDirty(idFootprintRefinement) =>
+                     freshIncarnation(idFootprintRefinement.getValidated)
+                       .flatMap(ex.submitTxnForImmediateRetry)
+                   case TxnResultFailure(err) =>
+                     completionSignal
+                       .complete(Left[Throwable, V](err))
+                       .void
+                 }
+          } yield ()).handleErrorWith { unexpectedErr =>
+            ex.registerCompletion(this).attempt >>
+            completionSignal.complete(Left[Throwable, V](unexpectedErr)).void
+          }
+        },
+        // Lost the admission gate: a duplicate or stale spawn for an
+        // incarnation that is already running, already completed, or has
+        // live dependencies again. Exit without side effects — whoever
+        // holds the last dependency edge respawns on drain.
+        Async[F].unit
+      )
   }
 
   private[stm] trait TxnRuntime {
@@ -407,6 +466,7 @@ private[stm] trait TxnRuntimeContext[F[_]] {
         dependencyTally  <- Ref[F].of(0)
         hasDownstream    <- Ref[F].of(false)
         executionStatus  <- Ref[F].of(NotScheduled.asInstanceOf[ExecutionStatus])
+        cascadeFired     <- Ref[F].of(false)
         id               <- txnIdGen.getAndUpdate(_ + 1)
         analysedTxn <-
           Async[F].delay(
@@ -419,6 +479,7 @@ private[stm] trait TxnRuntimeContext[F[_]] {
               unsubSpecs       = TrieMap(),
               executionStatus  = executionStatus,
               hasDownstream    = hasDownstream,
+              cascadeFired     = cascadeFired,
               scheduler        = scheduler
             )
           )

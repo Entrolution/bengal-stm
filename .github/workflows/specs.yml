@@ -68,12 +68,12 @@ jobs:
             specs/common/FootprintLemmas.tla \
             NONE
 
-      - name: Check Scheduler (pinned H4 counterexample)
+      - name: Check Scheduler (expected clean since the H4 fix)
         run: |
           ./specs/check_expected.sh \
             specs/scheduler/Scheduler.cfg \
             specs/scheduler/Scheduler.tla \
-            NoDoubleExec
+            NONE
 
       - name: Check Scheduler robustness (pinned, dispatch only)
         if: github.event_name == 'workflow_dispatch'
@@ -81,4 +81,5 @@ jobs:
           ./specs/check_expected.sh \
             specs/scheduler/SchedulerAborts.cfg \
             specs/scheduler/Scheduler.tla \
-            CompletionAtMostOnce
+            CompletionAtMostOnce \
+            ALLOW_DEADLOCK

@@ -26,8 +26,10 @@ the operational reference and the **source of truth for verdicts**.
 - Submission and dependency-graph construction, tallies, statuses,
   unsubscribe cascades, the dirty-resubmission path, and the
   `handleErrorWith` recovery branches
-- Six safety invariants over that machinery — all six currently **fail
-  organically** (no failure injection); see the verdict table
+- Six safety invariants over that machinery — all six **HOLD since the H4
+  fix** (admission gate, fresh incarnations, exactly-once cascades),
+  verified exhaustively with deadlock detection enabled; before the fix
+  all six failed organically (see the verdict table)
 
 **They do not verify (Phase 1):**
 
@@ -84,39 +86,46 @@ expected to reproduce a **pinned counterexample** (an EXPECTED-RED verdict):
 ./specs/check_expected.sh specs/common/FootprintLemmas.cfg \
     specs/common/FootprintLemmas.tla NONE
 
-# Scheduler evidence config — expected RED: pinned H4 counterexample
-# (NoDoubleExec violated at TLC search depth ~50), ~2s
+# Scheduler verification — expected CLEAN since the H4 fix (exhaustive,
+# deadlock detection on), ~2-3s
 ./specs/check_expected.sh specs/scheduler/Scheduler.cfg \
-    specs/scheduler/Scheduler.tla NoDoubleExec
+    specs/scheduler/Scheduler.tla NONE
+
+# Robustness config — expected RED (pinned CompletionAtMostOnce);
+# ALLOW_DEADLOCK suppresses deadlock detection for aborted-zombie states
+./specs/check_expected.sh specs/scheduler/SchedulerAborts.cfg \
+    specs/scheduler/Scheduler.tla CompletionAtMostOnce ALLOW_DEADLOCK
 
 # Raw TLC invocation (traces print to stdout; TTrace files are gitignored):
 java -XX:+UseParallelGC -cp specs/tla2tools.jar tlc2.TLC \
     -config specs/scheduler/Scheduler.cfg specs/scheduler/Scheduler.tla \
-    -workers auto -deadlock
+    -workers auto
 ```
 
-`-deadlock` is required: terminal states (all transactions completed, or a
-zombie left by an aborted submission) have no successors by design, and TLC's
-default deadlock detection would report them as errors.
+Deadlock detection is ENABLED for organic Scheduler runs (no `-deadlock`
+flag): legitimate terminals — every completion signal fired — stutter via
+the explicit `Terminating` action, so any reported deadlock is a real
+protocol deadlock. The failure-injection config passes `ALLOW_DEADLOCK`
+(the script's 4th argument adds `-deadlock`) because aborted zombies
+legitimately strand their dependents.
 
-CI (`.github/workflows/specs.yml`) runs `verify_anchors.sh` and then both
-checks above on every change to `specs/**` or the in-scope runtime sources
-(plus a `workflow_dispatch`-gated robustness check). A pinned-red check
-failing means the counterexample stopped reproducing — either the protocol
-changed, or the rolling TLC build drifted (the `v1.8.0` tag is a nightly);
-investigate which before touching the pin. The coupling is deliberate: fix
-and spec must move together (update this verdict table, the cfg pin, and the
-hypothesis rows in the plan).
+CI (`.github/workflows/specs.yml`) runs `verify_anchors.sh`, the lemma
+check, and the clean Scheduler verification on every change to `specs/**`
+or the in-scope runtime sources (plus the `workflow_dispatch`-gated
+robustness pin). Expectations bind in both directions: a clean spec going
+red means a protocol regression (or rolling-TLC drift — the `v1.8.0` tag is
+a nightly; investigate which), and a pinned counterexample stopping
+reproducing means the modelled defect changed shape. Either way, fix and
+spec move together (this verdict table, the cfg, and the plan's hypothesis
+rows).
 
 ## Verdict Table (source of truth)
 
 Scenario for all Scheduler rows: 3 txns / 2 vars, `t1` under-declared (empty
 footprint — the static-analysis fallback in `TxnRuntime.commit`), `t2`
 accurately declaring a write to the same var, `t3` accurately declaring a
-read of it; `MaxInc=2`, `MaxVer=6`, no failure injection. All six defect
-verdicts fire at TLC search depths 50–64, below the depth-72 truncation boundary
-(`NoDroppedSpawn` below), so none of them is an artifact of the two-slot
-fiber bound.
+read of it; `MaxInc=2`, `MaxVer=6`, no failure injection. This is the exact
+scenario that produced the H4 counterexample family before the fix.
 
 | Property | Verdict | Evidence |
 |----------|---------|----------|
@@ -124,17 +133,15 @@ fiber bound.
 | `DocumentsParentReadChildWriteCaught` — parent-structure read vs child-entry write now judged **incompatible** (plus `DocumentsParentReadChildReadCompatible`: pure readers stay compatible) | **HOLDS — H5 FIXED (2026-07-11)** by the relation's third conjunct; before the fix this pair was compatible (pinned then as `DocumentsReadGapH5`) | `FootprintLemmas.cfg` |
 | **H5 phantom write skew — behavioural** (whole-map read + new-key insert) | **FIXED (2026-07-11)** — was CONFIRMED at ~98% of contended reps (both txns observed the empty map, both committed); the fixed relation serializes the pair and the regression test asserts every rep serializable | `SerializabilityOracleSpec` ("H5 phantom write skew … regression for the H5 fix") |
 | `DocumentsSiblingInsertsCompatible` — two new-key inserts to one map compatible (H2 enabler) | **PINNED** (correct behaviour; the hazard is the lock aliasing, Spec A) | `FootprintLemmas.cfg` |
-| `NoDoubleExec` | **RED — organic, pinned in CI** (TLC search depth ~50, 49-state trace) | H4 counterexample, narrative below |
-| `ContractC` | **RED — organic** (depth ~51) | same root cause; drop-and-rerun procedure below |
-| `NoExecOnCompleted` | **RED — organic** (depth ~58) | 〃 |
-| `NoDoublePublish` | **RED — organic** (depth ~58) | 〃 |
-| `TallyNonNegative` | **RED — organic** (depth ~60) | 〃 |
-| `CompletionAtMostOnce` | **RED — organic** (depth ~64) | 〃 |
-| `NoDroppedSpawn` | **RED at depth ~72 — a model-capacity boundary, not a code defect** | the two-slot fiber bound truncates real behaviour from depth ~72 on (a third concurrent execute is reachable in code); enumeration results beyond that depth would need widened slots |
+| `NoDoubleExec`, `ContractC`, `NoExecOnCompleted`, `NoDoublePublish`, `TallyNonNegative`, `CompletionAtMostOnce` | **HOLD — H4 FIXED (2026-07-11)** by the admission gate (`admitForExecution`: status CAS + zero tally under the graph semaphore), fresh bookkeeping per incarnation (`freshIncarnation`), and exactly-once cascades (`cascadeFired`). Exhaustive at the defect scenario's own bounds, ~24k distinct states in ~2s — the gate collapsed the pre-fix >32M-state explosion. **Before the fix all six failed organically** at TLC search depths ~50–64 (`NoDoubleExec` was the CI pin; historical narrative below) | `Scheduler.cfg` (CI, expected clean) |
+| **Deadlock freedom** (organic) | **HOLDS** — detection enabled, legitimate terminals modelled by `Terminating` | `Scheduler.cfg` |
+| `NoDroppedSpawn` | **HOLDS post-fix** — the admission gate retires loser fibers fast enough that no spawn is dropped at these bounds (pre-fix the two-slot bound truncated behaviour from depth ~72) | `Scheduler.cfg` |
 | `TypeOK` | holds on every completed run | all cfgs |
 
-**H4 counterexample narrative** (validated line-by-line against the code;
-minimal 49-state trace (TLC search depth ~50), `Scheduler.cfg`):
+**H4 counterexample narrative — HISTORICAL, fixed 2026-07-11** (this is the
+defect the admission gate / fresh incarnations / cascade gate eliminated;
+validated line-by-line against the pre-fix code; minimal 49-state trace at
+TLC search depth ~50 under the pre-fix protocol):
 
 1. `t1` (empty declared footprint) and `t2` (writes `V1`) are judged
    compatible — under-declaration hides the conflict — and run concurrently.
@@ -163,16 +170,17 @@ minimal 49-state trace (TLC search depth ~50), `Scheduler.cfg`):
    reset tally), and `ContractC` (a stale fiber in-window alongside an
    incompatible peer).
 
-**Reproducing the non-pinned RED verdicts:** copy `Scheduler.cfg`, list the
-invariant of interest (dropping any that fail shallower — the order above is
-shallowest-first), and run TLC. Each halts within seconds at the quoted
-depth.
+**Reproducing the historical RED verdicts:** check out a pre-fix revision
+(any tree before the H4 fix landed), copy that revision's `Scheduler.cfg`,
+list the invariant of interest, and run TLC — each halts within seconds at
+its quoted depth. On the fixed protocol the full invariant set verifies
+clean.
 
 **Robustness config** (`scheduler/SchedulerAborts.cfg`, run manually or via
 the `workflow_dispatch`-gated CI step): enables nondeterministic failure
 injection at every point a `handleErrorWith` can observe (`execute`'s
 handler and the submit wrapper in `TxnRuntime.commit`). Measured and pinned:
-`CompletionAtMostOnce` violated at **depth 16** — a submit-wrapper abort
+`CompletionAtMostOnce` violated (**15-state counterexample**) — a submit-wrapper abort
 landing after the readiness check completes the caller's signal with an
 error while the already-spawned execute commits and completes again: a
 spurious failure report on a transaction that published. The
@@ -195,12 +203,12 @@ marks the **mechanism site**; it moves to the fix site when the fix lands.
 
 | TLA+ Invariant | Anchor site | Status at anchor |
 |---------------|-------------|------------------|
-| `NoDoubleExec` | `src/main/scala/bengal/stm/runtime/TxnRuntimeContext.scala` | execute spawn sites (readiness + tally zero-test) have no dedup guard — EXPECTED RED |
-| `TallyNonNegative` | `src/main/scala/bengal/stm/runtime/TxnRuntimeContext.scala` | the `getAndUpdate(_ - 1)` decrement is the only tally sink; stale shared-`unsubSpecs` edges under-run it — EXPECTED RED |
-| `NoExecOnCompleted` | `src/main/scala/bengal/stm/runtime/TxnRuntimeContext.scala` | `registerRunning` re-checks neither tally nor completion — EXPECTED RED |
-| `ContractC` | `src/main/scala/bengal/stm/runtime/TxnRuntimeContext.scala` | the submit scan is the intended conflict-avoidance mechanism — EXPECTED RED |
-| `CompletionAtMostOnce` | `src/main/scala/bengal/stm/runtime/TxnRuntimeContext.scala` | completion sites (success, error handler, submit wrapper) — EXPECTED RED |
-| `NoDoublePublish` | `src/main/scala/bengal/stm/runtime/TxnRuntimeContext.scala` | `log.commit` publishes; a second fiber re-publishes — EXPECTED RED |
+| `NoDoubleExec` | `src/main/scala/bengal/stm/runtime/TxnRuntimeContext.scala` | spawn sites stay unguarded by design; `admitForExecution` admits at most one fiber per incarnation — HOLDS |
+| `TallyNonNegative` | `src/main/scala/bengal/stm/runtime/TxnRuntimeContext.scala` | the `getAndUpdate(_ - 1)` decrement is the only tally sink; fresh per-incarnation edges + exactly-once cascades pair every decrement with one increment — HOLDS |
+| `NoExecOnCompleted` | `src/main/scala/bengal/stm/runtime/TxnRuntimeContext.scala` | `admitForExecution`'s status CAS rejects fibers for completed incarnations — HOLDS |
+| `ContractC` | `src/main/scala/bengal/stm/runtime/TxnRuntimeContext.scala` | the submit scan builds edges; the admission gate makes them binding — HOLDS |
+| `CompletionAtMostOnce` | `src/main/scala/bengal/stm/runtime/TxnRuntimeContext.scala` | completion sites (success, error handler, submit wrapper); one execute window per incarnation — HOLDS organically |
+| `NoDoublePublish` | `src/main/scala/bengal/stm/runtime/TxnRuntimeContext.scala` | `log.commit` publishes; at most one admitted fiber per incarnation — HOLDS |
 
 ### Footprint relation (anchors in `src/main/scala/bengal/stm/model/runtime/IdFootprint.scala`)
 
@@ -214,8 +222,10 @@ marks the **mechanism site**; it moves to the fix site when the fix lands.
 | TLA+ variable | Scala |
 |---------------|-------|
 | `status[t]` | `AnalysedTxn.executionStatus: Ref[F, ExecutionStatus]` — never demoted, exactly as in the code (nothing writes it after `Running` except a resubmission's `set(Scheduled)`); completion is visible only via `completedCount` |
-| `tally[t]` | `AnalysedTxn.dependencyTally: Ref[F, Int]` — shared across incarnations via `copy` |
-| `unsubs[t]` | `AnalysedTxn.unsubSpecs: MutableMap[TxnId, F[Unit]]` (edge set; the `F[Unit]` values are the downstream decrements) — shared across incarnations |
+| `tally[t]` | `AnalysedTxn.dependencyTally: Ref[F, Int]` — fresh per incarnation since the H4 fix |
+| `unsubs[t]` | `AnalysedTxn.unsubSpecs: MutableMap[TxnId, F[Unit]]` — fresh per incarnation since the H4 fix; modelled as `<<downstreamId, downstreamIncAtSubscribe>>` pairs so drains against re-incarnated targets no-op (dead refs) |
+| `cascadeFired[t]` | `AnalysedTxn.cascadeFired: Ref[F, Boolean]` — `triggerUnsub`'s exactly-once gate, fresh per incarnation |
+| `exec[t, slot].fInc` | the incarnation an execute fiber was spawned for (in code: the fiber's closure over one `AnalysedTxn`); admission compares it implicitly by gating on that incarnation's own status ref |
 | `hasDown[t]` | `AnalysedTxn.hasDownstream: Ref[F, Boolean]` |
 | `completedCount[t]` | completions of `AnalysedTxn.completionSignal: Deferred` (counted to detect doubles; the real `Deferred` is first-wins) |
 | `inc[t]`, `declared[t]` | incarnation ordinal and that incarnation's validated footprint (`idFootprint`, refined on the dirty path) |
@@ -238,13 +248,13 @@ interleave with in-region steps. Documented reductions:
 | # | Reduction | Justification |
 |---|-----------|---------------|
 | R1 | Scan fibers → sequential loop, fixed order | inter-fiber steps touch disjoint cells apart from monotone tally increments; external interleavings preserved between every pair of loop steps |
-| R2 | Subscribe triple (tally++, insert, hasDown) → one step | cascades do read and `clear()` the `unsubs` cell concurrently, but every torn-triple interleaving coincides observably with some atomic placement of the triple relative to `snapVals`/`clear` steps; the contains-check stays separate (that gap is H4's home) |
-| R3 | acquire/act/release → one guarded step for single-op semaphore regions (`registerRunning`, the active-set remove) | nothing else can run under the held semaphore in a one-op region |
+| R2 | Subscribe triple (tally++, insert, hasDown) → one step | cascades drain a frozen edge snapshot and `clear()` a map that receives no further semaphore-serialized inserts, so every torn-triple interleaving coincides observably with an atomic placement of the triple relative to cascade steps; the contains-check stays separate (that gap was H4's home) |
+| R3 | acquire/act/release → one guarded step for short semaphore regions (`admitForExecution`, the active-set remove) | for the remove, nothing else runs under the held semaphore; for admission (tally read + status CAS, two operations) the collapse is sound because all status writes are themselves semaphore-guarded and a tally decrement landing between the two would require an unpaired drain, excluded by fresh refs + exactly-once cascades |
 | R4 | Static analysis, `AnalysedTxn` construction, `Deferred` creation → `Init` | pre-protocol, no shared state contention |
-| R5 | Concurrent `submitTxnForImmediateRetry` runs of one txn → serialized (one submit workflow per txn) | **unjustified reduction, accepted for Phase 1** — the code runs each dirty fiber's resubmission inline, so two dirty fibers race their resets/scans; that region only exists after a `NoDoubleExec` violation, and enumeration traces from it are re-validated against the code individually; per-slot submit machinery is Phase 2 rework |
-| — | `triggerUnsub`'s nonEmpty check and values snapshot NOT collapsed | a concurrent `clear()` between them is a real trace (double-spawned cascades) |
+| R5 | Concurrent `submitTxnForImmediateRetry` runs of one txn → serialized (one submit workflow per txn) | post-H4-fix this is **provably vacuous** rather than merely accepted: two dirty fibers for one txn would need two admitted fibers in one incarnation, which the admission gate excludes (`NoDoubleExec` HOLDS) |
+| R6 | Cascade spawns with its edge set preloaded (gate + nonEmpty + values collapse) | the `cascadeFired` gate serializes cascades per incarnation and the owner left `activeTransactions` before the spawn, so the drained map is frozen — pre-fix these steps were kept separate precisely because double-spawned cascades could race a `clear()` |
 | — | Commit → one atomic truthful step (dirty iff a written var moved since **this fiber's** snapshot; snapshots are per-slot) | Spec B's contract with Spec A (plan §3); Spec A refines lock/validate/publish |
-| — | Two exec slots + two cascade slots per txn, `droppedSpawn` ghost | a third spawn is reachable in code (from depth ~72 in this scenario); the ghost turns any silent drop into a `NoDroppedSpawn` violation instead of an invisible truncation |
+| — | Two exec slots + two cascade slots per txn, `droppedSpawn` ghost | the ghost turns any silent drop into a `NoDroppedSpawn` violation instead of an invisible truncation; post-fix no drop occurs at these bounds (pre-fix, drops began at depth ~72) |
 
 Failure injection (`AbortsEnabled`): a nondeterministic abort at any point
 the corresponding `handleErrorWith` covers. The model does not claim any
@@ -255,16 +265,25 @@ verdicts are labelled accordingly.
 
 Measured on 12 cores (Apple x86_64, JDK 21, TLC 2026-07 build):
 
-- **Violation runs** (`Scheduler.cfg` and drop-and-rerun variants): halt in
-  **1–3 s** at TLC search depths 50–64 (the `NoDroppedSpawn` boundary run reaches
-  depth 72 in ~20 s / 1.2M distinct states); 4k–120k distinct states for
-  the defect verdicts. CI-friendly.
-- **Full organic sweep** at `MaxInc=2, MaxVer=6` (no protocol invariants):
-  **infeasible** — >32M distinct states after 10 min (~18M states/min
-  generated, ~3.4M distinct/min), queue still growing at depth 98.
-- Consequence: post-fix **green** verification of Spec B needs tighter
-  bounds (`MaxInc=1`, smaller `MaxVer`, or 2-txn scenarios) — sized when a
-  fix PR needs them (plan Phase 5). Expected-red pins are unaffected.
+- **Post-H4-fix full verification** (`Scheduler.cfg`, all invariants,
+  deadlock detection on): **exhaustive in ~2 s — 70k states generated, 24k
+  distinct, search depth 77, queue drained**. The admission gate retires
+  loser fibers immediately, collapsing the interleaving explosion, so the
+  green run fits CI at the defect scenario's own bounds with no downsizing.
+  Two useful corollaries of running with deadlock detection on: the
+  `MaxInc` incarnation bound never binds in this scenario (an
+  `ExecResubTruncate` firing would strand a transaction and surface as a
+  deadlock), and the organic verdict is scoped to **non-throwing
+  transactions** — the error-dispatch shape (`TxnResultFailure`) is
+  exercised only in the failure-injection config, where it is
+  protocol-isomorphic to the success path.
+- **Pre-fix, for the record**: violation runs halted in 1–3 s at TLC search
+  depths 50–64 (4k–120k distinct states); the `NoDroppedSpawn` boundary run
+  reached depth 72 in ~20 s / 1.2M distinct states; and a full organic
+  sweep at the same `MaxInc=2, MaxVer=6` bounds was **infeasible** — >32M
+  distinct states after 10 min, queue still growing at depth 98. The
+  ~1300× state-space collapse is itself evidence of how much spurious
+  concurrency the unguarded protocol admitted.
 
 ## Design Decisions
 
@@ -278,11 +297,11 @@ Measured on 12 cores (Apple x86_64, JDK 21, TLC 2026-07 build):
   distinct naturals chosen per scenario; the real system's hash-derived IDs
   make every ordering class reachable.
 - **Two exec slots / two cascade slots per txn, with a drop detector.**
-  Double-spawn and double-cascade are the defects under test; the model must
-  represent them. A third spawn is dropped, and — since that is reachable
-  *before* any invariant fires — every drop sets the `droppedSpawn` ghost so
-  `NoDroppedSpawn` reports the truncation explicitly (RED at depth ~72 in
-  the shipped scenario).
+  Double-spawn and double-cascade were the defects under test; the model
+  must represent them to prove the gate rejects them. Every dropped spawn
+  sets the `droppedSpawn` ghost so `NoDroppedSpawn` reports truncation
+  explicitly — pre-fix it went RED at depth ~72; post-fix it HOLDS (loser
+  fibers vacate slots immediately).
 - **`status` matches the code exactly**: never demoted (nothing writes it
   after `Running` except a resubmission's `set(Scheduled)`), so scans read
   the same values the code would. Completion is tracked by `completedCount`
@@ -305,11 +324,13 @@ Measured on 12 cores (Apple x86_64, JDK 21, TLC 2026-07 build):
    point-op workloads against the real STM, with every outcome checked
    against all serial orders of a sequential reference model (green — the
    scheduler serializes footprint-visible conflicts correctly), an
-   increment canary for the H4 double-execution family, and the **H5
+   increment canary for the H4 double-execution family, the **H5
    regression test** — the whole-map-read + new-key-insert idiom, which
    before the fix produced phantom write skew in ~98% of contended reps,
-   must now be serializable in every rep (500 per run). Whole-map reads
-   stay out of the *generated* suite (the targeted test covers the idiom
-   deterministically; folding them into the generators is a candidate
-   expansion); `waitUntil`/retry workloads join in Phase 2. Deterministic
-   replay tests for other confirmed traces arrive with their fixes.
+   must now be serializable in every rep (500 per run) — and the **H4
+   dirty-path stress test**, which uses data-dependent map keys to force
+   declared/actual footprint divergence and drive the resubmission
+   machinery (`freshIncarnation` + `admitForExecution`) under real
+   contention with exactly-once effect checks. Whole-map reads stay out of
+   the *generated* suite (the targeted test covers the idiom
+   deterministically); `waitUntil`/retry workloads join in Phase 2.
