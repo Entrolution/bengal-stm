@@ -108,10 +108,32 @@ ActualFP(t) ==
       [] t = "tr" -> FP({V1}, {V2})
       [] t = "tw" -> FP({}, {V1})
 
-(* Declared base footprints: t1 under-declares (models the static-analysis
-   fallback in TxnRuntime.commit's handleErrorWith) — this is what lets t1
-   and t2 run concurrently, forces a dirty commit, and opens the H4 window.
-   tr/tw declare accurately. *)
+(* Declared base footprints. t1's declared footprint is EMPTY while it really
+   writes V1, so t1 and t2 are judged compatible, run concurrently, collide on
+   V1, and one of them goes dirty — which is what opens the H4 window. tr/tw
+   declare accurately.
+
+   WHAT t1 MODELS CHANGED WITH THE H3 FIX (2026-07-11), and the distinction
+   matters. It used to model the static-analysis FALLBACK: the walker threw and
+   TxnRuntime.commit scheduled on whatever partial footprint it had. That path
+   is now FLAGGED (IdFootprint.isUnderApproximated) and the relation makes it
+   incompatible with everything, so a transaction that took it is serialized and
+   can never run concurrently with t2 at all.
+
+   t1 therefore now models the OTHER way declared can differ from actual: a
+   DATA-DEPENDENT footprint. The walker completed — nothing threw, so nothing is
+   flagged and the scheduler trusts the result — but the access set was computed
+   from values read BEFORE submission, and they changed underneath it. This is
+   the gap recorded in docs/plans/formal-specs.md section 10, and post-H3-fix it
+   is the ONLY remaining source of declared/actual divergence: the only thing
+   that can still drive a transaction down the dirty-resubmission path, and the
+   only thing left that can still under-declare a READ. See
+   specs/commit/CommitDirty.cfg, which had to be rebuilt on the same realisation.
+
+   The H4 machinery this config verifies is therefore still live and still
+   needs to be correct — but it is now reached by a different road, and this
+   comment exists so nobody reads the old one and concludes the scenario is
+   dead. *)
 DeclaredBase(t) ==
     CASE t = "t1" -> EmptyFootprint
       [] t = "t2" -> FP({}, {V1})

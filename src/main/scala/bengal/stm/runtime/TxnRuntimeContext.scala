@@ -534,11 +534,20 @@ private[stm] trait TxnRuntimeContext[F[_]] {
             // treated as incompatible with everything (negative control NC-2),
             // and give the analyser a shadow log so read-your-own-write stops
             // throwing in the first place.
+            //
+            // BOTH branches are under-approximations and both are now FLAGGED.
+            // The first carries the partial footprint the walker had reached
+            // when it threw; the second has nothing at all. Neither is a
+            // statement about what the transaction touches — both are an
+            // admission that we do not know — so each is marked and the relation
+            // then treats it as incompatible with everything. Before the fix the
+            // partial footprint was used as though it were complete, which is
+            // what let the skew through.
             .handleErrorWith {
               case StaticAnalysisShortCircuitException(idFootprint) =>
-                Async[F].delay((idFootprint, None))
+                Async[F].delay((idFootprint.markUnderApproximated, None))
               case _ =>
-                Async[F].pure((IdFootprint.empty, None))
+                Async[F].pure((IdFootprint.empty.markUnderApproximated, None))
             }
         completionSignal <- Deferred[F, Either[Throwable, V]]
         dependencyTally  <- Ref[F].of(0)
