@@ -184,10 +184,14 @@ class IdFootprintSpec extends AnyFreeSpec with Matchers {
         a.isCompatibleWith(b) shouldBe true
       }
 
-      "read parent vs write child is compatible" in {
+      "read parent vs write child is incompatible" in {
+        // A parent (structure) read observes the key set, so a child-entry
+        // write must conflict with it — the H5 phantom-write-skew fix.
+        // Before the fix this pair was judged compatible, which let
+        // whole-map readers race new-key inserters unserialized.
         val a = IdFootprint(readIds = Set(parentId), updatedIds = Set.empty)
         val b = IdFootprint(readIds = Set.empty, updatedIds = Set(childId))
-        a.isCompatibleWith(b) shouldBe true
+        a.isCompatibleWith(b) shouldBe false
       }
     }
 

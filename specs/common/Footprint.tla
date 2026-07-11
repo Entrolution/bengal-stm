@@ -46,6 +46,9 @@ CombinedRawIds(f) == { id.val : id \in CombinedIds(f) }
 (* updateRawIds *)
 UpdateRawIds(f) == { id.val : id \in f.updates }
 
+(* readRawIds *)
+ReadRawIds(f) == { id.val : id \in f.reads }
+
 (* mergeWith *)
 MergeWith(f, g) ==
     FP(f.reads \cup g.reads, f.updates \cup g.updates)
@@ -53,18 +56,23 @@ MergeWith(f, g) ==
 (*
  * asymmetricCompatibleWith:
  *   combinedRawIds.intersect(input.updateRawIds).isEmpty &&
- *     !combinedIds.exists(_.parent.exists(p => input.updateRawIds.contains(p.value)))
+ *     !combinedIds.exists(_.parent.exists(p => input.updateRawIds.contains(p.value))) &&
+ *     !updatedIds.exists(_.parent.exists(p => input.readRawIds.contains(p.value)))
  *
- * Note the known asymmetry gap (hypothesis H5): each side's ids — reads
- * included — are tested against the OTHER side's UPDATE ids only. A child
- * WRITE on this side is caught against a parent WRITE on the other side
- * (second conjunct, evaluated from the child's side), but a child WRITE is
- * never tested against a parent READ. FootprintLemmas.tla pins this down.
+ * The third conjunct (added with the H5 fix) tests this side's child
+ * WRITES against the other side's parent READS: a structure read observes
+ * the key set, so a child-entry write must conflict with it. Together the
+ * conjuncts give the full conflict matrix over the two-level hierarchy —
+ * raw overlap with writes; any-op-under-written-parent; write-under-read-
+ * parent — while parent-read vs child-read stays compatible.
+ * FootprintLemmas.tla pins every case.
  *)
 AsymCompat(f, g) ==
     /\ CombinedRawIds(f) \cap UpdateRawIds(g) = {}
     /\ ~\E id \in CombinedIds(f) :
             id.par /= NoParent /\ id.par \in UpdateRawIds(g)
+    /\ ~\E id \in f.updates :
+            id.par /= NoParent /\ id.par \in ReadRawIds(g)
 
 (* isCompatibleWith *)
 IsCompatible(f, g) == AsymCompat(f, g) /\ AsymCompat(g, f)

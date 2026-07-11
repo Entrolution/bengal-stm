@@ -44,9 +44,10 @@ import bengal.stm.syntax.all._
   *     serializable on the shipped code. For absent-key reads that visibility exists ONLY because the static-analysis
   *     walker registers the key's existential runtime id (the commit-time log records no entry and validates nothing
   *     for an absent read) — if static analysis were ever made lazy or optional, this suite would go red.
-  *   - Whole-map reads are EXCLUDED from the generated suite: combined with concurrent new-key inserts they express the
-  *     H5 relation gap (structure reads are footprint-compatible with new-key entry writes and never commit-validated —
-  *     see DocumentsReadGapH5 in specs/common/FootprintLemmas.tla), and the dedicated probe below owns that idiom.
+  *   - Whole-map reads stay out of the generated suite: the historically defective idiom (whole-map read + new-key
+  *     insert — the H5 phantom, fixed by the relation's third conjunct, DocumentsParentReadChildWriteCaught in
+  *     specs/common/FootprintLemmas.tla) is covered deterministically by the dedicated regression test below; folding
+  *     ReadWholeMap into the generators is a candidate expansion now that the idiom serializes.
   *   - waitUntil/retry is out of scope until the Phase 2 spec work lands (park/wake is unmodelled and carries its own
   *     hypothesis, H1).
   *   - Transactions here have statically known access sets, so the static-analysis fallback (H4's enabling condition)
@@ -221,43 +222,32 @@ class SerializabilityOracleSpec extends AnyFreeSpec with ScalaCheckPropertyCheck
   }
 
   // -------------------------------------------------------------------
-  // H5 pinned reproduction (EXPECTED ANOMALY — flips red when fixed)
+  // H5 regression: whole-map read + new-key insert must serialize
   // -------------------------------------------------------------------
 
   "H5 phantom write skew: whole-map read + new-key insert" - {
     /* Two transactions each read the whole map and insert a distinct new
-     * key. Their footprints are judged compatible (a parent-structure READ
-     * is never tested against a child-entry WRITE — DocumentsReadGapH5 in
-     * specs/common/FootprintLemmas.tla), the structure read is never
-     * commit-validated, and so both can observe the EMPTY map yet both
-     * commit — an outcome no serial order produces. Measured on first
-     * probe: 1958/2000 reps anomalous on a 12-core host, i.e. the phantom
-     * is the DEFAULT outcome under contention, and the static-analysis
-     * walker does not close the gap (the Phase 3 pre-step of
-     * docs/plans/formal-specs.md §6 H5, answered empirically).
-     *
-     * This test PINS the defect the way check_expected.sh pins TLC
-     * counterexamples: it asserts the anomaly still reproduces. IF THIS
-     * GOES RED the relation (or structure-read validation) was fixed —
-     * update DocumentsReadGapH5, the verdict table in specs/README.md,
-     * the H5 row in the plan, and rewrite this test to assert
-     * serializability of the idiom.
+     * key. Before the H5 fix their footprints were judged compatible (a
+     * parent-structure READ was never tested against a child-entry WRITE)
+     * and, with structure reads never commit-validated, both observed the
+     * EMPTY map yet both committed — an outcome no serial order produces,
+     * measured at ~98% of contended reps. The fixed relation's third
+     * conjunct (DocumentsParentReadChildWriteCaught in
+     * specs/common/FootprintLemmas.tla) makes the pair conflict, so the
+     * scheduler serializes them and every rep must now be serializable.
+     * This is the behavioural regression test for that fix.
      */
-    "reproduces (pinned defect — see specs/README.md verdict table)" in {
+    "is serializable in every rep (regression for the H5 fix)" in {
       val t1ops = List(ReadWholeMap, UpsertKey("a", 1))
       val t2ops = List(ReadWholeMap, UpsertKey("b", 2))
       val init  = ModelState(Vector.fill(NumVars)(0), Map.empty)
 
-      val maxReps = 1000
-      val anomaly = (1 to maxReps).exists { _ =>
+      val reps = 500
+      (1 to reps).foreach { rep =>
         val (finalState, observed) = runWorkload(init, List(t1ops, t2ops))
-        !isSerializable(init, List(t1ops, t2ops), observed, finalState)
-      }
-      withClue(
-        s"no phantom observed in $maxReps reps — if the footprint relation " +
-          "or structure-read validation was fixed, flip this pin (see comment)"
-      ) {
-        anomaly shouldBe true
+        withClue(s"rep $rep: " + explain(init, List(t1ops, t2ops), observed, finalState)) {
+          isSerializable(init, List(t1ops, t2ops), observed, finalState) shouldBe true
+        }
       }
     }
   }
