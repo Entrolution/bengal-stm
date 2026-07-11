@@ -23,6 +23,13 @@ private[stm] case class IdFootprint(
   isValidated: Boolean = false
 ) {
 
+  // SPEC: LemmaValidatedIdempotent — one application of this transform is a
+  // fixpoint (FootprintLemmas.tla checks it exhaustively), which makes the
+  // isValidated short-circuit sound ON RE-APPLICATION. The flag's full
+  // soundness also needs call-site discipline: addReadId/addWriteId/mergeWith
+  // copy isValidated through unchanged, so a validated footprint that is
+  // subsequently mutated would skip re-validation (today's call sites never
+  // do that — validation happens last, in the runtime).
   private[stm] lazy val getValidated =
     if (isValidated) {
       this
@@ -49,6 +56,11 @@ private[stm] case class IdFootprint(
   private[stm] def mergeWith(idScope: IdFootprint): IdFootprint =
     this.copy(readIds = readIds ++ idScope.readIds, updatedIds = updatedIds ++ idScope.updatedIds)
 
+  // SPEC: DocumentsReadGapH5 — ids (reads included) are tested only against
+  // the OTHER side's update ids, so a child-entry WRITE is never checked
+  // against a parent-structure READ: whole-map reads are judged compatible
+  // with new-key inserts (FootprintLemmas.tla pins this; hypothesis H5 in
+  // docs/plans/formal-specs.md tracks the behavioural consequence).
   private def asymmetricCompatibleWith(input: IdFootprint): Boolean =
     combinedRawIds.intersect(input.updateRawIds).isEmpty && !combinedIds.exists(
       _.parent.exists(p => input.updateRawIds.contains(p.value))

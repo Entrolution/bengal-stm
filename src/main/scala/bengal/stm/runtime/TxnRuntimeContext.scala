@@ -153,6 +153,9 @@ private[stm] trait TxnRuntimeContext[F[_]] {
         _ <- analysedTxn.resetDependencyTally
         _ <- graphBuilderSemaphore.permit.use { _ =>
                for {
+                 // SPEC: ContractC — this scan is the mechanism meant to keep
+                 // footprint-incompatible txns out of overlapping execute
+                 // windows (Scheduler.tla checks the guarantee itself).
                  testAndLink <- activeTransactions.values.toList.parTraverse { aTxn =>
                                   Async[F]
                                     .ifM(
@@ -184,6 +187,9 @@ private[stm] trait TxnRuntimeContext[F[_]] {
         _ <- analysedTxn.triggerUnsub.start
       } yield ()
 
+    // SPEC: NoExecOnCompleted — registerRunning re-checks nothing (no tally
+    // guard, no completion guard), so a stale execute spawn runs to commit;
+    // Scheduler.tla checks no execute fiber starts for a completed txn.
     def registerRunning(analysedTxn: AnalysedTxn[_]): F[Unit] =
       graphBuilderSemaphore.permit.use { _ =>
         analysedTxn.executionStatus.set(Running)
@@ -220,12 +226,18 @@ private[stm] trait TxnRuntimeContext[F[_]] {
     private[stm] val resetDependencyTally: F[Unit] =
       dependencyTally.set(0) >> hasDownstream.set(false)
 
+    // SPEC: NoDoubleExec — execute fibers are spawned here (readiness) and in
+    // unsubscribeUpstreamDependency (tally zero-test) with no dedup guard;
+    // Scheduler.tla checks that at most one fiber is ever in the commit window.
     private[stm] val checkExecutionReadiness: F[Unit] =
       Async[F].ifM(dependencyTally.get.map(_ == 0))(
         execute(scheduler).start.void,
         Async[F].unit
       )
 
+    // SPEC: TallyNonNegative — the getAndUpdate decrement below is the only
+    // tally sink; a negative tally means an unsubscribe was delivered for an
+    // edge the tally no longer counts (stale edge from a shared unsubSpecs).
     private val unsubscribeUpstreamDependency: F[Unit] =
       Async[F].ifM(dependencyTally.getAndUpdate(_ - 1).map(_ == 1))(
         execute(scheduler).start.void,
@@ -276,6 +288,9 @@ private[stm] trait TxnRuntimeContext[F[_]] {
             Async[F].delay((TxnLogError(ex), None))
         }
 
+    // SPEC: NoDoublePublish — log.commit below publishes the write set; a
+    // second concurrent execute fiber for the same txn re-runs the whole
+    // pipeline and publishes again (Scheduler.tla checks once-per-incarnation).
     private val commit: F[TxnResult] =
       for {
         logResult <- getTxnLogResult
@@ -331,6 +346,9 @@ private[stm] trait TxnRuntimeContext[F[_]] {
                (for {
                  result <- poll(commit)
                  _      <- ex.registerCompletion(this)
+                 // SPEC: CompletionAtMostOnce — completes here, in the error
+                 // handler below, and in the submit wrapper (all Deferred
+                 // first-wins); Scheduler.tla counts completions per txn.
                  _ <- result match {
                         case TxnResultSuccess(result) =>
                           completionSignal
