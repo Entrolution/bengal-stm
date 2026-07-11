@@ -90,3 +90,50 @@ jobs:
             specs/scheduler/Scheduler.tla \
             CompletionAtMostOnce \
             ALLOW_DEADLOCK
+
+      # --- Commit protocol (Spec A) ---
+      # H2 and H3 are CONFIRMED, OPEN defects. Their counterexamples are pinned
+      # so that CI fails if they stop reproducing — which is what forces the
+      # fix, the verdict table and the plan to move together.
+
+      - name: Check commit protocol — H2 lock-order deadlock (pinned RED)
+        run: |
+          ./specs/check_expected.sh \
+            specs/commit/CommitH2.cfg \
+            specs/commit/CommitProtocol.tla \
+            NoWaitsForCycle
+
+      - name: Check commit protocol — H3 under-declared read skew (pinned RED)
+        run: |
+          ./specs/check_expected.sh \
+            specs/commit/CommitH3.cfg \
+            specs/commit/CommitProtocol.tla \
+            CommitSnapshotValid
+
+      - name: Check commit protocol — H3 on the PARTIAL footprint ordinary code produces (pinned RED)
+        run: |
+          ./specs/check_expected.sh \
+            specs/commit/CommitH3Partial.cfg \
+            specs/commit/CommitProtocol.tla \
+            CommitSnapshotValid
+
+      - name: Check commit protocol — H3 under-declared writer (pinned RED)
+        run: |
+          ./specs/check_expected.sh \
+            specs/commit/CommitH3Writer.cfg \
+            specs/commit/CommitProtocol.tla \
+            CommitSnapshotValid
+
+      - name: Check commit protocol — dirty refinement (expected clean)
+        run: |
+          ./specs/check_expected.sh \
+            specs/commit/CommitDirty.cfg \
+            specs/commit/CommitProtocol.tla \
+            NONE
+
+      - name: Check commit protocol — accurate footprints (expected clean since the H5 fix)
+        run: |
+          ./specs/check_expected.sh \
+            specs/commit/CommitAccurate.cfg \
+            specs/commit/CommitProtocol.tla \
+            NONE

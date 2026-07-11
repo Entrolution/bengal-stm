@@ -502,6 +502,38 @@ private[stm] trait TxnRuntimeContext[F[_]] {
             // up to where the error is generated. In the worst case,
             // we fall back to blindly optimistic scheduling (for the
             // first transaction attempt)
+            //
+            // SPEC: CommitSnapshotValid — EXPECTED-RED; this is the H3
+            // mechanism site. Both branches yield an UNDER-APPROXIMATED
+            // footprint, and an under-approximated footprint is not merely a
+            // weaker hint — it is UNSOUND. Reads are never commit-validated
+            // and take no lock (see TxnLogReadOnlyVarEntry), so the scheduler
+            // is the only thing standing between a transaction and a stale
+            // read; an empty or partial footprint switches it off. Unsound in
+            // BOTH directions: an under-declared transaction reads what a peer
+            // overwrites (specs/commit/CommitH3.cfg), AND its undeclared
+            // writes invalidate a correctly-declared peer's reads
+            // (CommitH3Writer.cfg). Only a pure write-write collision is
+            // caught, by the commit locks and the dirty check
+            // (CommitDirty.cfg).
+            //
+            // Reachable from ORDINARY code, and it is the FIRST branch below —
+            // the partial footprint — that the reachable path takes, not the
+            // empty one. staticAnalysisCompiler executes real reads but never
+            // applies writes, so reading back a key this transaction just
+            // wrote yields None during analysis and Some(v) at run time; a
+            // partial continuation on that value throws during analysis and
+            // nowhere else, the walker converts it to
+            // StaticAnalysisShortCircuitException carrying whatever it had
+            // accumulated, and everything after the throw point goes
+            // undeclared. 198/200 contended reps skew, and holding the whole
+            // transaction fixed while making the continuation TOTAL removes
+            // the skew — so the throw is the cause, not the shape of the
+            // transaction (StaticAnalysisFallbackSpec, controls 1 and 2).
+            // The fix has two halves: flag the under-approximation so it is
+            // treated as incompatible with everything (negative control NC-2),
+            // and give the analyser a shadow log so read-your-own-write stops
+            // throwing in the first place.
             .handleErrorWith {
               case StaticAnalysisShortCircuitException(idFootprint) =>
                 Async[F].delay((idFootprint, None))
