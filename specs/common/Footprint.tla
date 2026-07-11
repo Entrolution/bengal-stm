@@ -96,6 +96,39 @@ IsCompatible(f, g) ==
     /\ AsymCompat(f, g)
     /\ AsymCompat(g, f)
 
+(*****************************************************************************)
+(* COVERAGE — the H6 fix.                                                    *)
+(*                                                                           *)
+(* The DECLARED footprint (what the scheduler saw) COVERS the ACTUAL one     *)
+(* (what the log really touched) iff declaring the former excludes at least  *)
+(* as much concurrency as declaring the latter would have. If that holds,    *)
+(* Contract C on the declared footprint implies Contract C on the actual     *)
+(* one, and the transaction's scheduling was sound after all.                *)
+(*                                                                           *)
+(* NOT a subset test on raw ids. That would be BOTH unsound and unusable:    *)
+(*                                                                           *)
+(*   - unusable, because a whole-map READ legitimately produces a read-only  *)
+(*     log entry for EVERY existing key (TxnLogValid.getVarMap), so the      *)
+(*     actual footprint properly contains ids the static footprint never     *)
+(*     named. Those ids ARE covered — a parent-structure read conflicts with *)
+(*     any child write via the relation's third conjunct — and a subset test *)
+(*     would abort every whole-map read in the library.                      *)
+(*   - and it would still miss the hierarchy: an id is covered if the        *)
+(*     footprint names it OR names its PARENT, but a parent READ covers a    *)
+(*     child READ while only a parent WRITE covers a child WRITE.            *)
+(*                                                                           *)
+(* LemmaCoverageIsSound (FootprintLemmas.tla) checks the whole thing         *)
+(* exhaustively against the relation, over every ordered TRIPLE of           *)
+(* footprints, rather than trusting the argument above.                      *)
+(*****************************************************************************)
+Covers(declared, actual) ==
+    /\ \A id \in actual.reads :
+            \/ id.val \in CombinedRawIds(declared)
+            \/ (id.par /= NoParent /\ id.par \in CombinedRawIds(declared))
+    /\ \A id \in actual.updates :
+            \/ id.val \in UpdateRawIds(declared)
+            \/ (id.par /= NoParent /\ id.par \in UpdateRawIds(declared))
+
 (*
  * getValidated:
  *   readIds := (readIds -- updatedIds)

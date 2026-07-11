@@ -122,6 +122,34 @@ private[stm] case class IdFootprint(
   private[stm] def isCompatibleWith(input: IdFootprint): Boolean =
     !isUnderApproximated && !input.isUnderApproximated &&
       asymmetricCompatibleWith(input) && input.asymmetricCompatibleWith(this)
+
+  // SPEC: CommitSnapshotValid — the H6 fix. TRUE iff declaring THIS footprint
+  // excluded at least as much concurrency as declaring `actual` would have. If
+  // so, Contract C on this footprint implies Contract C on what the transaction
+  // really touched, and its scheduling was sound after all
+  // (LemmaCoverageIsSound in specs/common/FootprintLemmas.tla checks that
+  // exhaustively over every ordered triple of footprints — it is not argued).
+  //
+  // NOT a subset test on raw ids. That would be unusable as well as wrong: a
+  // whole-map READ legitimately expands, in the log, into a read-only entry for
+  // EVERY existing key (TxnLogValid.getVarMap), so the actual footprint properly
+  // contains ids the static walker never named. Those ids ARE covered — a
+  // parent-structure read conflicts with any child write via the relation's
+  // third conjunct — and a subset test would abort every whole-map read in the
+  // library.
+  //
+  // Hence the hierarchy, and note its asymmetry: an id is covered if this
+  // footprint names it OR names its PARENT, but a parent READ covers only a
+  // child READ, whereas a parent WRITE covers child reads and writes alike.
+  // Reading a map does not announce that you will write a key in it.
+  private[stm] def covers(actual: IdFootprint): Boolean =
+    actual.readIds.forall { id =>
+      combinedRawIds.contains(id.value) ||
+      id.parent.exists(p => combinedRawIds.contains(p.value))
+    } && actual.updatedIds.forall { id =>
+      updateRawIds.contains(id.value) ||
+      id.parent.exists(p => updateRawIds.contains(p.value))
+    }
 }
 
 private[stm] object IdFootprint {

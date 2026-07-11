@@ -539,6 +539,32 @@ EntryDirty(t, e) ==
 
 IsDirty(t) == \E e \in Writes(t) : EntryDirty(t, e)
 
+(* THE H6 FIX — the commit-time coverage check.
+   The scheduler placed this transaction using its DECLARED footprint. Under the
+   locks, before publishing anything, ask whether that footprint actually COVERS
+   what the run really touched. If it does, Contract C on the declared footprint
+   implies Contract C on the actual one (LemmaCoverageIsSound, checked
+   exhaustively over every footprint triple) and the scheduling was sound. If it
+   does not, the transaction was placed on a footprint that did not describe it —
+   so it must ABORT WITHOUT PUBLISHING and re-run with the refined footprint,
+   exactly as the dirty path does.
+
+   Aborting before the publish is what makes this work in BOTH directions: our
+   undeclared write never lands, so a peer's unvalidated read of it stays valid;
+   and our own undeclared read never reaches a caller.
+
+   An UNDER-APPROXIMATED footprint skips the check: it is incompatible with
+   everything (the H3 fix), so the transaction ran alone, nothing could change
+   under it, and its reads are valid whatever it touched. Checking coverage there
+   would abort it every time for no gain. *)
+CoverageOk(t) ==
+    \/ declared[t].under
+    \/ Covers(declared[t], Validated(ActualFP(t)))
+
+(* Either failure sends the transaction down the same road: release, refine from
+   the actual log, re-run. *)
+NeedsRefinement(t) == IsDirty(t) \/ ~CoverageOk(t)
+
 (* A structure read observes the whole K -> V map (TxnVarMap.get), so any
    write to any child bumps the structure's version. *)
 BumpedBy(t, e) ==
@@ -713,7 +739,7 @@ AcquireDone(t) ==
    are not visible in txnVarMap.get). *)
 Publish(t) ==
     /\ pc[t] = "validate"
-    /\ ~IsDirty(t)
+    /\ ~NeedsRefinement(t)
     /\ readValid' = [readValid EXCEPT ![t] =
                         IF ReadsStillValid(t) THEN "ok" ELSE "bad"]
     /\ version'   = [e \in Entities |->
@@ -732,7 +758,7 @@ Publish(t) ==
    is all isDirty looks at. *)
 DirtyRestart(t) ==
     /\ pc[t] = "validate"
-    /\ IsDirty(t)
+    /\ NeedsRefinement(t)
     /\ inc[t] < MaxInc
     /\ lockHolder' = [l \in Locks |->
                         IF lockHolder[l] = t THEN "none" ELSE lockHolder[l]]
@@ -756,7 +782,7 @@ DirtyRestart(t) ==
    verdict (BoundsNeverBind). *)
 DirtyTruncate(t) ==
     /\ pc[t] = "validate"
-    /\ IsDirty(t)
+    /\ NeedsRefinement(t)
     /\ inc[t] = MaxInc
     /\ lockHolder' = [l \in Locks |->
                         IF lockHolder[l] = t THEN "none" ELSE lockHolder[l]]

@@ -48,6 +48,20 @@ Ids == {PV1, S, E1, E2}
    untrustworthy footprints — 512 footprints, 262,144 ordered pairs. *)
 Footprints == [reads : SUBSET Ids, updates : SUBSET Ids, under : BOOLEAN]
 
+(* The COMPLETE footprints — those the walker fully determined. The coverage
+   lemma quantifies `declared` and `actual` over these rather than over the whole
+   universe, and that is exact rather than a shortcut: an under-approximated
+   footprint is incompatible with everything
+   (LemmaUnderApproximatedIncompatibleWithAll), so a triple with an
+   under-approximated `declared` discharges vacuously, and `actual` is a log
+   footprint, which is complete by construction. `g` likewise: if it is
+   under-approximated then BOTH sides of the implication are false. So the
+   restriction is exact, not a shortcut -- every triple it drops is one that
+   discharges vacuously anyway -- and it cuts the check 8x. The negative control
+   in specs/README.md (break Covers, watch LemmaCoverageIsSound fail) confirms
+   the restricted lemma still has teeth. *)
+CompleteFootprints == [reads : SUBSET Ids, updates : SUBSET Ids, under : {FALSE}]
+
 -------------------------------------------------------------------------------
 (* Algebraic properties of the relation as encoded *)
 -------------------------------------------------------------------------------
@@ -116,6 +130,53 @@ ASSUME LemmaValidatedPreservesUnderApproximation ==
 ASSUME LemmaMergePropagatesUnderApproximation ==
     \A f \in Footprints, g \in Footprints :
         MergeWith(f, g).under = (f.under \/ g.under)
+
+(*
+ * THE H6 FIX, and the reason it is safe to act on.
+ *
+ * If the DECLARED footprint covers the ACTUAL one, then every transaction the
+ * scheduler judged compatible with the declared footprint really is compatible
+ * with what the transaction actually touched. Contract C on `declared` therefore
+ * implies Contract C on `actual`, and the scheduling was sound after all.
+ *
+ * That is the entire justification for the commit-time coverage check: pass it
+ * and the run can publish; fail it and the transaction was scheduled on a
+ * footprint that did not describe it, so it must abort BEFORE publishing and
+ * re-run with the refined footprint. Checked here over every ordered TRIPLE of
+ * footprints in the universe, not argued.
+ *
+ * `actual` is required complete (~a.under) because it is: the log footprint is
+ * built by merging real log entries, and no entry can be under-approximated.
+ *)
+ASSUME LemmaCoverageIsSound ==
+    \A d \in CompleteFootprints, a \in CompleteFootprints, g \in CompleteFootprints :
+        (Covers(d, a) /\ IsCompatible(d, g)) => IsCompatible(a, g)
+
+(* Coverage is reflexive: an accurate footprint always covers itself, so a
+   transaction with a statically-known access set NEVER trips the check. This is
+   what bounds the fix's cost to the data-dependent path. *)
+ASSUME LemmaCoverageReflexive ==
+    \A f \in Footprints : Covers(f, f)
+
+(* A parent-structure READ covers a child-entry READ (the whole-map-read case:
+   the log expands it into a read-only entry per key, and every one of those is
+   covered) -- but a parent READ does NOT cover a child WRITE, because reading a
+   map does not announce that you will write a key in it. This asymmetry is why
+   the check cannot be a plain subset test. *)
+ASSUME DocumentsParentReadCoversChildRead ==
+    /\ Covers(FP({S}, {}), FP({E1}, {}))
+    /\ ~Covers(FP({S}, {}), FP({}, {E1}))
+
+(* A parent-structure WRITE covers child-entry writes AND reads -- the setVarMap
+   case, where the log expands a structure write into a per-key update entry. *)
+ASSUME DocumentsParentWriteCoversChildren ==
+    /\ Covers(FP({}, {S}), FP({}, {E1}))
+    /\ Covers(FP({}, {S}), FP({E1}, {}))
+
+(* And the H6 defect itself: declaring a write to one id does NOT cover writing a
+   DIFFERENT one. This is the case the check exists to catch. *)
+ASSUME DocumentsWrongIdIsNotCovered ==
+    ~Covers(FP({}, {PV1}), FP({}, {E1}))
 
 -------------------------------------------------------------------------------
 (* Positive controls: conflicts the relation DOES catch *)

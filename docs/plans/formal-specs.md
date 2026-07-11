@@ -38,16 +38,22 @@ so the transaction is serialized and runs alone — which makes its unvalidated
 reads trivially safe. All nine TLC expectations across the workstream are now
 expected-CLEAN; there are no pinned counterexamples left.
 
-**What the H3 fix does NOT cover, and it is the natural next hypothesis.**
-Flagging reaches only the paths where the walker *throws*. A **data-dependent
-footprint** — an access set computed from values read before submission, which
-then changed — completes without throwing, is therefore unflagged and trusted,
-and can under-declare a READ by exactly the H3 mechanism. Post-fix it is the
-ONLY remaining source of declared/actual divergence, which means it is also the
-only thing that can still drive a transaction down the dirty-resubmission path:
-that machinery now exists to service one path, and that path is unsound. Both
-`Scheduler.cfg`'s `t1` and `CommitDirty.cfg`'s `ddw` had to be re-founded on
-this realisation to stay reachable (see §10).
+**H6 — data-dependent footprints — CONFIRMED and FIXED (2026-07-12).** The hole
+the H3 fix could not reach, promoted from a §10 footnote the moment H3 landed.
+The walker runs BEFORE `submitTxn` — outside any Contract-C window — and computes
+the access set from LIVE reads, so a transaction whose keys depend on a value it
+read can be scheduled on a footprint naming the WRONG ids. Nothing throws, so
+nothing is flagged. Same mechanism as H3, same invariant.
+**Fixed by a commit-time COVERAGE check**: under the locks and *before publishing*,
+verify that the declared footprint covers what the run actually touched; if not,
+refine from the actual log and re-run. Checking before the publish is what makes
+it sound in both directions. `IdFootprint.covers` is deliberately NOT a subset
+test — a whole-map read legitimately expands into a log entry per key — and
+`LemmaCoverageIsSound` proves the real thing exhaustively over every ordered
+triple of footprints.
+
+**All six hypotheses (H1–H6) are now confirmed and fixed.** Ten TLC expectations,
+all expected-clean; no pinned counterexamples remain.
 Two results came out of Spec A besides the verdicts: **the H5 fix is what
 discharges Spec B's atomic-commit abstraction** (§3's refinement obligation),
 and **the commit protocol alone is not serializable** — removing only the
@@ -466,8 +472,8 @@ on nothing TLA-related.
   collision conflates two vars in the log map (silent entry overwrite) and in
   footprints. The specs `ASSUME` distinct IDs; the risk is documented in
   `specs/README.md` and is property-test / arithmetic territory, not TLC territory.
-- **Data-dependent footprints — PROMOTED (2026-07-11): this is now the next
-  hypothesis, not a footnote.** A txn whose access set depends on values read can
+- **Data-dependent footprints — PROMOTED (2026-07-11), then CONFIRMED and FIXED
+  as H6 (2026-07-12). Retained here as the record of how it surfaced.** A txn whose access set depends on values read can
   declare one set and touch another: the static-analysis walker runs BEFORE
   `submitTxn`, outside any Contract-C window, and the values it reads to compute
   keys can change before the transaction is scheduled. Nothing throws, so nothing
@@ -477,12 +483,20 @@ on nothing TLA-related.
   threw.
 
   The original note here said "revisit only if H3/H5 verdicts make refinement
-  soundness load-bearing." They did. Post-H3-fix this is the ONLY remaining source
-  of declared/actual divergence, and therefore the only thing that can still drive
-  the dirty-resubmission path at all: that machinery now exists to service a single
-  path, and that path is unsound. Both `Scheduler.cfg`'s `t1` and
-  `CommitDirty.cfg`'s `ddw` had to be re-founded on it to stay reachable, which is
-  the clearest possible signal that it is load-bearing.
+  soundness load-bearing." They did. Post-H3-fix this was the ONLY remaining source
+  of declared/actual divergence, and therefore the only thing that could still
+  drive the dirty-resubmission path at all: that machinery existed to service a
+  single path, and that path was unsound. Both `Scheduler.cfg`'s `t1` and
+  `CommitDirty.cfg`'s `ddw` had to be re-founded on it to stay reachable, which was
+  the clearest possible signal that it was load-bearing.
+
+  **FIXED (2026-07-12) — see the H6 row in §6.** The commit-time coverage check
+  catches it: an inaccurate declared footprint is caught at the one point where it
+  can still be caught harmlessly, before anything is published. Worth recording
+  how this arrived, because it is the pattern the whole workstream ran on — the
+  hypothesis was not found by staring at the code, it was *forced out* by a fix.
+  Closing H3 made `CommitDirty` vacuous, and asking "so what CAN still go dirty?"
+  had exactly one answer.
 - **Semaphore fairness:** CE `Semaphore` is FIFO; the model uses weak fairness, which
   is *weaker in a way that can matter* — see the fairness row in §9 for the
   validation discipline and escalation path.

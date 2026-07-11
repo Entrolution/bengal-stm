@@ -126,6 +126,13 @@ jobs:
             specs/commit/CommitProtocol.tla \
             NONE
 
+      - name: Check commit protocol — H6 data-dependent footprint (expected clean since the H6 fix)
+        run: |
+          ./specs/check_expected.sh \
+            specs/commit/CommitH6.cfg \
+            specs/commit/CommitProtocol.tla \
+            NONE
+
       - name: Check commit protocol — dirty refinement (expected clean)
         run: |
           ./specs/check_expected.sh \
