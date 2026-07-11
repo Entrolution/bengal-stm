@@ -36,6 +36,14 @@ private[stm] trait TxnLogContext[F[_]] {
     private[stm] def set(value: V): TxnLogEntry[V]
     private[stm] def commit: F[Unit]
     private[stm] def isDirty: F[Boolean]
+
+    // Unlike isDirty — which read-only entries hardcode to false because
+    // commit-time validation is the scheduler's job — this REALLY compares
+    // the entry's initial value against live state, read-only entries
+    // included. The park path (submitTxnForRetry) uses it to detect
+    // conflicting commits that landed after the log ran but whose wake
+    // sweep has already been spent (the H1 lost-wakeup fix).
+    private[stm] def hasChangedSinceRead: F[Boolean]
     private[stm] def lock: F[Option[Semaphore[F]]]
     private[stm] def idFootprint: F[IdFootprint]
 
@@ -69,6 +77,9 @@ private[stm] trait TxnLogContext[F[_]] {
 
     override private[stm] lazy val isDirty: F[Boolean] =
       Async[F].pure(false)
+
+    override private[stm] lazy val hasChangedSinceRead: F[Boolean] =
+      txnVar.get.map(_ != initial)
 
     override private[stm] lazy val lock: F[Option[Semaphore[F]]] =
       Async[F].pure(None)
@@ -108,6 +119,9 @@ private[stm] trait TxnLogContext[F[_]] {
     override private[stm] lazy val isDirty: F[Boolean] =
       txnVar.get.map(_ != initial)
 
+    override private[stm] lazy val hasChangedSinceRead: F[Boolean] =
+      isDirty
+
     override private[stm] lazy val lock: F[Option[Semaphore[F]]] =
       Async[F].delay(Some(txnVar.commitLock))
 
@@ -142,6 +156,9 @@ private[stm] trait TxnLogContext[F[_]] {
 
     override private[stm] lazy val isDirty: F[Boolean] =
       Async[F].pure(false)
+
+    override private[stm] lazy val hasChangedSinceRead: F[Boolean] =
+      txnVarMap.get.map(_ != initial)
 
     override private[stm] lazy val lock: F[Option[Semaphore[F]]] =
       Async[F].pure(None)
@@ -181,6 +198,9 @@ private[stm] trait TxnLogContext[F[_]] {
     override private[stm] lazy val isDirty: F[Boolean] =
       txnVarMap.get.map(_ != initial)
 
+    override private[stm] lazy val hasChangedSinceRead: F[Boolean] =
+      isDirty
+
     override private[stm] lazy val lock: F[Option[Semaphore[F]]] =
       Async[F].delay(Some(txnVarMap.commitLock))
 
@@ -217,6 +237,9 @@ private[stm] trait TxnLogContext[F[_]] {
 
     override private[stm] lazy val isDirty: F[Boolean] =
       Async[F].pure(false)
+
+    override private[stm] lazy val hasChangedSinceRead: F[Boolean] =
+      txnVarMap.get(key).map(_ != initial)
 
     override private[stm] lazy val lock: F[Option[Semaphore[F]]] =
       Async[F].pure(None)
@@ -272,6 +295,9 @@ private[stm] trait TxnLogContext[F[_]] {
           .map(iValue => !oValue.contains(iValue))
           .getOrElse(oValue.isDefined)
       }
+
+    override private[stm] lazy val hasChangedSinceRead: F[Boolean] =
+      isDirty
 
     override private[stm] lazy val lock: F[Option[Semaphore[F]]] =
       for {
@@ -1018,6 +1044,15 @@ private[stm] trait TxnLogContext[F[_]] {
         _       <- logFib.join
       } yield result
     }
+
+    // The park path's read-inclusive staleness check (H1 fix): TRUE iff any
+    // entry — read-only entries included — no longer matches the live value
+    // it was built from. Contrast isDirty, which validates the write set
+    // only. Logs are small; no short-circuit machinery needed.
+    private[stm] lazy val anyReadChangedSinceRead: F[Boolean] =
+      log.values.toList
+        .parTraverse(_.hasChangedSinceRead)
+        .map(_.exists(identity))
 
     override private[stm] lazy val idFootprint: F[IdFootprint] =
       log.values.toList

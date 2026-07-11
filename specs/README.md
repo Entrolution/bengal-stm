@@ -24,16 +24,17 @@ the operational reference and the **source of truth for verdicts**.
 **Scheduler protocol, Phase 1 scope** (`src/main/scala/bengal/stm/runtime/TxnRuntimeContext.scala`):
 
 - Submission and dependency-graph construction, tallies, statuses,
-  unsubscribe cascades, the dirty-resubmission path, and the
-  `handleErrorWith` recovery branches
+  unsubscribe cascades, the dirty-resubmission path, the
+  `handleErrorWith` recovery branches, and (since Phase 2) the retry
+  map / park / wake machinery (`TxnResultRetry`, `submitTxnForRetry`,
+  `checkRetryQueue`)
 - Six safety invariants over that machinery — all six **HOLD since the H4
   fix** (admission gate, fresh incarnations, exactly-once cascades),
   verified exhaustively with deadlock detection enabled; before the fix
   all six failed organically (see the verdict table)
 
-**They do not verify (Phase 1):**
+**They do not verify:**
 
-- The retry map / park / wake machinery (`TxnResultRetry`) — Phase 2
 - The commit protocol's internals: lock ordering, dirty-check, publish
   (Spec A, `commit/`) — Phase 3; Spec B treats commit as one atomic step
 - The free-monad compiler / static-analysis walker
@@ -49,7 +50,7 @@ the operational reference and the **source of truth for verdicts**.
 |------|----------------|----------------------|
 | `common/Footprint.tla` | The footprint data model and compatibility relation (operators only) | `IdFootprint.scala`, `TxnVarRuntimeId.scala` |
 | `common/FootprintLemmas.tla` | Exhaustive lemma checks over a 4-id universe (256 footprints, 65,536 ordered pairs) as named `ASSUME`s | `IdFootprint.scala` |
-| `scheduler/Scheduler.tla` | Spec B: the scheduler protocol at Ref/TrieMap-operation granularity | `TxnRuntimeContext.scala` |
+| `scheduler/Scheduler.tla` | Spec B: the scheduler protocol at Ref/TrieMap-operation granularity — scenarios select `Txns` per config (H4 safety set; retry/park/wake set) | `TxnRuntimeContext.scala` |
 | `commit/` | Spec A: commit protocol (locks, dirty-check, publish) | **Phase 3 — not yet written** |
 
 `scheduler/Footprint.tla` and `commit/Footprint.tla` are symlinks to
@@ -135,6 +136,8 @@ scenario that produced the H4 counterexample family before the fix.
 | `DocumentsSiblingInsertsCompatible` — two new-key inserts to one map compatible (H2 enabler) | **PINNED** (correct behaviour; the hazard is the lock aliasing, Spec A) | `FootprintLemmas.cfg` |
 | `NoDoubleExec`, `ContractC`, `NoExecOnCompleted`, `NoDoublePublish`, `TallyNonNegative`, `CompletionAtMostOnce` | **HOLD — H4 FIXED (2026-07-11)** by the admission gate (`admitForExecution`: status CAS + zero tally under the graph semaphore), fresh bookkeeping per incarnation (`freshIncarnation`), and exactly-once cascades (`cascadeFired`). Exhaustive at the defect scenario's own bounds, ~24k distinct states in ~2s — the gate collapsed the pre-fix >32M-state explosion. **Before the fix all six failed organically** at TLC search depths ~50–64 (`NoDoubleExec` was the CI pin; historical narrative below) | `Scheduler.cfg` (CI, expected clean) |
 | **Deadlock freedom** (organic) | **HOLDS** — detection enabled, legitimate terminals modelled by `Terminating` | `Scheduler.cfg` |
+| **H1 lost wakeup — park/submit window** | **CONFIRMED and FIXED (2026-07-11)**: pre-fix the retry config deadlocked — a conflictor's submission-time sweep ran against a retry map that did not yet contain the parker, the conflictor's commit then satisfied the parker's predicate, and wakes fire only from sweeps, so nothing ever woke it. The fix scans `activeTransactions` for footprint conflicts and re-checks the read set (`hasChangedSinceRead` — a real comparison, unlike the vacuous read-only `isDirty`), both inside the retry-semaphore region before parking. **The check ORDER is load-bearing**: scan first, staleness last. The reverse order — which a first draft shipped — still loses wakeups (a conflictor commits after the staleness read and leaves `activeTransactions` before the scan, escaping both) and TLC finds it as a deadlock; that is negative control NC-A below | `SchedulerRetry.cfg` (CI, expected clean) |
+| **Spurious self-wake spin** (found while verifying H1) | **FIXED (2026-07-11)**: a parked transaction is footprint-incompatible with *itself* (it writes), so its own in-flight submission sweep woke it, it re-ran, re-parked, and the next sweep could do it again — an unbounded spin under adversarial scheduling, pre-existing and orthogonal to H1. The retry map is now keyed by `TxnId` rather than footprint, and a sweep skips the submitting transaction (its own submission cannot satisfy its own predicate — it retried rather than committed). Keying by id also removes the old wake-chaining of distinct transactions that happened to share a footprint | `SchedulerRetry.cfg` (`BoundsNeverBind`); negative control NC-C |
 | `NoDroppedSpawn` | **HOLDS post-fix** — the admission gate retires loser fibers fast enough that no spawn is dropped at these bounds (pre-fix the two-slot bound truncated behaviour from depth ~72) | `Scheduler.cfg` |
 | `TypeOK` | holds on every completed run | all cfgs |
 
@@ -169,6 +172,16 @@ TLC search depth ~50 under the pre-fix protocol):
    `NoExecOnCompleted`, `TallyNonNegative` (stale drains under-run the
    reset tally), and `ContractC` (a stale fiber in-window alongside an
    incompatible peer).
+
+**Negative controls (the model is a detector, not a rubber stamp).** Each
+break is applied to a scratch copy of `Scheduler.tla` and run against
+`SchedulerRetry.cfg`:
+
+| # | Break | Result |
+|---|-------|--------|
+| NC-A | Swap the park checks (staleness before the active scan) | **Deadlock** — the ordering defect |
+| NC-B | Remove both park checks | **Deadlock** — the original H1 defect |
+| NC-C | Remove the sweep's self-skip | **`BoundsNeverBind` violated** — the spurious spin |
 
 **Reproducing the historical RED verdicts:** check out a pre-fix revision
 (any tree before the H4 fix landed), copy that revision's `Scheduler.cfg`,
@@ -209,6 +222,7 @@ marks the **mechanism site**; it moves to the fix site when the fix lands.
 | `ContractC` | `src/main/scala/bengal/stm/runtime/TxnRuntimeContext.scala` | the submit scan builds edges; the admission gate makes them binding — HOLDS |
 | `CompletionAtMostOnce` | `src/main/scala/bengal/stm/runtime/TxnRuntimeContext.scala` | completion sites (success, error handler, submit wrapper); one execute window per incarnation — HOLDS organically |
 | `NoDoublePublish` | `src/main/scala/bengal/stm/runtime/TxnRuntimeContext.scala` | `log.commit` publishes; at most one admitted fiber per incarnation — HOLDS |
+| `NoLostWakeup` | `src/main/scala/bengal/stm/runtime/TxnRuntimeContext.scala` | `submitTxnForRetry` re-checks reads + active conflictors inside the retry-semaphore region before parking (the H1 fix) — the retry config verifies deadlock-free |
 
 ### Footprint relation (anchors in `src/main/scala/bengal/stm/model/runtime/IdFootprint.scala`)
 
@@ -234,6 +248,7 @@ marks the **mechanism site**; it moves to the fix site when the fix lands.
 | `exec[t, slot]` | in-flight `execute` fibers (two slots — double-spawn must be representable) |
 | `unsubW[t, slot]` | in-flight `triggerUnsub` cascades (two slots — the error path spawns a second) |
 | `active` | `TxnScheduler.activeTransactions` keys |
+| `parked`, `retrySem`, `sweep[t, slot]`, `parkChk[t, slot]` | `retryMap` membership (keyed by `TxnId`; compat computed from `declared`), the `retrySemaphore` holder, in-flight `checkRetryQueue` fibers (three slots per transaction — one per possible submission at `MaxInc=2`; `droppedSweep` ghosts any drop), and the park region's per-fiber check results |
 | `graphSem` | `graphBuilderSemaphore` holder (`retrySemaphore` arrives with Phase 2) |
 
 ## Atomicity Mapping & Reductions
@@ -254,6 +269,8 @@ interleave with in-region steps. Documented reductions:
 | R5 | Concurrent `submitTxnForImmediateRetry` runs of one txn → serialized (one submit workflow per txn) | post-H4-fix this is **provably vacuous** rather than merely accepted: two dirty fibers for one txn would need two admitted fibers in one incarnation, which the admission gate excludes (`NoDoubleExec` HOLDS) |
 | R6 | Cascade spawns with its edge set preloaded (gate + nonEmpty + values collapse) | the `cascadeFired` gate serializes cascades per incarnation and the owner left `activeTransactions` before the spawn, so the drained map is frozen — pre-fix these steps were kept separate precisely because double-spawned cascades could race a `clear()` |
 | — | Commit → one atomic truthful step (dirty iff a written var moved since **this fiber's** snapshot; snapshots are per-slot) | Spec B's contract with Spec A (plan §3); Spec A refines lock/validate/publish |
+| — | Sweeps are spawned on EVERY submission and read the retry map only at semaphore-acquire time — deliberately NOT optimised away when nothing is parked | a sweep spawned while a transaction is mid-park blocks on the retry semaphore, then finds that transaction parked and wakes it. That rescue path is load-bearing for the park-time checks; an earlier draft skipped empty-map sweeps and thereby deleted it (the reduction was unsound and is recorded here as a warning) |
+| — | The park region is split in CODE ORDER, never collapsed | the retry semaphore serializes it against sweeps but NOT against commits or completions, so a conflictor can move between the two checks; collapsing them hides the ordering defect that TLC finds as a deadlock |
 | — | Two exec slots + two cascade slots per txn, `droppedSpawn` ghost | the ghost turns any silent drop into a `NoDroppedSpawn` violation instead of an invisible truncation; post-fix no drop occurs at these bounds (pre-fix, drops began at depth ~72) |
 
 Failure injection (`AbortsEnabled`): a nondeterministic abort at any point

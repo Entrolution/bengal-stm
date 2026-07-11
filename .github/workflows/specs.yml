@@ -75,6 +75,13 @@ jobs:
             specs/scheduler/Scheduler.tla \
             NONE
 
+      - name: Check Scheduler retry/park/wake (expected clean since the H1 fix)
+        run: |
+          ./specs/check_expected.sh \
+            specs/scheduler/SchedulerRetry.cfg \
+            specs/scheduler/Scheduler.tla \
+            NONE
+
       - name: Check Scheduler robustness (pinned, dispatch only)
         if: github.event_name == 'workflow_dispatch'
         run: |
