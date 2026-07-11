@@ -30,13 +30,23 @@
  *       are preserved; the code's contains-check stays a SEPARATE step,
  *       which is where the H4 staleness lives.
  *   R3. Semaphore acquire/act/release collapses to one guarded step for
- *       regions containing exactly one operation (registerRunning,
- *       registerCompletion's remove).
+ *       single-operation regions (admitForExecution, registerCompletion's
+ *       remove).
  *   R4. Static analysis, AnalysedTxn construction, and Deferred creation
  *       collapse into Init.
- * The nonEmpty check and values snapshot of triggerUnsub are deliberately
- * NOT collapsed (two steps) — a clear() can land between them, and merging
- * would hide real traces (double-spawned cascades from the error path).
+ *   R6. A cascade spawns with its edge set preloaded: the cascadeFired
+ *       gate serializes cascades per incarnation and the drained map is
+ *       frozen by spawn time, so the code's gate/nonEmpty/values steps
+ *       collapse soundly (pre-fix these were kept separate because
+ *       double-spawned cascades could race a clear()).
+ *
+ * THE H4 FIX IS MODELLED (matching the code): admitForExecution admits at
+ * most one fiber per incarnation into the commit window (status CAS +
+ * tally==0 under the graph semaphore — ExecAdmit); every resubmission is a
+ * freshIncarnation with new tally/unsubs/status/cascade refs (edges are
+ * incarnation-tagged, and drains/clears against re-incarnated targets
+ * no-op, modelling decrements of dead refs); triggerUnsub fires exactly
+ * once per incarnation (cascadeFired).
  *
  * Commit outcomes are truthful, not nondeterministic: dirty iff a written
  * var's version moved since this fiber's snapshot. A nondeterministic
@@ -93,17 +103,21 @@ TxnRank(t) == CASE t = "t1" -> 1 [] t = "t2" -> 2 [] t = "t3" -> 3
 
 VARIABLES
     \* --- per-txn protocol state (the AnalysedTxn refs; shared across
-    \*     incarnations exactly as the dirty path's this.copy shares them) ---
-    status,          \* executionStatus Ref — never demoted, as in the code;
-                     \* completion is visible only via completedCount
-    tally,           \* dependencyTally Ref (Int — negativity is detectable)
-    unsubs,          \* unsubSpecs TrieMap: t |-> set of downstream txn ids
-    hasDown,         \* hasDownstream Ref
-    completedCount,  \* completionSignal completions observed (Deferred)
+    \*     the H4 fix gives every incarnation FRESH tally/unsubs/status/
+    \*     cascade refs — old cascades drain dead refs, modelled by
+    \*     incarnation-tagged edges whose drains no-op on a mismatch) ---
+    status,          \* executionStatus Ref — fresh per incarnation
+    tally,           \* dependencyTally Ref (fresh per incarnation)
+    unsubs,          \* unsubSpecs TrieMap: t |-> set of <<downstreamId, itsIncAtSubscribe>>
+                     \* edges (fresh map per incarnation)
+    hasDown,         \* hasDownstream Ref (fresh per incarnation)
+    completedCount,  \* completionSignal completions observed (Deferred — SHARED
+                     \* across incarnations; it must complete the original caller)
     inc,             \* incarnation counter (0 = first submission)
     declared,        \* current incarnation's declared (validated) footprint
     publishedInc,    \* ghost: this incarnation already published
     doublePub,       \* ghost: a publish happened twice in one incarnation
+    cascadeFired,    \* triggerUnsub's exactly-once gate (fresh per incarnation)
     droppedSpawn,    \* ghost: a spawn found no free slot (masking detector —
                      \* if TRUE the two-slot bound truncated a real behaviour)
     snap,            \* PER-FIBER version snapshot taken at execute start
@@ -128,7 +142,7 @@ VARIABLES
     version          \* var id -> commit counter (values abstracted away)
 
 txnVars    == <<status, tally, unsubs, hasDown, completedCount, inc, declared,
-                publishedInc, doublePub, droppedSpawn, snap>>
+                publishedInc, doublePub, cascadeFired, droppedSpawn, snap>>
 submitVars == <<submitPc, submitMode, scanPending, curTarget, curDir, curContained>>
 schedVars  == <<active, graphSem, version>>
 vars       == <<txnVars, submitVars, exec, unsubW, schedVars>>
@@ -136,42 +150,52 @@ vars       == <<txnVars, submitVars, exec, unsubW, schedVars>>
 ExecSlots  == Txns \X {"A", "B"}
 UnsubSlots == Txns \X {"u1", "u2"}
 
-NoExec  == [pc |-> "none", out |-> "none"]
-NoUnsub == [ph |-> "none", pend |-> {}]
+NoExec  == [pc |-> "none", out |-> "none", fInc |-> 0]
+NoUnsub == [ph |-> "none", pend |-> {}, ownerInc |-> 0]
 
-(* Exec pcs that constitute the execute/commit window *)
-ExecWindowPcs == {"regRun", "snap", "commit", "regComp", "spawnU"}
+(* Exec pcs that constitute the execute/commit window. "regRun" (parked at
+   the admission gate) is deliberately NOT in the window: multiple fibers
+   parked at admission are legal and harmless — at most one wins. *)
+ExecWindowPcs == {"snap", "commit", "regComp", "spawnU"}
 
 ---------------------------------------------------------------------------
 (* Helpers *)
 ---------------------------------------------------------------------------
 
 (* execute(scheduler).start — from checkExecutionReadiness or
-   unsubscribeUpstreamDependency's zero-test. If both slots are busy a
-   third spawn is dropped — and that IS reachable before any NoDoubleExec
-   violation (a slot lingering at "resubWait" is outside the window), so
-   every spawn site records the drop in the droppedSpawn ghost and the
-   NoDroppedSpawn invariant surfaces the truncation instead of letting it
-   silently mask deeper behaviours. *)
+   unsubscribeUpstreamDependency's zero-test. Spawned fibers carry the
+   incarnation they were spawned for (fInc): in the code a fiber closes
+   over one AnalysedTxn incarnation and gates against ITS status ref, so a
+   stale fiber can never admit against a newer incarnation. If both slots
+   are busy a third spawn is dropped; every spawn site records the drop in
+   the droppedSpawn ghost so the NoDroppedSpawn invariant surfaces the
+   truncation instead of letting it silently mask deeper behaviours. *)
 ExecSlotsFull(ex, t) ==
     ex[<<t, "A">>].pc /= "none" /\ ex[<<t, "B">>].pc /= "none"
+
+SpawnExec(ex, t, i) ==
+    IF ex[<<t, "A">>].pc = "none"
+        THEN [ex EXCEPT ![<<t, "A">>] = [pc |-> "regRun", out |-> "none", fInc |-> i]]
+    ELSE IF ex[<<t, "B">>].pc = "none"
+        THEN [ex EXCEPT ![<<t, "B">>] = [pc |-> "regRun", out |-> "none", fInc |-> i]]
+    ELSE ex
 
 UnsubSlotsFull(uw, t) ==
     uw[<<t, "u1">>].ph /= "none" /\ uw[<<t, "u2">>].ph /= "none"
 
-SpawnExec(ex, t) ==
-    IF ex[<<t, "A">>].pc = "none"
-        THEN [ex EXCEPT ![<<t, "A">>] = [pc |-> "regRun", out |-> "none"]]
-    ELSE IF ex[<<t, "B">>].pc = "none"
-        THEN [ex EXCEPT ![<<t, "B">>] = [pc |-> "regRun", out |-> "none"]]
-    ELSE ex
-
-(* analysedTxn.triggerUnsub.start (fire-and-forget) *)
-SpawnUnsub(uw, t) ==
-    IF uw[<<t, "u1">>].ph = "none"
-        THEN [uw EXCEPT ![<<t, "u1">>] = [ph |-> "check", pend |-> {}]]
+(* triggerUnsub.start, post-fix: the getAndSet(cascadeFired) gate admits
+   exactly one cascade per incarnation, and the drained map is FROZEN by
+   then (the owner left activeTransactions before the spawn, so no new
+   edges can arrive). Reduction R6: gate + nonEmpty check + values
+   snapshot collapse into spawn-with-preloaded-edges — sound because the
+   map is frozen and the gate serializes cascades. *)
+SpawnUnsub(uw, t, edges, ownInc) ==
+    IF edges = {}
+        THEN uw
+    ELSE IF uw[<<t, "u1">>].ph = "none"
+        THEN [uw EXCEPT ![<<t, "u1">>] = [ph |-> "drain", pend |-> edges, ownerInc |-> ownInc]]
     ELSE IF uw[<<t, "u2">>].ph = "none"
-        THEN [uw EXCEPT ![<<t, "u2">>] = [ph |-> "check", pend |-> {}]]
+        THEN [uw EXCEPT ![<<t, "u2">>] = [ph |-> "drain", pend |-> edges, ownerInc |-> ownInc]]
     ELSE uw
 
 (* Fixed scan order (reduction R1) *)
@@ -186,6 +210,7 @@ Init ==
     /\ status         = [t \in Txns |-> "NotScheduled"]
     /\ tally          = [t \in Txns |-> 0]
     /\ unsubs         = [t \in Txns |-> {}]
+    /\ cascadeFired   = [t \in Txns |-> FALSE]
     /\ hasDown        = [t \in Txns |-> FALSE]
     /\ completedCount = [t \in Txns |-> 0]
     /\ inc            = [t \in Txns |-> 0]
@@ -223,7 +248,7 @@ SubmitReset1(t) ==
     /\ tally'    = [tally EXCEPT ![t] = 0]
     /\ submitPc' = [submitPc EXCEPT ![t] = "reset2"]
     /\ UNCHANGED <<status, unsubs, hasDown, completedCount, inc, declared,
-                   publishedInc, doublePub, droppedSpawn, snap, submitMode,
+                   publishedInc, doublePub, cascadeFired, droppedSpawn, snap, submitMode,
                    scanPending, curTarget, curDir, curContained, exec,
                    unsubW, schedVars>>
 
@@ -232,7 +257,7 @@ SubmitReset2(t) ==
     /\ hasDown'  = [hasDown EXCEPT ![t] = FALSE]
     /\ submitPc' = [submitPc EXCEPT ![t] = "acq"]
     /\ UNCHANGED <<status, tally, unsubs, completedCount, inc, declared,
-                   publishedInc, doublePub, droppedSpawn, snap, submitMode,
+                   publishedInc, doublePub, cascadeFired, droppedSpawn, snap, submitMode,
                    scanPending, curTarget, curDir, curContained, exec,
                    unsubW, schedVars>>
 
@@ -254,7 +279,7 @@ SubmitSetScheduled(t) ==
     /\ status'   = [status EXCEPT ![t] = "Scheduled"]
     /\ submitPc' = [submitPc EXCEPT ![t] = "insAct"]
     /\ UNCHANGED <<tally, unsubs, hasDown, completedCount, inc, declared,
-                   publishedInc, doublePub, droppedSpawn, snap, submitMode,
+                   publishedInc, doublePub, cascadeFired, droppedSpawn, snap, submitMode,
                    scanPending, curTarget, curDir, curContained, exec,
                    unsubW, schedVars>>
 
@@ -282,8 +307,8 @@ SubmitScanPick(t) ==
    plain (submitTxn): incompatible -> target.subscribeDownstreamDependency(me).
    imm (submitTxnForImmediateRetry): status Running -> as plain; status Scheduled ->
    me.subscribeDownstreamDependency(target) — the REVERSED edge; the status
-   read is stable while the semaphore is held (registerRunning also takes
-   it), so reading and branching in one step is sound. *)
+   read is stable while the semaphore is held (admitForExecution also
+   takes it), so reading and branching in one step is sound. *)
 SubmitScanCheck(t) ==
     /\ submitPc[t] = "scanCheck"
     /\ LET a      == curTarget[t]
@@ -313,18 +338,23 @@ SubmitSubCheck(t) ==
     /\ submitPc[t] = "subCheck"
     /\ LET a == curTarget[t]
        IN curContained' = [curContained EXCEPT ![t] =
-                              IF curDir[t] = "down" THEN t \in unsubs[a]
-                                                    ELSE a \in unsubs[t]]
+                              IF curDir[t] = "down"
+                              THEN \E i \in 0..MaxInc : <<t, i>> \in unsubs[a]
+                              ELSE \E i \in 0..MaxInc : <<a, i>> \in unsubs[t]]
     /\ submitPc' = [submitPc EXCEPT ![t] = "subApply"]
     /\ UNCHANGED <<status, tally, unsubs, hasDown, completedCount, inc,
-                   declared, publishedInc, doublePub, droppedSpawn, snap,
-                   submitMode, scanPending, curTarget, curDir, exec, unsubW,
-                   schedVars>>
+                   declared, publishedInc, doublePub, cascadeFired,
+                   droppedSpawn, snap, submitMode, scanPending, curTarget,
+                   curDir, exec, unsubW, schedVars>>
 
 (* The subscribe triple, reduction R2: upstream-tally increment
    (subscribeUpstreamDependency) + unsubSpecs insert + hasDownstream set.
-   Skipped entirely if the contains-check said the edge already exists —
-   even when that check was stale (H4). *)
+   Edges are recorded with the downstream's CURRENT incarnation, modelling
+   the closure over that incarnation's dependencyTally ref: a drain
+   delivered after the downstream re-incarnated decrements a dead ref,
+   i.e. no-ops (see UnsubDrain). Skipped when the contains-check found the
+   edge — with fresh unsubSpecs per incarnation the check can no longer be
+   stale across incarnations. *)
 SubmitSubApply(t) ==
     /\ submitPc[t] = "subApply"
     /\ LET a == curTarget[t]
@@ -332,25 +362,26 @@ SubmitSubApply(t) ==
           THEN UNCHANGED <<tally, unsubs, hasDown>>
           ELSE IF curDir[t] = "down"
                THEN /\ tally'   = [tally EXCEPT ![t] = @ + 1]
-                    /\ unsubs'  = [unsubs EXCEPT ![a] = @ \cup {t}]
+                    /\ unsubs'  = [unsubs EXCEPT ![a] = @ \cup {<<t, inc[t]>>}]
                     /\ hasDown' = [hasDown EXCEPT ![a] = TRUE]
                ELSE /\ tally'   = [tally EXCEPT ![curTarget[t]] = @ + 1]
-                    /\ unsubs'  = [unsubs EXCEPT ![t] = @ \cup {a}]
+                    /\ unsubs'  = [unsubs EXCEPT ![t] = @ \cup {<<a, inc[a]>>}]
                     /\ hasDown' = [hasDown EXCEPT ![t] = TRUE]
     /\ submitPc' = [submitPc EXCEPT ![t] = "scanPick"]
     /\ UNCHANGED <<status, completedCount, inc, declared, publishedInc,
-                   doublePub, droppedSpawn, snap, submitMode, scanPending,
-                   curTarget, curDir, curContained, exec, unsubW, schedVars>>
+                   doublePub, cascadeFired, droppedSpawn, snap, submitMode,
+                   scanPending, curTarget, curDir, curContained, exec,
+                   unsubW, schedVars>>
 
 (* checkExecutionReadiness: tally read + spawn,
    still inside the region *)
 SubmitReadiness(t) ==
     /\ submitPc[t] = "ready"
-    /\ exec' = IF tally[t] = 0 THEN SpawnExec(exec, t) ELSE exec
+    /\ exec' = IF tally[t] = 0 THEN SpawnExec(exec, t, inc[t]) ELSE exec
     /\ droppedSpawn' = (droppedSpawn \/ (tally[t] = 0 /\ ExecSlotsFull(exec, t)))
     /\ submitPc' = [submitPc EXCEPT ![t] = "rel"]
     /\ UNCHANGED <<status, tally, unsubs, hasDown, completedCount, inc,
-                   declared, publishedInc, doublePub, snap, submitMode,
+                   declared, publishedInc, doublePub, cascadeFired, snap, submitMode,
                    scanPending, curTarget, curDir, curContained, unsubW,
                    schedVars>>
 
@@ -379,7 +410,7 @@ SubmitAbort(t) ==
     /\ submitPc' = [submitPc EXCEPT ![t] = "idle"]
     /\ completedCount' = [completedCount EXCEPT ![t] = @ + 1]
     /\ UNCHANGED <<status, tally, unsubs, hasDown, inc, declared,
-                   publishedInc, doublePub, droppedSpawn, snap, submitMode,
+                   publishedInc, doublePub, cascadeFired, droppedSpawn, snap, submitMode,
                    scanPending, curTarget, curDir, curContained, exec,
                    unsubW, active, version>>
 
@@ -388,17 +419,22 @@ SubmitAbort(t) ==
    abstraction (plan §3). *)
 ---------------------------------------------------------------------------
 
-(* registerRunning: semaphore-guarded single set,
-   reduction R3. NOTE the code re-checks nothing here — no tally guard, no
-   status guard. *)
-ExecRegRunning(t, s) ==
+(* admitForExecution: semaphore-guarded admission gate (reduction R3 —
+   single region). A fiber proceeds only if it was spawned for the CURRENT
+   incarnation (fInc — in the code a stale fiber CASes its own dead status
+   ref), the incarnation is still Scheduled, and its dependency tally is
+   zero. Losers retire their slot without side effects. *)
+ExecAdmit(t, s) ==
     /\ exec[<<t, s>>].pc = "regRun"
     /\ graphSem = "none"
-    /\ status' = [status EXCEPT ![t] = "Running"]
-    /\ exec'   = [exec EXCEPT ![<<t, s>>].pc = "snap"]
+    /\ IF exec[<<t, s>>].fInc = inc[t] /\ status[t] = "Scheduled" /\ tally[t] = 0
+       THEN /\ status' = [status EXCEPT ![t] = "Running"]
+            /\ exec'   = [exec EXCEPT ![<<t, s>>].pc = "snap"]
+       ELSE /\ exec'   = [exec EXCEPT ![<<t, s>>] = NoExec]
+            /\ UNCHANGED status
     /\ UNCHANGED <<tally, unsubs, hasDown, completedCount, inc, declared,
-                   publishedInc, doublePub, droppedSpawn, snap, submitVars,
-                   unsubW, schedVars>>
+                   publishedInc, doublePub, cascadeFired, droppedSpawn,
+                   snap, submitVars, unsubW, schedVars>>
 
 (* Log construction abstracted to one snapshot of the footprint's versions,
    PER FIBER — each execute run builds a private log in the code, so
@@ -410,8 +446,8 @@ ExecSnapshot(t, s) ==
     /\ snap' = [snap EXCEPT ![<<t, s>>] = [v \in VarIds |-> version[v]]]
     /\ exec' = [exec EXCEPT ![<<t, s>>].pc = "commit"]
     /\ UNCHANGED <<status, tally, unsubs, hasDown, completedCount, inc,
-                   declared, publishedInc, doublePub, droppedSpawn,
-                   submitVars, unsubW, schedVars>>
+                   declared, publishedInc, doublePub, cascadeFired,
+                   droppedSpawn, submitVars, unsubW, schedVars>>
 
 (* The atomic commit: dirty iff a written var moved since the snapshot
    (models the commit pipeline withLock{isDirty}/commit, at
@@ -421,7 +457,7 @@ ExecCommit(t, s) ==
     /\ LET dirtyNow == \E v \in Writes(t) : version[v] /= snap[<<t, s>>][v]
        IN IF dirtyNow
           THEN /\ exec' = [exec EXCEPT ![<<t, s>>] =
-                              [pc |-> "regComp", out |-> "dirty"]]
+                              [pc |-> "regComp", out |-> "dirty", fInc |-> exec[<<t, s>>].fInc]]
                /\ UNCHANGED <<version, publishedInc, doublePub>>
           ELSE /\ version' = [v \in VarIds |->
                                 IF v \in Writes(t) THEN version[v] + 1
@@ -429,9 +465,9 @@ ExecCommit(t, s) ==
                /\ doublePub' = [doublePub EXCEPT ![t] = @ \/ publishedInc[t]]
                /\ publishedInc' = [publishedInc EXCEPT ![t] = TRUE]
                /\ exec' = [exec EXCEPT ![<<t, s>>] =
-                              [pc |-> "regComp", out |-> "success"]]
+                              [pc |-> "regComp", out |-> "success", fInc |-> exec[<<t, s>>].fInc]]
     /\ UNCHANGED <<status, tally, unsubs, hasDown, completedCount, inc,
-                   declared, droppedSpawn, snap, submitVars, unsubW, active,
+                   declared, cascadeFired, droppedSpawn, snap, submitVars, unsubW, active,
                    graphSem>>
 
 (* Commit throws before publishing — poll(commit) raises, execute's
@@ -441,7 +477,7 @@ ExecCommit(t, s) ==
 ExecCommitFail(t, s) ==
     /\ AbortsEnabled
     /\ exec[<<t, s>>].pc = "commit"
-    /\ exec' = [exec EXCEPT ![<<t, s>>] = [pc |-> "eRegComp", out |-> "fail"]]
+    /\ exec' = [exec EXCEPT ![<<t, s>>] = [pc |-> "eRegComp", out |-> "fail", fInc |-> exec[<<t, s>>].fInc]]
     /\ UNCHANGED <<txnVars, submitVars, unsubW, schedVars>>
 
 (* registerCompletion: semaphore-guarded remove (R3)... *)
@@ -452,12 +488,18 @@ ExecRegComplete(t, s) ==
     /\ exec'   = [exec EXCEPT ![<<t, s>>].pc = "spawnU"]
     /\ UNCHANGED <<txnVars, submitVars, unsubW, graphSem, version>>
 
-(* ...followed by triggerUnsub.start (fire-and-forget) — fire-and-forget: the
-   cascade races everything that follows, including the dirty resubmission. *)
+(* ...followed by triggerUnsub.start (fire-and-forget): the cascade races
+   everything that follows, including the dirty resubmission — but the
+   cascadeFired gate admits at most one cascade per incarnation, and the
+   fInc check models the fiber holding the OLD incarnation's gate after a
+   resubmission bumped inc (the old gate is already TRUE in the code). *)
 ExecSpawnUnsub(t, s) ==
     /\ exec[<<t, s>>].pc = "spawnU"
-    /\ unsubW' = SpawnUnsub(unsubW, t)
-    /\ droppedSpawn' = (droppedSpawn \/ UnsubSlotsFull(unsubW, t))
+    /\ IF exec[<<t, s>>].fInc = inc[t] /\ ~cascadeFired[t]
+       THEN /\ unsubW' = SpawnUnsub(unsubW, t, unsubs[t], inc[t])
+            /\ cascadeFired' = [cascadeFired EXCEPT ![t] = TRUE]
+            /\ droppedSpawn' = (droppedSpawn \/ (unsubs[t] /= {} /\ UnsubSlotsFull(unsubW, t)))
+       ELSE UNCHANGED <<unsubW, cascadeFired, droppedSpawn>>
     /\ exec' = [exec EXCEPT ![<<t, s>>].pc =
                    IF exec[<<t, s>>].out = "success" THEN "complete"
                                                      ELSE "resubInit"]
@@ -474,7 +516,7 @@ ExecComplete(t, s) ==
     /\ completedCount' = [completedCount EXCEPT ![t] = @ + 1]
     /\ exec'   = [exec EXCEPT ![<<t, s>>] = NoExec]
     /\ UNCHANGED <<status, tally, unsubs, hasDown, inc, declared,
-                   publishedInc, doublePub, droppedSpawn, snap, submitVars,
+                   publishedInc, doublePub, cascadeFired, droppedSpawn, snap, submitVars,
                    unsubW, schedVars>>
 
 (* TxnResultLogDirty dispatch: refine the declared footprint to the actual
@@ -482,13 +524,15 @@ ExecComplete(t, s) ==
    submitTxnForImmediateRetry — INSIDE this fiber. this.copy shares
    unsubs/tally/hasDown/completionSignal; only the footprint is replaced.
 
-   REDUCTION R5 (unjustified serialization — accepted for Phase 1, rework
-   with Phase 2): the code runs each dirty fiber's resubmission inline, so
-   two dirty fibers of one txn can run two CONCURRENT imm submissions with
-   racing resets and scans. This model has one submit workflow per txn
-   (guard: submitPc = "idle"), which serializes them. The region only
-   exists after a NoDoubleExec violation; traces from enumeration runs in
-   that region must be re-validated against the code individually. *)
+   REDUCTION R5 (provably vacuous since the H4 fix): the model has one
+   submit workflow per txn (guard: submitPc = "idle"), serializing
+   concurrent imm submissions the code could in principle run inline from
+   two dirty fibers. Post-fix no such concurrency exists: two dirty fibers
+   of ONE incarnation would need two admitted fibers (excluded by the
+   admission gate / NoDoubleExec), and a fiber of incarnation k cannot
+   still be mid-resubmission when k+1 resubmits, because k+1's fiber is
+   spawned inside k's resubmission region and cannot admit until that
+   region releases. *)
 ExecResubInit(t, s) ==
     /\ exec[<<t, s>>].pc = "resubInit"
     /\ inc[t] < MaxInc
@@ -496,21 +540,31 @@ ExecResubInit(t, s) ==
     /\ declared'     = [declared EXCEPT ![t] = Validated(ActualFP(t))]
     /\ inc'          = [inc EXCEPT ![t] = @ + 1]
     /\ publishedInc' = [publishedInc EXCEPT ![t] = FALSE]
+    \* freshIncarnation: brand-new tally / unsub-edge map / status /
+    \* cascade-gate refs. Old cascades still drain the OLD map — their
+    \* frozen pend copies live in unsubW — and their decrements no-op
+    \* against re-incarnated targets (UnsubDrain's inc match). Scanners in
+    \* the pre-Scheduled window see NotScheduled and skip, matching the
+    \* fresh status ref.
+    /\ tally'        = [tally EXCEPT ![t] = 0]
+    /\ unsubs'       = [unsubs EXCEPT ![t] = {}]
+    /\ status'       = [status EXCEPT ![t] = "NotScheduled"]
+    /\ cascadeFired' = [cascadeFired EXCEPT ![t] = FALSE]
+    /\ hasDown'      = [hasDown EXCEPT ![t] = FALSE]
     /\ submitPc'     = [submitPc EXCEPT ![t] = "reset1"]
     /\ submitMode'   = [submitMode EXCEPT ![t] = "imm"]
-    \* status stays "Running": the copy shares the executionStatus Ref and
-    \* nothing writes it until the resubmission's set(Scheduled) —
-    \* scanners in this window see Running and take the Running branch.
     /\ exec'         = [exec EXCEPT ![<<t, s>>].pc = "resubWait"]
-    /\ UNCHANGED <<status, tally, unsubs, hasDown, completedCount, doublePub,
-                   droppedSpawn, snap, scanPending, curTarget, curDir,
-                   curContained, unsubW, schedVars>>
+    /\ UNCHANGED <<completedCount, doublePub, droppedSpawn, snap,
+                   scanPending, curTarget, curDir, curContained, unsubW,
+                   schedVars>>
 
 (* A dirty fiber at the incarnation bound retires its slot: the code would
    resubmit unboundedly; the model truncates the behaviour here and frees
    the slot (leaving it pinned would compound the two-slot masking that
-   droppedSpawn guards against). Safety-only truncation, documented in the
-   README sweeps section. *)
+   droppedSpawn guards against). Safety-only truncation — and with deadlock
+   detection enabled, a truncation that ever mattered would strand its
+   transaction and surface as a deadlock; the clean run therefore also
+   proves MaxInc never binds in this scenario (README sweeps section). *)
 ExecResubTruncate(t, s) ==
     /\ exec[<<t, s>>].pc = "resubInit"
     /\ inc[t] >= MaxInc
@@ -535,7 +589,7 @@ ExecResubAbort(t, s) ==
     /\ submitPc[t] /= "idle"
     /\ graphSem' = IF graphSem = t THEN "none" ELSE graphSem
     /\ submitPc' = [submitPc EXCEPT ![t] = "idle"]
-    /\ exec'     = [exec EXCEPT ![<<t, s>>] = [pc |-> "eRegComp", out |-> "fail"]]
+    /\ exec'     = [exec EXCEPT ![<<t, s>>] = [pc |-> "eRegComp", out |-> "fail", fInc |-> exec[<<t, s>>].fInc]]
     /\ UNCHANGED <<txnVars, submitMode, scanPending, curTarget, curDir,
                    curContained, unsubW, active, version>>
 
@@ -550,8 +604,11 @@ ExecErrRegComplete(t, s) ==
 
 ExecErrSpawnUnsub(t, s) ==
     /\ exec[<<t, s>>].pc = "eSpawnU"
-    /\ unsubW' = SpawnUnsub(unsubW, t)
-    /\ droppedSpawn' = (droppedSpawn \/ UnsubSlotsFull(unsubW, t))
+    /\ IF exec[<<t, s>>].fInc = inc[t] /\ ~cascadeFired[t]
+       THEN /\ unsubW' = SpawnUnsub(unsubW, t, unsubs[t], inc[t])
+            /\ cascadeFired' = [cascadeFired EXCEPT ![t] = TRUE]
+            /\ droppedSpawn' = (droppedSpawn \/ (unsubs[t] /= {} /\ UnsubSlotsFull(unsubW, t)))
+       ELSE UNCHANGED <<unsubW, cascadeFired, droppedSpawn>>
     /\ exec' = [exec EXCEPT ![<<t, s>>].pc = "eComplete"]
     /\ UNCHANGED <<status, tally, unsubs, hasDown, completedCount, inc,
                    declared, publishedInc, doublePub, snap, submitVars,
@@ -562,52 +619,60 @@ ExecErrComplete(t, s) ==
     /\ completedCount' = [completedCount EXCEPT ![t] = @ + 1]
     /\ exec'   = [exec EXCEPT ![<<t, s>>] = NoExec]
     /\ UNCHANGED <<status, tally, unsubs, hasDown, inc, declared,
-                   publishedInc, doublePub, droppedSpawn, snap, submitVars,
+                   publishedInc, doublePub, cascadeFired, droppedSpawn, snap, submitVars,
                    unsubW, schedVars>>
 
 ---------------------------------------------------------------------------
-(* triggerUnsub cascades — detached fibers, NO semaphore.
-   The nonEmpty check and the values snapshot are separate steps on
-   purpose: a concurrent clear() (from a double-spawned sibling) can land
-   between them. Each drained edge is unsubscribeUpstreamDependency: one
-   atomic getAndUpdate(-1) whose old==1 spawns the downstream's execute. *)
+(* triggerUnsub cascades — detached fibers, NO semaphore. Post-fix, a
+   cascade is spawned with its edge set preloaded (reduction R6: the gate
+   serializes cascades and the owner left activeTransactions before the
+   spawn, so the drained map is frozen — see SpawnUnsub). *)
 ---------------------------------------------------------------------------
 
-UnsubCheck(o, u) ==
-    /\ unsubW[<<o, u>>].ph = "check"
-    /\ IF unsubs[o] = {}
-       THEN unsubW' = [unsubW EXCEPT ![<<o, u>>] = NoUnsub]
-       ELSE unsubW' = [unsubW EXCEPT ![<<o, u>>].ph = "snapVals"]
-    /\ UNCHANGED <<txnVars, submitVars, exec, schedVars>>
-
-UnsubSnapVals(o, u) ==
-    /\ unsubW[<<o, u>>].ph = "snapVals"
-    /\ unsubW' = [unsubW EXCEPT ![<<o, u>>] = [ph |-> "drain", pend |-> unsubs[o]]]
-    /\ UNCHANGED <<txnVars, submitVars, exec, schedVars>>
-
+(* Each drained edge is unsubscribeUpstreamDependency on the closure's
+   incarnation: if the downstream re-incarnated since subscribing, the
+   decrement lands on a dead ref — a no-op here (the inc match). Live
+   drains whose old value was 1 spawn the downstream's execute, tagged
+   with the downstream's current incarnation. *)
 UnsubDrain(o, u) ==
     /\ unsubW[<<o, u>>].ph = "drain"
     /\ unsubW[<<o, u>>].pend /= {}
-    /\ \E d \in unsubW[<<o, u>>].pend :
-        /\ tally' = [tally EXCEPT ![d] = @ - 1]
-        /\ exec'  = IF tally[d] = 1 THEN SpawnExec(exec, d) ELSE exec
-        /\ droppedSpawn' = (droppedSpawn \/ (tally[d] = 1 /\ ExecSlotsFull(exec, d)))
-        /\ unsubW' = [unsubW EXCEPT ![<<o, u>>].pend = @ \ {d}]
+    /\ \E e \in unsubW[<<o, u>>].pend :
+        IF inc[e[1]] = e[2]
+        THEN /\ tally' = [tally EXCEPT ![e[1]] = @ - 1]
+             /\ exec'  = IF tally[e[1]] = 1 THEN SpawnExec(exec, e[1], inc[e[1]]) ELSE exec
+             /\ droppedSpawn' = (droppedSpawn \/ (tally[e[1]] = 1 /\ ExecSlotsFull(exec, e[1])))
+             /\ unsubW' = [unsubW EXCEPT ![<<o, u>>].pend = @ \ {e}]
+        ELSE /\ unsubW' = [unsubW EXCEPT ![<<o, u>>].pend = @ \ {e}]
+             /\ UNCHANGED <<tally, exec, droppedSpawn>>
     /\ UNCHANGED <<status, unsubs, hasDown, completedCount, inc, declared,
-                   publishedInc, doublePub, snap, submitVars, schedVars>>
+                   publishedInc, doublePub, cascadeFired, snap, submitVars,
+                   schedVars>>
 
+(* unsubSpecs.clear() — a no-op if the owner re-incarnated (the cascade
+   holds the old, dead map; the new incarnation's map is already fresh). *)
 UnsubClear(o, u) ==
     /\ unsubW[<<o, u>>].ph = "drain"
     /\ unsubW[<<o, u>>].pend = {}
-    /\ unsubs' = [unsubs EXCEPT ![o] = {}]
+    /\ unsubs' = IF inc[o] = unsubW[<<o, u>>].ownerInc
+                 THEN [unsubs EXCEPT ![o] = {}]
+                 ELSE unsubs
     /\ unsubW' = [unsubW EXCEPT ![<<o, u>>] = NoUnsub]
     /\ UNCHANGED <<status, tally, hasDown, completedCount, inc, declared,
-                   publishedInc, doublePub, droppedSpawn, snap, submitVars,
-                   exec, schedVars>>
+                   publishedInc, doublePub, cascadeFired, droppedSpawn,
+                   snap, submitVars, exec, schedVars>>
 
 ---------------------------------------------------------------------------
 (* Next *)
 ---------------------------------------------------------------------------
+
+(* Legitimate terminal states stutter: every submitted transaction's
+   completion signal has fired. Anything else with no enabled action is a
+   REAL protocol deadlock, and TLC's deadlock detection (now enabled for
+   organic runs — no -deadlock flag) reports it. *)
+Terminating ==
+    /\ \A t \in Txns : completedCount[t] >= 1
+    /\ UNCHANGED vars
 
 Next ==
     \/ \E t \in Txns :
@@ -617,7 +682,7 @@ Next ==
         \/ SubmitSubCheck(t)   \/ SubmitSubApply(t)
         \/ SubmitReadiness(t)  \/ SubmitRelease(t)  \/ SubmitAbort(t)
     \/ \E t \in Txns, s \in {"A", "B"} :
-        \/ ExecRegRunning(t, s) \/ ExecSnapshot(t, s) \/ ExecCommit(t, s)
+        \/ ExecAdmit(t, s)      \/ ExecSnapshot(t, s) \/ ExecCommit(t, s)
         \/ ExecCommitFail(t, s) \/ ExecRegComplete(t, s)
         \/ ExecSpawnUnsub(t, s) \/ ExecComplete(t, s)
         \/ ExecResubInit(t, s)  \/ ExecResubTruncate(t, s)
@@ -625,8 +690,8 @@ Next ==
         \/ ExecErrRegComplete(t, s) \/ ExecErrSpawnUnsub(t, s)
         \/ ExecErrComplete(t, s)
     \/ \E o \in Txns, u \in {"u1", "u2"} :
-        \/ UnsubCheck(o, u) \/ UnsubSnapVals(o, u)
         \/ UnsubDrain(o, u) \/ UnsubClear(o, u)
+    \/ Terminating
 
 Spec == Init /\ [][Next]_vars
 
@@ -655,8 +720,8 @@ TallyNonNegative == \A t \in Txns : tally[t] >= 0
 (* Contract C — the interface property Spec A assumes (plan §3): no two
    transactions in their execute/commit window with incompatible DECLARED
    footprints (current incarnations). The code's window is
-   [registerRunning fired, registerCompletion fired] — status stays
-   "Running" forever in the code (nothing demotes it), so the window is
+   [admitForExecution succeeded, registerCompletion fired] — completion
+   never demotes status, so the window is
    encoded from exec-fiber position, not status: past regRun (snapshot
    pending or taken, commit pending) until the active-set removal fires. *)
 InExecWindow(t) ==
@@ -673,13 +738,15 @@ NoDoubleExec ==
     \A t \in Txns :
         ~(exec[<<t, "A">>].pc \in ExecWindowPcs /\ exec[<<t, "B">>].pc \in ExecWindowPcs)
 
-(* An execute fiber must never start for a transaction that already
-   completed — a completed txn re-executing means its log commits twice.
-   "Completed" is completedCount >= 1 (the code never demotes status, so
-   status carries no completion information). *)
+(* No execute fiber may be ADMITTED (inside the commit window) for a
+   transaction that already completed — a completed txn re-executing means
+   its log commits twice. Fibers merely PARKED at the admission gate
+   ("regRun") for a completed txn are expected and harmless: the gate
+   rejects them (terminal status loses the CAS). "Completed" is
+   completedCount >= 1. *)
 NoExecOnCompleted ==
     \A t \in Txns, s \in {"A", "B"} :
-        exec[<<t, s>>].pc = "regRun" => completedCount[t] = 0
+        exec[<<t, s>>].pc \in ExecWindowPcs => completedCount[t] = 0
 
 (* The two-slot fiber bound never silently truncated a behaviour: every
    attempted spawn found a free slot. Include this in enumeration runs —
@@ -693,4 +760,6 @@ CompletionAtMostOnce == \A t \in Txns : completedCount[t] <= 1
 (* A transaction's writes are published at most once per incarnation *)
 NoDoublePublish == \A t \in Txns : ~doublePub[t]
 
+
 ===============================================================================
+

@@ -20,6 +20,7 @@ package spec
 import scala.concurrent.duration._
 
 import cats.effect.IO
+import cats.effect.implicits._
 import cats.effect.unsafe.implicits.global
 import cats.syntax.all._
 import org.scalacheck.Gen
@@ -218,6 +219,121 @@ class SerializabilityOracleSpec extends AnyFreeSpec with ScalaCheckPropertyCheck
       val init            = ModelState(Vector.fill(NumVars)(0), Map.empty)
       val (finalState, _) = runWorkload(init, workload)
       finalState.vars(0) shouldBe nTxns * opsPerTxn
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // H5 regression: whole-map read + new-key insert must serialize
+  // -------------------------------------------------------------------
+
+  // -------------------------------------------------------------------
+  // Dirty-path exerciser: resubmissions preserve exactly-once effects.
+  // NOTE: this drives the machinery the H4 fix hardened (measured: ~120
+  // TxnResultLogDirty resubmissions per 300 reps) but does NOT reach the
+  // H4 defect interleaving itself — it passes against pre-fix code too.
+  // The executable H4 regression gate is the TLC expected-clean check
+  // (specs/scheduler/Scheduler.cfg in CI).
+  // -------------------------------------------------------------------
+
+  "dirty-path resubmissions preserve exactly-once effects" - {
+    /* Exercises the dirty/resubmission machinery (freshIncarnation +
+     * admitForExecution, the H4 fix) through the public API. A
+     * data-dependent map key makes the statically declared footprint
+     * diverge from the actual one: tSelect flips the selector var while
+     * tKey (which read the selector at static-analysis time) waits on it,
+     * so tKey's actual entry write can land on the same key tDirect
+     * declared — footprint-compatible per declarations, write-write in
+     * reality, which is exactly what produces TxnResultLogDirty and a
+     * resubmission. Pre-fix, the resubmission's shared bookkeeping could
+     * double-execute transactions (H4, confirmed in TLC); post-fix every
+     * effect must apply exactly once and the outcome must be serializable.
+     */
+    "under contention with data-dependent keys" in {
+      val reps = 300
+      (1 to reps).foreach { rep =>
+        val (finalS, counters, finalMap) =
+          STM
+            .runtime[IO]
+            .flatMap { implicit stm =>
+              for {
+                sel      <- TxnVar.of[IO, Int](0)
+                counters <- List.fill(3)(0).traverse(TxnVar.of[IO, Int])
+                map      <- TxnVarMap.of[IO, String, Int](Map.empty[String, Int])
+                tSelect = for {
+                            _ <- sel.modify(_ + 1)
+                            _ <- counters(0).modify(_ + 1)
+                          } yield ()
+                tKey = for {
+                         s <- sel.get
+                         _ <- map.set("k" + (s % 2), 10)
+                         _ <- counters(1).modify(_ + 1)
+                       } yield ()
+                tDirect = for {
+                            _ <- map.set("k1", 20)
+                            _ <- counters(2).modify(_ + 1)
+                          } yield ()
+                _  <- List(tSelect.commit, tKey.commit, tDirect.commit).parSequence
+                s  <- sel.get.commit
+                cs <- counters.traverse(_.get.commit)
+                m  <- map.get.commit
+              } yield (s, cs, m)
+            }
+            .timeout(30.seconds)
+            .unsafeRunSync()
+
+        withClue(s"rep $rep: s=$finalS counters=$counters map=$finalMap") {
+          finalS shouldBe 1
+          counters shouldBe List(1, 1, 1)
+          // tKey wrote k0 (read sel before tSelect) or k1 (after); tDirect
+          // wrote k1. Every serializable outcome has k-values from that set
+          // and k1 present (tDirect always writes it; tKey may overwrite).
+          finalMap.keySet should contain("k1")
+          finalMap.keySet.subsetOf(Set("k0", "k1")) shouldBe true
+          finalMap.get("k0").foreach(_ shouldBe 10)
+          Set(10, 20) should contain(finalMap("k1"))
+        }
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // Park/wake smoke test: parked retries wake through fresh incarnations
+  // -------------------------------------------------------------------
+
+  "parked retries wake through fresh incarnations" - {
+    /* A reader parks on waitFor (predicate false, no downstream); a writer
+     * then submits, whose checkRetryQueue wake rebuilds the parked
+     * transaction as a freshIncarnation. That wake-time rebuild is
+     * load-bearing, not hygiene: cascadeFired is sticky on the parked
+     * object, so resubmitting it raw would make its next triggerUnsub a
+     * no-op and deadlock any downstream subscriber. This is the only
+     * executable coverage of the park→wake leg until the Phase 2 spec
+     * models it (H1); the 30s timeout turns a wake regression into a red
+     * test rather than a hang.
+     */
+    "reader parked on waitFor completes after the writer commits" in {
+      val reps = 50
+      (1 to reps).foreach { rep =>
+        val result =
+          STM
+            .runtime[IO]
+            .flatMap { implicit stm =>
+              for {
+                flag <- TxnVar.of[IO, Int](0)
+                reader = for {
+                           v <- flag.get
+                           _ <- STM[IO].waitFor(v > 0)
+                         } yield v
+                fib <- reader.commit.start
+                _   <- IO.sleep(20.millis)
+                _   <- flag.set(1).commit
+                v   <- fib.joinWithNever
+              } yield v
+            }
+            .timeout(30.seconds)
+            .unsafeRunSync()
+        withClue(s"rep $rep:")(result shouldBe 1)
+      }
     }
   }
 
