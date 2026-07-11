@@ -113,9 +113,10 @@ expected to reproduce a **pinned counterexample** (an EXPECTED-RED verdict):
 
 # --- Commit protocol (Spec A) ---
 
-# H2 — lock-order deadlock via the map-lock fallback. EXPECTED RED.
+# H2 — lock ordering across two maps, plus the lock-aliasing (`dbl`) case.
+# EXPECTED CLEAN since the H2 fix.
 ./specs/check_expected.sh specs/commit/CommitH2.cfg \
-    specs/commit/CommitProtocol.tla NoWaitsForCycle
+    specs/commit/CommitProtocol.tla NONE
 
 # H3 — write skew when the fallback under-declares. EXPECTED RED, three ways:
 #   CommitH3        the EMPTY-footprint extreme (case _ => IdFootprint.empty)
@@ -192,7 +193,8 @@ judgement below is **computed** by `common/Footprint.tla`, never hand-assigned.
 
 | Property | Verdict | Evidence |
 |----------|---------|----------|
-| **H2 — lock-order deadlock via the map-lock fallback** (`NoWaitsForCycle`) | **CONFIRMED (2026-07-11) — OPEN, pinned red.** Two transactions each inserting a **fresh key into two maps** have compatible footprints, so the scheduler deliberately runs them concurrently; each new-key entry falls back to its **map's** structural `commitLock`, so both hold `{M1.lock, M2.lock}`; and `withLock` sorts by the **log key**, which for an absent key is the existential hash of `(mapId, key)` — a value with no relation to the lock it resolves to. Hash-derived order therefore inverts the acquisition order and both fibers block forever on `Semaphore.permit`, callers hung on `completionSignal.get`. **Needs no fallback, no under-declaration, and no scheduler bug — it is reachable on fully ACCURATE footprints.** 17-state trace, exhaustive at depth 25 | `CommitH2.cfg` (CI, expected red) |
+| **H2 — lock-order deadlock via the map-lock fallback** (`NoWaitsForCycle`) | **CONFIRMED and FIXED (2026-07-11).** Two transactions each inserting a **fresh key into two maps** have compatible footprints, so the scheduler deliberately runs them concurrently; each new-key entry falls back to its **map's** structural `commitLock`, so both hold `{M1.lock, M2.lock}`; and `withLock` sorted by the **log key**, which for an absent key is the existential hash of `(mapId, key)` — a value with no relation to the lock it resolves to. Hash-derived order therefore inverted the acquisition order and both fibers blocked forever on `Semaphore.permit`, callers hung on `completionSignal.get`. **It needed no fallback, no under-declaration and no scheduler bug — it was reachable on fully ACCURATE footprints.** 17-state counterexample; the behavioural twin deadlocked and failed with a `TimeoutException`. **FIXED**: `TxnLogEntry.lock` now returns the lock paired with the runtime id of the entity that **owns** it, and `withLock` sorts on the owner. Owner → lock is injective, so one ascending order is a single global total order over locks and no circular wait can form. Post-fix the config verifies **exhaustively clean** (2,100 distinct states, depth 36) with deadlock detection on | `CommitH2.cfg` (CI, expected clean); `CommitLockOrderSpec` |
+| **Lock aliasing** — two fresh keys inserted into ONE map (`dbl`) | **HOLDS.** Both entries resolve to that map's single structural `commitLock`, so `withLock`'s `.distinct` must collapse them into ONE acquisition — a 1-permit `Semaphore` taken twice by the same fiber self-deadlocks instantly. Nothing in the catalogue exercised the dedup before, and the H2 fix **changed what it dedupes on** (the `(owner id, Semaphore)` pair rather than the bare `Semaphore`), so it now has its own scenario and its own negative control (NC-5, which removes the dedup and produces the self-deadlock). Deduping on the pair rather than on the owner id alone is deliberate: it compares the `Semaphore` by reference, so two genuinely distinct locks whose owner ids suffered a hash collision are still both acquired | `CommitH2.cfg`; `CommitLockOrderSpec` |
 | **H3 — write skew when the fallback under-declares** (`CommitSnapshotValid`) | **CONFIRMED (2026-07-11) at both levels — OPEN, pinned red.** Reads are never commit-validated and hold no lock, so the scheduler's footprint conflict-avoidance is the only defence, and an under-approximated footprint switches it off. **Unsound in BOTH directions:** the under-declared transaction reads what a peer overwrites (`CommitH3.cfg`), *and* its undeclared writes invalidate a correctly-declared peer's reads (`CommitH3Writer.cfg` — that transaction has no reads at all and still breaks its peer). **Reachable from ordinary code**: `staticAnalysisCompiler` executes real reads but never applies writes, so reading back a key the transaction just wrote yields `None` during analysis and `Some(v)` at run time; a partial continuation on it (`.get`, a pattern match) throws during analysis only, and everything after the throw goes undeclared. Measured **198/200 contended reps skewed** — the anomaly is the default outcome under contention, exactly as for H5 pre-fix | `CommitH3.cfg`, `CommitH3Partial.cfg`, `CommitH3Writer.cfg` (CI, expected red); `StaticAnalysisFallbackSpec` (behavioural, pinned red) |
 | **H3 — which fallback branch actually fires** | `TxnRuntime.commit`'s `handleErrorWith` has **two** under-approximating branches, and it matters which is which. `case _ => IdFootprint.empty` is the *extreme* point — compatible with everything — and is what `CommitH3.cfg` models. But the demonstrated defect takes the **other** branch: the walker's own handler converts the throw into `StaticAnalysisShortCircuitException(s)`, carrying the **partial** footprint accumulated so far, and `TxnRuntime.commit` schedules on *that*. `CommitH3Partial.cfg` models the partial footprint the real code produces (declared = just the scratch-key write; the whole skew undeclared behind it) and **reproduces the same violation** — so the verdict does not depend on the idealised empty case. Under-approximation is unsound whatever its *size*; what matters is that the conflicting ids are missing | `CommitH3Partial.cfg` (CI, expected red) |
 | **The fallback's one safe case** — a pure write-write collision between two under-declared transactions | **HOLDS.** The conflict lands on the write set, which the commit locks and the dirty check *do* cover: the loser sees its snapshot moved, releases, refines its footprint from the actual log, and re-runs. This is the row that makes the H3 boundary precise — and `CommitH3Writer.cfg` is the row that stops it being over-read: the fallback is safe only when **neither** party reads anything | `CommitDirty.cfg` (CI, expected clean) |
@@ -267,7 +269,8 @@ fixes are pre-validated against the model before a line of Scala moves.
 
 | # | Break / fix applied | Result |
 |---|---------------------|--------|
-| NC-1 | **Candidate H2 fix**: sort by the lock's **owner** id instead of the log key | `CommitH2.cfg` goes **clean** — the cycle is gone. Lock ↔ owner-id is a bijection, so a single ascending order is a total order on locks and no circular wait can form |
+| NC-1 | **Revert the H2 fix**: sort by the **log key** again instead of the lock's owner id | `CommitH2.cfg` goes **red** (`NoWaitsForCycle`) — the model still detects H2, so the post-fix clean verdict means the fix works rather than that the model stopped looking |
+| NC-5 | Remove `withLock`'s `.distinct` | `CommitH2.cfg` **deadlocks** — `dbl`'s two fresh keys in one map alias to that map's single lock, and taking a 1-permit `Semaphore` twice self-deadlocks. Pins the dedup, which the H2 fix changed |
 | NC-2 | **Candidate H3 fix**: an under-declared footprint is incompatible with everything | `CommitH3.cfg`, `CommitH3Partial.cfg` and `CommitH3Writer.cfg` all go **clean** — the fix works. **But read `CommitDirty.cfg` carefully: it stays clean *vacuously*.** Under NC-2 the two under-declared transactions can no longer overlap, so neither ever goes dirty and `DirtyRestart` becomes unreachable (measured by TLC action coverage: it fires 2× at baseline, **0× under NC-2**). That is the fix's throughput cost made concrete — and it means this control does **not** demonstrate that the dirty-refinement path survives the fix. Demonstrating that belongs to the H3 fix PR, which must add a scenario where an accurately-declared transaction still goes dirty |
 | NC-3 | Remove the relation's **third conjunct** (the pre-H5-fix relation) | `CommitAccurate.cfg` goes **red** (`CommitSnapshotValid`) — the H5 fix is load-bearing here, confirmed from the commit-protocol side |
 | NC-4 | Remove the **Contract C guard** — accurate footprints, locks and dirty check intact | `CommitAccurate.cfg` goes **red** (`CommitSnapshotValid`) — the commit protocol alone is NOT safe; the scheduler is doing real work. (Checking `ContractCHolds` as well would be circular — it restates the guard — so it is dropped for this control) |
@@ -328,7 +331,7 @@ site when the fix lands.
 
 | TLA+ Invariant | Anchor site | Status at anchor |
 |---------------|-------------|------------------|
-| `NoWaitsForCycle` | `src/main/scala/bengal/stm/runtime/TxnLogContext.scala` | `withLock` sorts by the LOG KEY while a new-key entry resolves to its MAP's lock — the two id spaces are decoupled, so sorting cannot order the acquired locks — **EXPECTED-RED (H2)** |
+| `NoWaitsForCycle` | `src/main/scala/bengal/stm/runtime/TxnLogContext.scala` | `withLock` sorts by the id of the entity that OWNS each lock, carried alongside the lock by `TxnLogEntry.lock`. Owner → lock is injective, so this is a global total order over locks — the H2 fix. HOLDS (the anchor moved here from the pre-fix mechanism site, per the convention above) |
 | `NoLocksWithoutWrites` | `src/main/scala/bengal/stm/runtime/TxnLogContext.scala` | read-only entries return `lock = None` and `isDirty = pure(false)` — commit validation and commit locks cover the write set only — HOLDS (and is why serializability rests on the scheduler) |
 | `CommitSnapshotValid` | `src/main/scala/bengal/stm/runtime/TxnRuntimeContext.scala` | `TxnRuntime.commit`'s `handleErrorWith` yields an under-approximated footprint, which is unsound rather than merely weak — **EXPECTED-RED (H3)** |
 
@@ -498,12 +501,15 @@ Measured with `-workers 1` for determinism:
 
 | Config | Verdict | States (gen / distinct) | Queue at halt | Depth reached |
 |--------|---------|------------------------|---------------|---------------|
-| `CommitH2` | RED — `NoWaitsForCycle` | 312 / 156 | 9 | 17 (**17-state counterexample**) |
+| `CommitH2` | clean — **exhaustive** (since the H2 fix) | 6,082 / 2,100 | 0 | 36 |
 | `CommitH3` | RED — `CommitSnapshotValid` | 317 / 168 | 7 | 19 |
 | `CommitH3Partial` | RED — `CommitSnapshotValid` | 816 / 350 | 3 | 26 |
 | `CommitH3Writer` | RED — `CommitSnapshotValid` | 240 / 131 | 5 | 18 |
 | `CommitDirty` | clean — **exhaustive** | 205 / 132 | 0 | 27 |
 | `CommitAccurate` | clean — **exhaustive** | 31,368 / 11,385 | 0 | 48 |
+
+*(Pre-fix, `CommitH2` halted red at 312/156 with 9 states on the queue, depth 17
+— the 17-state counterexample.)*
 
 All six together run in **~10 s** wall-clock on 12 cores (`CommitAccurate`, the
 largest at 5 transactions, is 5–15 s of that depending on load). Spec A is cheap

@@ -48,20 +48,36 @@
  * The LOG is keyed by whichever one the entry resolved to when it was built:
  * the entry var's own id if the key EXISTED, the existential id if it did
  * not (TxnLogValid.writeVarMapValue / getVarMapValueEntry both branch on
- * txnVarMap.getTxnVar(key)). And withLock sorts by THE LOG KEY:
+ * txnVarMap.getTxnVar(key)). Meanwhile TxnLogUpdateVarMapEntry.lock resolves
+ * to the ENTRY's lock if the key exists and THE MAP'S STRUCTURAL LOCK if it
+ * does not.
  *
- *     locks <- log.toList.sortBy(_._1.value).traverse(_._2.lock)
- *     locks.flatten.distinct.foldLeft(...)((i, j) => i >> j.permit).use(...)
+ * H2 WAS the gap between those two facts. withLock used to sort the LOG
+ * ENTRIES:
  *
- * while TxnLogUpdateVarMapEntry.lock resolves to
+ *     locks <- log.toList.sortBy(_._1.value).traverse(_._2.lock)   // PRE-FIX
  *
- *     oTxnVar.map(_.commitLock).getOrElse(txnVarMap.commitLock)
+ * so a new-key insert acquired the MAP's lock at a sort position derived from
+ * a hash of (mapId, key) — ordering the acquisitions by a hash of the KEY
+ * while the locks acquired belonged to the MAPS. Two unrelated id spaces, so
+ * the sort ordered nothing at all, and two transactions inserting fresh keys
+ * into two maps could take {M1.lock, M2.lock} in opposite orders. Their
+ * footprints are compatible, so the scheduler ran them concurrently by design.
  *
- * — the ENTRY's lock if the key exists, THE MAP'S STRUCTURAL LOCK if it does
- * not. So a new-key insert acquires the MAP's lock at a sort position
- * derived from a hash of (mapId, key). The sort key and the lock identity
- * are decoupled: sorting cannot order the acquired locks consistently
- * across transactions. That is H2.
+ * FIXED (2026-07-11). TxnLogEntry.lock now returns the lock PAIRED WITH ITS
+ * OWNER'S runtime id, and withLock sorts on the owner:
+ *
+ *     locks <- log.values.toList.traverse(_.lock)                  // POST-FIX
+ *     locks.flatten.distinct.sortBy(_._1.value).map(_._2)...
+ *
+ * Owner -> lock is injective, so one ascending order over owner ids is a
+ * single global total order over locks, and no set of transactions respecting
+ * it can form a circular wait. LockOwnerVal below is that sort key; reverting
+ * it to the log key is negative control NC-1 and must go RED.
+ *
+ * The bounds argument that follows is why the H2 config's scenario is the
+ * right one, and it still explains why the FIXED protocol is safe: it
+ * enumerates every lock two compatible transactions can share.
  *
  * WHY 2 TXNS AND 2 MAPS IS MINIMAL AND SUFFICIENT (the plan's mandatory
  * bounds note). Enumerate every way two COMPATIBLE transactions could share
@@ -230,10 +246,12 @@ M1a == [val |-> 11, par |-> 30]   \* key "a" of map 1
 M2a == [val |-> 12, par |-> 40]   \* key "a" of map 2
 M2b == [val |-> 13, par |-> 40]   \* key "b" of map 2
 M1b == [val |-> 14, par |-> 30]   \* key "b" of map 1
+M1c == [val |-> 15, par |-> 30]   \* key "c" of map 1  } the aliasing pair:
+M1d == [val |-> 16, par |-> 30]   \* key "d" of map 1  } two fresh keys, ONE map
 
 PlainVars  == {X, Y}
 MapStructs == {M1, M2}
-MapEntries == {M1a, M1b, M2a, M2b}
+MapEntries == {M1a, M1b, M1c, M1d, M2a, M2b}
 Entities   == PlainVars \cup MapStructs \cup MapEntries
 
 (* The entry TxnVar's OWN runtimeId value — hashed from a fresh sequential
@@ -254,12 +272,13 @@ NoLock == "none"
 
 EntryLock(e) ==
     CASE e = M1a -> "LE_M1a" [] e = M1b -> "LE_M1b"
+      [] e = M1c -> "LE_M1c" [] e = M1d -> "LE_M1d"
       [] e = M2a -> "LE_M2a" [] e = M2b -> "LE_M2b"
 
 StructLock(m) == IF m = M1 THEN "LM1" ELSE "LM2"
 
 Locks == {"LX", "LY", "LM1", "LM2",
-          "LE_M1a", "LE_M1b", "LE_M2a", "LE_M2b"}
+          "LE_M1a", "LE_M1b", "LE_M1c", "LE_M1d", "LE_M2a", "LE_M2b"}
 
 (* TxnLogEntry.lock, resolved against LIVE state (`exists` is read at
    withLock time, not at log-build time):
@@ -312,7 +331,7 @@ LockOfWrite(e, exists) ==
    *)
 ---------------------------------------------------------------------------
 
-AllTxns == {"h2a", "h2b", "h3a", "h3b", "h5a", "h5b", "wwa", "wwb", "pfa", "pfb", "ro"}
+AllTxns == {"h2a", "h2b", "dbl", "h3a", "h3b", "h5a", "h5b", "wwa", "wwb", "pfa", "pfb", "ro"}
 ASSUME Txns \subseteq AllTxns
 ASSUME UnderDeclared \subseteq Txns
 
@@ -362,6 +381,12 @@ ActualFP(t) ==
       [] t = "h5b" -> FP({M1}, {M1b})
       [] t = "wwa" -> FP({},   {X})
       [] t = "wwb" -> FP({},   {X})
+      \* dbl inserts TWO fresh keys into ONE map. Both entries alias to that
+      \* map's single structural commitLock, so withLock's `.distinct` must
+      \* collapse them into ONE acquisition — a 1-permit Semaphore taken twice
+      \* by the same fiber is an instant self-deadlock. Nothing else in the
+      \* catalogue exercises the dedup, and the H2 fix changed how it dedupes.
+      [] t = "dbl" -> FP({},   {M1c, M1d})
       \* pfa/pfb: the log holds the scratch-key insert (M1a/M1b) AND the skew
       \* pair the walker never reached. The scratch READ is not a separate log
       \* read — the write entry is already there, so `scratch.get(key)` is
@@ -404,7 +429,7 @@ ReadSet(t)  == Validated(ActualFP(t)).reads
 TxnRank(t) ==
     CASE t = "h2a" -> 1 [] t = "h2b" -> 2 [] t = "h3a" -> 3 [] t = "h3b" -> 4
       [] t = "h5a" -> 5 [] t = "h5b" -> 6 [] t = "wwa" -> 7 [] t = "wwb" -> 8
-      [] t = "pfa" -> 9 [] t = "pfb" -> 10 [] t = "ro"  -> 11
+      [] t = "pfa" -> 9 [] t = "pfb" -> 10 [] t = "ro" -> 11 [] t = "dbl" -> 12
 
 ---------------------------------------------------------------------------
 (* State *)
@@ -450,22 +475,38 @@ InWindow(t) == pc[t] \in WindowPcs
 
 Range(s) == { s[i] : i \in 1..Len(s) }
 
-(* The LOG KEY of an entry — what withLock's `sortBy(_._1.value)` sorts on.
-   For a map entry this is the ENTRY VAR's own id if the key existed when the
-   log entry was built, else the EXISTENTIAL id. See the header. *)
-LogKeyVal(t, e) ==
-    IF e \in MapEntries /\ snapEx[t][e] THEN EntryVarVal(e) ELSE e.val
+(* THE H2 FIX. withLock now sorts by the id of THE ENTITY THAT OWNS THE LOCK,
+   carried alongside the lock itself (TxnLogEntry.lock returns
+   (TxnVarRuntimeId, Semaphore)). For a map entry the owner is the entry's own
+   TxnVar if the key exists, and otherwise THE MAP — because that is whose lock
+   the fallback actually takes.
 
-(* log.toList.sortBy(_._1.value), restricted to the entries that contribute a
-   lock. Read-only entries return lock = None and are dropped by `.flatten`;
-   they occupy sort positions but cannot change the RELATIVE order of the
-   write entries, so omitting them is exact, not a reduction. *)
+   Since owner -> lock is injective, one ascending order over owner ids is a
+   single global total order over locks, so no set of transactions respecting
+   it can form a circular wait.
+
+   BEFORE THE FIX this operator returned the LOG KEY: `e.val` (the existential
+   id hashed from (mapId, key)) for an absent key. That ordered acquisitions by
+   a hash of the KEY while the locks acquired belonged to the MAPS — two
+   unrelated id spaces — and TLC found the resulting cycle. Reverting this one
+   operator to the log key is negative control NC-1, and it must go RED. *)
+LockOwnerVal(t, e) ==
+    IF e \in MapEntries
+    THEN IF snapEx[t][e] THEN EntryVarVal(e) ELSE ParentStruct(e).val
+    ELSE e.val
+
+(* The lock-contributing entries, ordered by their LOCK'S OWNER. Read-only
+   entries return lock = None and are dropped by `.flatten`, so they cannot
+   affect the acquisition order at all — omitting them is exact, not a
+   reduction. Sorting on the owner is what makes this a total order over locks;
+   the code reaches the same sequence via `.sortBy(_._1.value)` after resolving
+   every lock. *)
 SortedWrites(t) ==
     LET S == Writes(t)
         n == Cardinality(S)
     IN  CHOOSE sq \in [1..n -> S] :
             /\ \A i, j \in 1..n : i /= j => sq[i] /= sq[j]
-            /\ \A i \in 1..(n-1) : LogKeyVal(t, sq[i]) < LogKeyVal(t, sq[i+1])
+            /\ \A i \in 1..(n-1) : LockOwnerVal(t, sq[i]) <= LockOwnerVal(t, sq[i+1])
 
 (* isDirty, per entry, exactly as TxnLogContext has it:
      - TxnLogUpdateVarEntry / ...StructureEntry: live value /= initial
@@ -818,6 +859,30 @@ NoLocksWithoutWrites ==
 LocksHeldConsistent ==
     \A t \in Txns :
         HeldBy(t) = { lockSeq[t][i] : i \in 1..lockIdx[t] }
+
+(* FIDELITY PIN for the H2 fix's sort key.
+   The CODE resolves a map entry's lock owner from a LIVE read at withLock time
+   (TxnLogUpdateVarMapEntry.lock does txnVarMap.getTxnVar(key)). This MODEL
+   computes the sort key from snapEx — the key's existence when the LOG ENTRY
+   was built. Those agree only if nothing can flip the existence of an entity we
+   WRITE while we are inside our window, and Contract C is why: anyone who could
+   insert or delete that key must write it, which is raw-id overlap with our own
+   write, hence incompatible, hence excluded from our window.
+
+   That argument is sound but it is an argument, so it is machine-checked here
+   rather than assumed. If a future scenario breaks it — a fallback config that
+   lets two transactions write one map entry, say — this goes RED and says so,
+   instead of the model silently sorting on a key the code never uses.
+
+   Scoped to the RESOLVE and ACQUIRE phases, which is exactly where the owner id
+   is consulted. Beyond them the check would be vacuously self-violating: a
+   transaction's OWN publish flips keyExists for its own writes while it is
+   still in its window (at "release"), and that is not interference. *)
+LockOwnerStable ==
+    \A t \in Txns :
+        pc[t] \in {"resolve", "acquire"} =>
+            \A e \in Writes(t) :
+                e \in MapEntries => (snapEx[t][e] = keyExists[e])
 
 (* Contract C is ASSUMED here (TxnEnter's guard) and CHECKED by Spec B.
    Asserting it costs nothing and pins the assumption in place — if a later

@@ -96,12 +96,12 @@ jobs:
       # so that CI fails if they stop reproducing — which is what forces the
       # fix, the verdict table and the plan to move together.
 
-      - name: Check commit protocol — H2 lock-order deadlock (pinned RED)
+      - name: Check commit protocol — H2 lock ordering (expected clean since the H2 fix)
         run: |
           ./specs/check_expected.sh \
             specs/commit/CommitH2.cfg \
             specs/commit/CommitProtocol.tla \
-            NoWaitsForCycle
+            NONE
 
       - name: Check commit protocol — H3 under-declared read skew (pinned RED)
         run: |
