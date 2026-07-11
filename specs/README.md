@@ -16,9 +16,10 @@ the operational reference and the **source of truth for verdicts**.
   half of the `isValidated` flag's soundness — the other half is call-site
   discipline, see the `IdFootprint.scala` anchor), validation monotonicity,
   writer self-incompatibility
-- Pins of current behaviour with protocol consequences, including the **H5
-  read gap**: a parent-structure READ is judged compatible with a child-entry
-  WRITE (whole-map read vs new-key insert) — see the verdict table
+- The full parent-hierarchy conflict matrix, including the **H5 fix**: a
+  parent-structure READ now conflicts with a child-entry WRITE (whole-map
+  read vs new-key insert) while parent-read vs child-read stays compatible —
+  see the verdict table
 
 **Scheduler protocol, Phase 1 scope** (`src/main/scala/bengal/stm/runtime/TxnRuntimeContext.scala`):
 
@@ -120,8 +121,8 @@ fiber bound.
 | Property | Verdict | Evidence |
 |----------|---------|----------|
 | `LemmaCompatSymmetric`, `LemmaValidatedIdempotent`, `LemmaValidatedPreservesUpdates`, `LemmaValidatedMonotoneCompat`, `LemmaWriterSelfIncompatible` | **HOLD** (exhaustive at 4-id universe) | `FootprintLemmas.cfg`, clean |
-| `DocumentsReadGapH5` — parent-structure read vs child-entry write judged **compatible** | **PINNED** (current behaviour; relation-level H5 premise confirmed) | `FootprintLemmas.cfg`; flips RED when the relation is fixed |
-| **H5 phantom write skew — behavioural** (whole-map read + new-key insert: both txns observe the empty map, both commit; no serial order exists) | **CONFIRMED in the shipped library — pinned in the test suite** (~98% of contended reps on a 12-core host; the static-analysis walker does not close the gap) | `SerializabilityOracleSpec` ("H5 phantom write skew"); flips RED when fixed |
+| `DocumentsParentReadChildWriteCaught` — parent-structure read vs child-entry write now judged **incompatible** (plus `DocumentsParentReadChildReadCompatible`: pure readers stay compatible) | **HOLDS — H5 FIXED (2026-07-11)** by the relation's third conjunct; before the fix this pair was compatible (pinned then as `DocumentsReadGapH5`) | `FootprintLemmas.cfg` |
+| **H5 phantom write skew — behavioural** (whole-map read + new-key insert) | **FIXED (2026-07-11)** — was CONFIRMED at ~98% of contended reps (both txns observed the empty map, both committed); the fixed relation serializes the pair and the regression test asserts every rep serializable | `SerializabilityOracleSpec` ("H5 phantom write skew … regression for the H5 fix") |
 | `DocumentsSiblingInsertsCompatible` — two new-key inserts to one map compatible (H2 enabler) | **PINNED** (correct behaviour; the hazard is the lock aliasing, Spec A) | `FootprintLemmas.cfg` |
 | `NoDoubleExec` | **RED — organic, pinned in CI** (TLC search depth ~50, 49-state trace) | H4 counterexample, narrative below |
 | `ContractC` | **RED — organic** (depth ~51) | same root cause; drop-and-rerun procedure below |
@@ -206,7 +207,7 @@ marks the **mechanism site**; it moves to the fix site when the fix lands.
 | TLA+ Invariant | Anchor site | Status at anchor |
 |---------------|-------------|------------------|
 | `LemmaValidatedIdempotent` | `src/main/scala/bengal/stm/model/runtime/IdFootprint.scala` | one `getValidated` application is a fixpoint — HOLDS, makes the memoisation flag sound |
-| `DocumentsReadGapH5` | `src/main/scala/bengal/stm/model/runtime/IdFootprint.scala` | the parent rule tests ids only against the other side's update set — PINNED current behaviour (H5) |
+| `DocumentsParentReadChildWriteCaught` | `src/main/scala/bengal/stm/model/runtime/IdFootprint.scala` | the relation's third conjunct conflicts child writes with parent reads — the H5 fix |
 
 ## Variable Mapping (Scheduler.tla)
 
@@ -304,12 +305,11 @@ Measured on 12 cores (Apple x86_64, JDK 21, TLC 2026-07 build):
    point-op workloads against the real STM, with every outcome checked
    against all serial orders of a sequential reference model (green — the
    scheduler serializes footprint-visible conflicts correctly), an
-   increment canary for the H4 double-execution family, and a **pinned H5
-   reproduction** — the whole-map-read + new-key-insert phantom write skew
-   reproduces in the shipped library (measured ~98% of contended reps, on both a
-   12-core host and a 2-thread pool) and the test
-   asserts it keeps reproducing until fixed, exactly as `check_expected.sh`
-   pins TLC counterexamples. Whole-map reads are excluded from the
-   *generated* suite for that reason; `waitUntil`/retry workloads join in
-   Phase 2. Deterministic replay tests for other confirmed traces arrive
-   with their fixes.
+   increment canary for the H4 double-execution family, and the **H5
+   regression test** — the whole-map-read + new-key-insert idiom, which
+   before the fix produced phantom write skew in ~98% of contended reps,
+   must now be serializable in every rep (500 per run). Whole-map reads
+   stay out of the *generated* suite (the targeted test covers the idiom
+   deterministically; folding them into the generators is a candidate
+   expansion); `waitUntil`/retry workloads join in Phase 2. Deterministic
+   replay tests for other confirmed traces arrive with their fixes.

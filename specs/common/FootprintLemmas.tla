@@ -24,14 +24,14 @@
  *               means the Footprint.tla encoding drifted from intent (or a
  *               code change broke the relation's algebra).
  *
- *   Documents* — pins of CURRENT behaviour, including behaviour suspected
- *               to be defective. In particular DocumentsReadGapH5 asserts
- *               that a parent-structure READ is judged compatible with a
- *               child-entry WRITE — the hypothesised phantom-write-skew hole
- *               (plan §6, H5). If isCompatibleWith is ever fixed to close
- *               that gap, this ASSUME goes RED on purpose: update the lemma,
- *               Footprint.tla, the verdict table in specs/README.md, and the
- *               H5 row together.
+ *   Documents* — pins of current behaviour (positive controls and
+ *               consequence-laden compatibilities). Historical note: until
+ *               the H5 fix, DocumentsReadGapH5 pinned the phantom-write-skew
+ *               gap here — a parent-structure READ was judged compatible
+ *               with a child-entry WRITE. The relation now catches that
+ *               conflict (DocumentsParentReadChildWriteCaught below), and
+ *               the behavioural regression test lives in
+ *               SerializabilityOracleSpec.
  *)
 
 EXTENDS Footprint
@@ -109,25 +109,22 @@ ASSUME DocumentsParentWriteChildWriteCaught ==
 ASSUME DocumentsParentWriteChildReadCaught ==
     ~IsCompatible(FP({E1}, {}), FP({}, {S}))
 
+(* Child-entry WRITE vs parent-structure READ is caught by the third
+   conjunct (the H5 fix): a structure read observes the key set, so a
+   new-key insert must conflict with it. Before the fix this pair was
+   judged compatible — the phantom-write-skew hole confirmed behaviourally
+   at ~98% of contended whole-map-read + insert reps (plan §6, H5). *)
+ASSUME DocumentsParentReadChildWriteCaught ==
+    ~IsCompatible(FP({S}, {}), FP({}, {E1}))
+
+(* Parent-structure READ vs child-entry READ remains compatible — the fix
+   must not serialize pure readers *)
+ASSUME DocumentsParentReadChildReadCompatible ==
+    IsCompatible(FP({S}, {}), FP({E1}, {}))
+
 -------------------------------------------------------------------------------
 (* Pins of current behaviour with protocol-level consequences *)
 -------------------------------------------------------------------------------
-
-(*
- * H5 (plan §6): parent-structure READ vs child-entry WRITE is judged
- * COMPATIBLE. The parent rule tests ids only against the other side's
- * UPDATE set, so E1.par = S.val is never compared against a mere read of S.
- * Consequence: "read whole map" and "insert new key" can run concurrently
- * under fully accurate footprints, and since structure reads are never
- * commit-validated (TxnLogReadOnlyVarMapStructureEntry), phantom write skew is
- * hypothesised reachable. Spec A (Phase 3) carries the behavioural check;
- * this lemma pins the relation-level fact.
- *
- * IF THIS GOES RED: the relation was fixed. Flip the H5 verdict row and
- * rewrite this lemma to assert the incompatibility.
- *)
-ASSUME DocumentsReadGapH5 ==
-    IsCompatible(FP({S}, {}), FP({}, {E1}))
 
 (*
  * Two new-key inserts into the SAME map (distinct keys) are compatible —

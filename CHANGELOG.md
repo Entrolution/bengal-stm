@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Phantom write skew on `TxnVarMap`: a whole-map read was judged footprint-compatible with a concurrent new-key insert (the compatibility relation never tested a child-entry write against a parent-structure read), and since structure reads are not commit-validated, two "read all, then insert" transactions could both observe the pre-insert map and both commit — a non-serializable outcome measured in ~98% of contended runs. `IdFootprint.isCompatibleWith` now conflicts child-entry writes with parent-structure reads, so the scheduler serializes such transactions. Throughput trade-off: whole-map readers now serialize against all entry-level writers of that map — the price of making the idiom serializable. Confirmed via the TLA+ footprint-relation lemmas (`specs/common/FootprintLemmas.tla`) and regression-pinned by `SerializabilityOracleSpec`.
+
+### Added
+- Serializability oracle test suite (`SerializabilityOracleSpec`, 143 → 146 tests): generated concurrent workloads checked against all serial orders of a sequential reference model, an increment canary, and the H5 phantom-write-skew regression test
+- TLA+ formal specifications under `specs/` for the footprint compatibility relation and the transaction scheduler protocol, with CI-pinned expectations (`.github/workflows/specs.yml`)
+
 ## [0.13.0] - 2026-03-10
 
 ### Fixed

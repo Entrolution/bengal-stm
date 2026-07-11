@@ -47,6 +47,8 @@ private[stm] case class IdFootprint(
 
   private[stm] lazy val updateRawIds: Set[Int] = updatedIds.map(_.value)
 
+  private[stm] lazy val readRawIds: Set[Int] = readIds.map(_.value)
+
   private[stm] def addReadId(id: TxnVarRuntimeId): IdFootprint =
     this.copy(readIds = readIds + id)
 
@@ -56,14 +58,22 @@ private[stm] case class IdFootprint(
   private[stm] def mergeWith(idScope: IdFootprint): IdFootprint =
     this.copy(readIds = readIds ++ idScope.readIds, updatedIds = updatedIds ++ idScope.updatedIds)
 
-  // SPEC: DocumentsReadGapH5 — ids (reads included) are tested only against
-  // the OTHER side's update ids, so a child-entry WRITE is never checked
-  // against a parent-structure READ: whole-map reads are judged compatible
-  // with new-key inserts (FootprintLemmas.tla pins this; hypothesis H5 in
-  // docs/plans/formal-specs.md tracks the behavioural consequence).
+  // SPEC: DocumentsParentReadChildWriteCaught — the conflict matrix over the
+  // parent hierarchy is: raw-id overlap with the other side's writes (first
+  // conjunct); my ids — reads included — under a parent the other side
+  // WRITES (second conjunct); and my WRITES under a parent the other side
+  // READS (third conjunct). The third closes the H5 phantom-write-skew gap
+  // (whole-map read vs new-key insert; docs/plans/formal-specs.md §6):
+  // a structure read observes the key set, so any child-entry write must
+  // conflict with it. Parent-read vs child-read stays compatible.
+  // ASSUMES a 2-level id hierarchy (parents are never themselves parented —
+  // true by construction today): all parent checks here and in getValidated
+  // are one-hop, and deeper nesting would need multi-hop coverage.
   private def asymmetricCompatibleWith(input: IdFootprint): Boolean =
     combinedRawIds.intersect(input.updateRawIds).isEmpty && !combinedIds.exists(
       _.parent.exists(p => input.updateRawIds.contains(p.value))
+    ) && !updatedIds.exists(
+      _.parent.exists(p => input.readRawIds.contains(p.value))
     )
 
   private[stm] def isCompatibleWith(input: IdFootprint): Boolean =
