@@ -53,6 +53,20 @@ private[stm] trait TxnLogContext[F[_]] {
   // However, to make the library interface more
   // predictable in the face of side-effects, RO
   // entries are created
+  //
+  // SPEC: NoLocksWithoutWrites — every read-only entry returns lock = None and
+  // isDirty = pure(false). Two consequences, and both are load-bearing:
+  //   1. Commit-time validation and commit locks cover the WRITE SET ONLY.
+  //      Serializability therefore rests ENTIRELY on the scheduler's
+  //      footprint conflict-avoidance, which is why footprint accuracy is a
+  //      safety precondition (H3) and why a gap in the compatibility relation
+  //      is a direct hole (H5). Removing the Contract C guard from Spec A
+  //      breaks CommitSnapshotValid even with accurate footprints and every
+  //      lock intact — negative control NC-4 in specs/README.md.
+  //   2. A pure reader's log acquires NO locks and can NEVER report dirty, so
+  //      the TxnLogRetry re-validation before a park is vacuous. That is why
+  //      the H1 fix needed hasChangedSinceRead (below) — a real comparison
+  //      that includes read-only entries — rather than leaning on isDirty.
   private[stm] case class TxnLogReadOnlyVarEntry[V](
     initial: V,
     txnVar: TxnVar[F, V]
@@ -1061,6 +1075,21 @@ private[stm] trait TxnLogContext[F[_]] {
         }
         .map(_.reduce(_ mergeWith _))
 
+    // SPEC: NoWaitsForCycle — EXPECTED-RED; this is the H2 mechanism site.
+    // The sort key and the lock identity live in DIFFERENT id spaces. We sort
+    // log entries by their LOG KEY (_._1.value), but a map entry for an ABSENT
+    // key resolves its lock to the MAP's structural commitLock
+    // (TxnLogUpdateVarMapEntry.lock) while being logged under the existential
+    // id hashed from (mapId, key). So a new-key insert takes the map's lock at
+    // a sort position that has nothing to do with that lock — and sorting
+    // therefore cannot order the acquired locks consistently across
+    // transactions. Two transactions inserting fresh keys into two maps have
+    // COMPATIBLE footprints (the scheduler deliberately runs them
+    // concurrently), both hold {M1.lock, M2.lock}, and hash-derived order can
+    // invert their acquisition order: circular wait, both fibers blocked
+    // forever on Semaphore.permit. specs/commit/CommitH2.cfg pins the
+    // counterexample; the fix is to sort by the LOCK'S OWNER id, not the log
+    // key (negative control NC-1 in specs/README.md).
     override private[stm] def withLock[A](fa: F[A]): F[A] =
       for {
         locks <- log.toList.sortBy(_._1.value).traverse(_._2.lock)
