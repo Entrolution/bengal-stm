@@ -1,81 +1,12 @@
 # Formal Specification Plan — Scheduler & Commit Protocols
 
-**Status:** Phases 0–2 executed and merged (2026-07-11, PRs #55–#59) —
-`specs/README.md` is now the verdict source of truth. **H4 CONFIRMED
-organically and FIXED the same day** (all six Spec B safety invariants were
-violated with a minimal counterexample pinned in CI at TLC search depth ~50;
-the fix — admission gate, fresh incarnations, exactly-once cascades — turned
-the full invariant set exhaustively green at the same bounds and the CI pin
-flipped to expected-clean; see the verdict table).
-**H5 CONFIRMED at both levels and FIXED (2026-07-11)**: confirmed
-relation-level by `FootprintLemmas.tla` (then `DocumentsReadGapH5`) and
-behaviourally by the oracle test's probe (~98% of contended
-whole-map-read + new-key-insert reps non-serializable); fixed by adding a
-third conjunct to `isCompatibleWith` (child-entry writes conflict with
-parent-structure reads), with the lemma flipped to
-`DocumentsParentReadChildWriteCaught` and the probe flipped to a
-serializability regression test. The oracle test landed as PR #56; the fix
-follows it. Spec A's model-level `CommitSnapshotValid` check remains Phase 3
-(now expected to HOLD in accurate mode for this idiom).
-**H1 CONFIRMED and FIXED (2026-07-11)** in Phase 2 — a hard deadlock at TLC
-depth 39 in the retry model; fixed by scanning `activeTransactions` for
-footprint conflicts and *then* re-checking the read set, inside the
-retry-semaphore region, before parking (the order is load-bearing). A
-pre-existing spurious self-wake spin surfaced in the same verification and was
-fixed by keying the retry map on `TxnId` (see the verdict table).
-**Phase 3 executed (2026-07-11): Spec A landed and BOTH remaining hypotheses
-CONFIRMED — H2 and H3 are open defects, pinned red in CI.** H2: a lock-order
-deadlock via the map-lock fallback, reachable on **fully accurate footprints**
-(`withLock` sorted by the log key while a new-key entry resolves to its *map's*
-lock — two decoupled id spaces). H3: write skew when the static-analysis
-fallback under-declares — unsound in **both** directions and reachable from
-ordinary read-your-own-write code (198/200 contended reps skew).
-**BOTH FIXED (2026-07-11).** H2: `TxnLogEntry.lock` now carries each lock's
-OWNER id and `withLock` sorts on that, a genuine total order over locks. H3:
-`IdFootprint.isUnderApproximated` flags a footprint the walker could not
-complete, and the relation makes such a footprint incompatible with everything,
-so the transaction is serialized and runs alone — which makes its unvalidated
-reads trivially safe. All nine TLC expectations across the workstream are now
-expected-CLEAN; there are no pinned counterexamples left.
+> **HISTORICAL — not maintained.** This was the plan of record for PRs #55–#69.
+> **Every verdict in it is superseded by [`specs/README.md`](../../../specs/README.md)**,
+> which is the sole source of truth for what the specs check and what they found.
+> Retained for the architecture rationale (§2, §3, §7) and the hypothesis provenance
+> (§6) — this is the plan *as written*, including file layouts, property names and API
+> shapes that no longer exist.
 
-**H6 — data-dependent footprints — CONFIRMED and FIXED (2026-07-12).** The hole
-the H3 fix could not reach, promoted from a §10 footnote the moment H3 landed.
-The walker runs BEFORE `submitTxn` — outside any Contract-C window — and computes
-the access set from LIVE reads, so a transaction whose keys depend on a value it
-read can be scheduled on a footprint naming the WRONG ids. Nothing throws, so
-nothing is flagged. Same mechanism as H3, same invariant.
-**Fixed by a commit-time COVERAGE check**: under the locks and *before publishing*,
-verify that the declared footprint covers what the run actually touched; if not,
-refine from the actual log and re-run. Checking before the publish is what makes
-it sound in both directions. `IdFootprint.covers` is deliberately NOT a subset
-test — a whole-map read legitimately expands into a log entry per key — and
-`LemmaCoverageIsSound` proves the real thing exhaustively over every ordered
-triple of footprints.
-
-H6 is confirmed **behaviourally as well as in the model**, and deterministically:
-`DataDependentFootprintSpec` suspends the analysis pass itself (via `STM[F].fromF`,
-since the walker executes `TxnDelay` thunks), flips the key sources while the
-transaction is not yet in `activeTransactions`, and watches the reader observe a
-**torn** transfer — 20/20 reps pre-fix, 0/20 post-fix.
-
-**All six hypotheses (H1–H6) are now confirmed and fixed**, each at BOTH levels —
-model and shipped code. Ten TLC expectations, all expected-clean; no pinned
-counterexamples remain.
-Two results came out of Spec A besides the verdicts: **the H5 fix is what
-discharges Spec B's atomic-commit abstraction** (§3's refinement obligation),
-and **the commit protocol alone is not serializable** — removing only the
-Contract C guard breaks it with every lock intact (NC-4), so footprint
-accuracy is a safety precondition, not a throughput knob.
-Plan below retained as written (critique-ratcheted: self-review +
-independent agent review applied). **Invariant naming note:** implementation
-tightened some planned property names — `TallyIsUpstreamCount` shipped as
-the weaker-but-sufficient `TallyNonNegative`, `CompletionExactlyOnce`'s
-safety half as `CompletionAtMostOnce`, and `StatusWellFormed` as
-`NoDoubleExec` + `NoExecOnCompleted`; `NoDroppedSpawn` was added as a
-model-capacity detector. `specs/README.md` uses the shipped names. Line
-references in the plan body below predate the `// SPEC:` anchor insertions
-(off by up to 18 lines in `TxnRuntimeContext.scala` / `IdFootprint.scala`);
-the specs and `specs/README.md` cite symbols and are authoritative.
 **Tooling:** TLA+ / TLC (echidna house pattern)
 **Scope:** `TxnRuntimeContext.scala`, `TxnLogContext.scala` (commit path), `IdFootprint.scala`, `TxnVarRuntimeId.scala`
 
@@ -372,6 +303,15 @@ different algorithm and goes back for granularity rework before any green invari
 is trusted. Each row must record why its config bounds suffice to exhibit the claimed
 behaviour.
 
+> **Read the Expected column as provenance, not as a verdict.** These cells were written
+> during the workstream and frozen mid-flight: several **lead** with a status that is
+> reversed later in the same cell (H2 and H3 both open with "CONFIRMED — OPEN, pinned
+> red" and reach "FIXED" a few hundred words on), and the state counts quoted in H4 are
+> Phase-1-era figures that Phase 2 superseded. What survives here is *why each hypothesis
+> was suspected and what it predicted* — which is the reason to keep the table. For what
+> is actually true of the shipped code, go to
+> [`specs/README.md`](../../../specs/README.md).
+
 | # | Hypothesis | Spec / property | Code site | Expected |
 |---|---|---|---|---|
 | H1 | **Park/submit lost-wakeup window.** On `TxnResultRetry`, `registerCompletion` (removes txn from `active`) precedes the park into `retryMap`. A conflicting writer submitted in the gap sees the txn in neither structure (no graph edge, no wake), commits, and nothing ever wakes the parked txn — wakes fire only on submission. | B / `NoLostWakeup` | `TxnRuntimeContext.scala:330-359`, `61-95` | **CONFIRMED (2026-07-11)** as a hard deadlock at depth 39 in the Phase 2 retry model (2 txns, 1 var — as predicted; manifests as a dead-end state, so no fairness machinery was needed). **FIXED same day**: `submitTxnForRetry` scans `activeTransactions` for footprint conflicts and then re-checks the read set (`hasChangedSinceRead`) inside the retry-semaphore region before parking. Both checks are required (sweeps fire at submission, BEFORE the conflicting commit) and **the order is load-bearing** — staleness must be the last read before the insert; the reverse order still deadlocks (negative control NC-A), which a first draft of the fix shipped and the code-order-split model caught. A second, pre-existing defect surfaced in the same verification: a parked transaction's OWN submission sweep woke it (self-incompatible footprint), an unbounded spurious spin — fixed by keying the retry map on `TxnId` and skipping the submitter. Post-fix `SchedulerRetry.cfg` verifies exhaustively with deadlock detection on (CI, expected clean) |
@@ -497,7 +437,10 @@ on nothing TLA-related.
   `CommitDirty.cfg`'s `ddw` had to be re-founded on it to stay reachable, which was
   the clearest possible signal that it was load-bearing.
 
-  **FIXED (2026-07-12) — see the H6 row in §6.** The commit-time coverage check
+  **FIXED (2026-07-12) — see the H6 row in [`specs/README.md`](../../../specs/README.md).**
+  (H6 was promoted from this footnote *after* §6's table was written, so it has no row
+  there; §6 lists the five hypotheses that came out of the pre-planning read.)
+  The commit-time coverage check
   catches it: an inaccurate declared footprint is caught at the one point where it
   can still be caught harmlessly, before anything is published. Worth recording
   how this arrived, because it is the pattern the whole workstream ran on — the

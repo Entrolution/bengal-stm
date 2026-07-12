@@ -27,9 +27,12 @@ import bengal.stm.model.runtime._
 private[stm] trait TxnStateEntity[F[_], V] {
   private[stm] def id: TxnVarId
 
-  // A unique identifier for key-values that may
-  // not be present in the map. This is used to build
-  // references in the runtime system.
+  // This entity's OWN runtime id, derived from its TxnVarId: the key it is
+  // logged under, and the id it contributes to a footprint. For a TxnVarMap it
+  // doubles as the PARENT of every one of its entries' ids
+  // (TxnVarMap.getRuntimeId), which is what makes a whole-map read conflict with
+  // a write to any key in it.
+  //
   // Note: We run this through a deterministic UUID mapping
   // to mitigate the chance of increment-based IDs colliding
   // with bare hash codes

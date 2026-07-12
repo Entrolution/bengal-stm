@@ -30,7 +30,7 @@ import bengal.stm.STM
 import bengal.stm.model._
 import bengal.stm.syntax.all._
 
-class StmStressSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
+class StmStressSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers with StmSuite {
 
   private def transfer(
     from: TxnVar[IO, Int],
@@ -61,76 +61,66 @@ class StmStressSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
     } yield v
 
   "counter with 100 concurrent writers" in {
-    STM
-      .runtime[IO]
-      .flatMap { implicit stm =>
-        for {
-          counter <- TxnVar.of(0)
-          _       <- (1 to 100).toList.parTraverse_(_ => counter.modify(_ + 1).commit)
-          result  <- counter.get.commit
-        } yield result
-      }
-      .timeout(30.seconds)
-      .asserting(_ shouldBe 100)
+    withRuntime { implicit stm =>
+      for {
+        counter <- TxnVar.of(0)
+        _       <- (1 to 100).toList.parTraverse_(_ => counter.modify(_ + 1).commit)
+        result  <- counter.get.commit
+      } yield result
+    }.asserting(_ shouldBe 100)
   }
 
   "account transfer with 100 concurrent transfers" in {
-    STM
-      .runtime[IO]
-      .flatMap { implicit stm =>
-        for {
-          accountA <- TxnVar.of(1000)
-          accountB <- TxnVar.of(1000)
-          _ <- (1 to 100).toList.parTraverse_ { i =>
-                 if (i <= 50) transfer(accountA, accountB).commit
-                 else transfer(accountB, accountA).commit
-               }
-          a <- accountA.get.commit
-          b <- accountB.get.commit
-        } yield a + b
-      }
-      .timeout(30.seconds)
-      .asserting(_ shouldBe 2000)
+    withRuntime { implicit stm =>
+      for {
+        accountA <- TxnVar.of(1000)
+        accountB <- TxnVar.of(1000)
+        _ <- (1 to 100).toList.parTraverse_ { i =>
+               if (i <= 50) transfer(accountA, accountB).commit
+               else transfer(accountB, accountA).commit
+             }
+        a <- accountA.get.commit
+        b <- accountB.get.commit
+      } yield a + b
+    }.asserting(_ shouldBe 2000)
   }
 
   "map contention with 20 concurrent writers" in {
     val keys       = List("k1", "k2", "k3", "k4", "k5")
     val initialMap = keys.map(_ -> 0).toMap
 
-    STM
-      .runtime[IO]
-      .flatMap { implicit stm =>
-        for {
-          tVarMap <- TxnVarMap.of(initialMap)
-          _       <- (1 to 20).toList.parTraverse_(_ => incrementAllKeys(tVarMap, keys).commit)
-          result  <- tVarMap.get.commit
-        } yield result
-      }
-      .timeout(30.seconds)
-      .asserting(_ shouldBe keys.map(_ -> 20).toMap)
+    withRuntime { implicit stm =>
+      for {
+        tVarMap <- TxnVarMap.of(initialMap)
+        _       <- (1 to 20).toList.parTraverse_(_ => incrementAllKeys(tVarMap, keys).commit)
+        result  <- tVarMap.get.commit
+      } yield result
+    }.asserting(_ shouldBe keys.map(_ -> 20).toMap)
   }
 
-  // Scale reduced from 10 writers + 10 readers to 5 + 3.
-  // The original created a thundering herd: every writer commit woke ALL
-  // readers (same retryMap footprint), yielding O(writers * readers) = 100
-  // futile retry cycles that serialise on global scheduler semaphores.
-  // Under resource-constrained CI runners this exceeded the timeout.
+  // Scale reduced from 10 writers + 10 readers to 5 + 3. Every reader parks on
+  // the SAME counter, so every writer's commit sweep wakes all of them, and each
+  // wake re-runs a whole transaction body that mostly re-parks: O(writers *
+  // readers) futile cycles, all funnelling through the global scheduler
+  // semaphores. On a resource-constrained CI runner that exceeded the timeout.
+  //
+  // The waste is inherent to the workload, not to the retry map. (The map used to
+  // be keyed by FOOTPRINT, which chained wakes between unrelated transactions
+  // that merely shared one; the H1 fix re-keyed it by TxnId, which removed that
+  // amplification. What is left here is the real thing: five readers genuinely
+  // waiting on one counter.)
   "waitFor under contention" in {
-    STM
-      .runtime[IO]
-      .flatMap { implicit stm =>
-        for {
-          counter     <- TxnVar.of(0)
-          writerFiber <- (1 to 5).toList.traverse_(_ => counter.modify(_ + 1).commit).start
-          readers     <- (1 to 3).toList.parTraverse(_ => readWaitFor(counter, 5).commit)
-          _           <- writerFiber.joinWithNever
-          result      <- counter.get.commit
-        } yield (result, readers)
-      }
-      .timeout(60.seconds)
-      .asserting { case (finalValue, readerResults) =>
-        finalValue shouldBe 5
-        readerResults shouldBe List.fill(3)(5)
-      }
+    withRuntime(60.seconds) { implicit stm =>
+      for {
+        counter     <- TxnVar.of(0)
+        writerFiber <- (1 to 5).toList.traverse_(_ => counter.modify(_ + 1).commit).start
+        readers     <- (1 to 3).toList.parTraverse(_ => readWaitFor(counter, 5).commit)
+        _           <- writerFiber.joinWithNever
+        result      <- counter.get.commit
+      } yield (result, readers)
+    }.asserting { case (finalValue, readerResults) =>
+      finalValue shouldBe 5
+      readerResults shouldBe List.fill(3)(5)
+    }
   }
 }

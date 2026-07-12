@@ -48,14 +48,9 @@ private[stm] trait TxnLogContext[F[_]] {
     // The commitLock this entry must hold to publish, PAIRED WITH THE RUNTIME
     // ID OF THE ENTITY THAT OWNS IT. Read-only entries hold no lock at all.
     //
-    // The owner id is not decoration: it is what withLock sorts on, and it has
-    // to travel WITH the lock because it cannot be recovered from the log key.
-    // A map entry whose key does not yet exist is LOGGED under the existential
-    // id hashed from (mapId, key) but LOCKS the map's structural commitLock —
-    // two unrelated id spaces (see TxnLogUpdateVarMapEntry.lock). Sorting log
-    // entries would therefore order the acquisitions by a hash of the KEY while
-    // the locks acquired belong to the MAPS. That was H2: a circular wait
-    // between two transactions the scheduler had (correctly) judged compatible.
+    // The owner id has to travel WITH the lock because it cannot be recovered
+    // from the log key, and it is what withLock sorts on — the H2 fix, argued in
+    // full there.
     private[stm] def lock: F[Option[(TxnVarRuntimeId, Semaphore[F])]]
 
     private[stm] def idFootprint: F[IdFootprint]
@@ -326,10 +321,10 @@ private[stm] trait TxnLogContext[F[_]] {
     override private[stm] lazy val hasChangedSinceRead: F[Boolean] =
       isDirty
 
-    // The map-lock fallback, and the reason the owner id has to be carried:
-    // a key that does not yet exist has no TxnVar, so this entry locks the
-    // MAP's structural commitLock while being logged under the existential id
-    // hashed from (mapId, key). Owner and log key are different entities.
+    // The map-lock fallback: a key that does not yet exist has no TxnVar, so this
+    // entry locks the MAP's structural commitLock while being logged under the
+    // existential id hashed from (mapId, key). Owner and log key are different
+    // entities — the id-space split withLock's ordering turns on.
     override private[stm] lazy val lock: F[Option[(TxnVarRuntimeId, Semaphore[F])]] =
       for {
         oTxnVar <- txnVarMap.getTxnVar(key)
@@ -438,7 +433,10 @@ private[stm] trait TxnLogContext[F[_]] {
     private def getLogEntry[V](rId: TxnVarRuntimeId): F[Option[TxnLogEntry[V]]] =
       Async[F].delay(log.get(rId).map(_.asInstanceOf[TxnLogEntry[V]]))
 
-    @nowarn // Type erasure: V in (TxnLog, V) cannot be verified at runtime
+    // @nowarn: the error branch has no V to hand back — the log is now a
+    // TxnLogError and the fold is running only to reach a handleError — so it
+    // returns ().asInstanceOf[V], which Scala 2.13 flags as a dubious Unit cast.
+    @nowarn
     override private[stm] def delay[V](
       value: F[V]
     ): F[(TxnLog, V)] =
@@ -1078,6 +1076,22 @@ private[stm] trait TxnLogContext[F[_]] {
     override private[stm] def scheduleRetry: F[TxnLog] =
       throw TxnRetryException(this)
 
+    // A hand-rolled short-circuiting existsM: the first entry to find itself
+    // dirty completes the Deferred, and the caller returns on that rather than
+    // waiting out the parTraverse. It computes exactly `exists(_.isDirty)` — the
+    // Deferred is first-wins, and the fold at the end publishes false only if no
+    // entry raised.
+    //
+    // The early return buys nothing, though, and this is worth knowing before
+    // copying the pattern. Every entry's isDirty is a single Ref read against
+    // live state, and read-only entries do not even do that (they hardcode
+    // false), so there is no slow check here to escape — while the fiber, the
+    // Deferred and the cancel/join are all real cost. That is why
+    // anyReadChangedSinceRead below, which is the same walk over the same log,
+    // is a plain parTraverse instead. The machinery is vestigial rather than
+    // load-bearing; it is left alone because it sits on the commit path under the
+    // locks, where a rewrite deserves its own measurement rather than a
+    // confident guess (see benchmarks/README.md on that point).
     override private[stm] lazy val isDirty: F[Boolean] = {
       def setDeferred(container: Deferred[F, Boolean]): F[Unit] = {
         for {
@@ -1106,7 +1120,8 @@ private[stm] trait TxnLogContext[F[_]] {
     // The park path's read-inclusive staleness check (H1 fix): TRUE iff any
     // entry — read-only entries included — no longer matches the live value
     // it was built from. Contrast isDirty, which validates the write set
-    // only. Logs are small; no short-circuit machinery needed.
+    // only. Same walk, no short-circuit machinery: see isDirty above for why
+    // that machinery would not pay for itself here either.
     private[stm] lazy val anyReadChangedSinceRead: F[Boolean] =
       log.values.toList
         .parTraverse(_.hasChangedSinceRead)
@@ -1125,12 +1140,11 @@ private[stm] trait TxnLogContext[F[_]] {
     // coverage check forces it on EVERY commit, and a whole-map read expands
     // into a log entry per key, so the fiber count tracked the map size.
     //
-    // Measured (benchmarks/StmThroughputBench, on dedicated hardware): the
-    // whole-map-read + insert workload goes 566 -> 676 ops/s, +19%, which turns
-    // the H6 fix's cost on that workload from -21% into -6%. Everything else is
-    // unchanged within noise. See the benchmark's header for why the hardware
-    // matters: the first attempt at this measurement was taken on a thermally
-    // throttling laptop and said the exact opposite.
+    // The switch was measured on dedicated hardware and it is worth real
+    // percentage points on the whole-map-read workload; benchmarks/README.md
+    // carries the figures, and its header explains why the hardware matters —
+    // the first attempt at this measurement ran on a thermally throttling laptop
+    // and reported the exact opposite.
     override private[stm] lazy val idFootprint: F[IdFootprint] =
       log.values.toList
         .traverse { entry =>

@@ -109,11 +109,12 @@ jobs:
             ALLOW_DEADLOCK
 
       # --- Commit protocol (Spec A) ---
-      # H2 and H3 are both FIXED; every config below is expected clean. The
-      # negative controls that keep these verdicts honest (reverting each fix
-      # must reproduce its counterexample) are documented in specs/README.md
-      # and run manually — a green run here means the fix works, not that the
-      # model stopped looking.
+      # H2, H3 and H6 are all FIXED; every config below is expected clean. What
+      # keeps a green run here from being worthless is the negative-control table
+      # in specs/README.md: reverting each fix must reproduce its counterexample.
+      # Those are run by hand, and NC-8 is worth knowing about before you trust
+      # this job — deleting the commit-time dirty check outright changes no
+      # verdict in any of the seven.
 
       - name: Check commit protocol — H2 lock ordering (expected clean since the H2 fix)
         run: |

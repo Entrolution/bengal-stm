@@ -44,32 +44,26 @@ import bengal.stm.syntax.all._
   *     against the declared one, aborting and re-running on divergence. A fold over the log entries added to the happy
   *     path, plus new re-executions.
   *
-  * These exist to answer that before v0.14.0, and they are only meaningful as a COMPARISON. An absolute ops/sec here
-  * says very little; the RATIO between two revisions is the whole point. Every fix in the workstream was
-  * `private[stm]`, so the same benchmark compiles unchanged against an older library:
+  * These exist to answer that, and they are only meaningful as a COMPARISON. An absolute ops/sec here says very little;
+  * the RATIO between two revisions is the whole point. Every fix in the workstream was `private[stm]`, so the same
+  * benchmark compiles unchanged against an older library. These are the flags the published table was measured with:
   *
   * {{{
-  *   sbt 'benchmarks/Jmh/run -f1 -wi 3 -i 5 .*StmThroughputBench.*'   # after
+  *   sbt 'benchmarks/Jmh/run -f1 -wi 8 -i 12 .*StmThroughputBench.*'   # after
   *   git checkout <old-rev> -- src/main/scala && sbt clean
-  *   sbt 'benchmarks/Jmh/run -f1 -wi 3 -i 5 .*StmThroughputBench.*'   # before
+  *   sbt 'benchmarks/Jmh/run -f1 -wi 8 -i 12 .*StmThroughputBench.*'   # before
   *   git checkout HEAD -- src/main/scala
   * }}}
   *
   * ===========================================================================
-  * DO NOT RUN THESE ON A LAPTOP. See benchmarks/README.md.
+  * DO NOT RUN THESE ON A LAPTOP -- thermal throttling swung IDENTICAL runs by 2.3x and inverted two conclusions here.
+  * Read benchmarks/README.md before trusting any number this produces.
   * ===========================================================================
-  * The first attempt at this measurement was taken on a MacBook and was ENTIRELY WRONG. It reported a 27% regression on
-  * the uncontended path, and said a candidate optimisation made things WORSE across the board. Both were artifacts of
-  * thermal throttling: re-running IDENTICAL code twenty minutes later scored 16,400 -> 7,236 ops/s. A 2.3x swing from
-  * machine state alone, larger than any effect being measured.
+  * Run A -> B -> A, and check that the two A runs AGREE before looking at the result at all.
   *
-  * So run A -> B -> A, and check whether the two A runs AGREE before looking at the result at all. A dedicated box
-  * (vast.ai, about $0.07/hr) drifts under 7% between identical runs; the laptop drifted 130%. The instrument gets
-  * verified before its output means anything -- the same discipline the TLA+ negative controls and the soak's
-  * fix-reversion checks apply everywhere else in this project.
-  *
-  * `@OperationsPerInvocation(Batch)` makes JMH report per-TRANSACTION throughput rather than per-batch, so every
-  * benchmark below is directly comparable with every other.
+  * `@OperationsPerInvocation(32)` makes JMH report per-TRANSACTION rather than per-batch throughput on the six batched
+  * benchmarks, so all seven are directly comparable -- `uncontendedCommit` runs one transaction per invocation and
+  * needs no annotation. The `32` is a literal and `Batch` is a separate `final val`: they must track each other.
   */
 @State(Scope.Benchmark)
 @BenchmarkMode(Array(Mode.Throughput))

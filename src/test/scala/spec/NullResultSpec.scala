@@ -17,8 +17,6 @@
 package ai.entrolution
 package spec
 
-import scala.concurrent.duration._
-
 import cats.effect.IO
 import cats.effect.testing.scalatest.AsyncIOSpec
 import org.scalatest.freespec.AsyncFreeSpec
@@ -48,28 +46,25 @@ import bengal.stm.syntax.all._
   * yields `Some` (of a possibly-null value) and `None` on that path can only ever mean "refine". Reverting it turns
   * both tests below red — the first hangs to its timeout, the second reports an inflated lap count.
   */
-class NullResultSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
+class NullResultSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers with StmSuite {
 
   "a transaction that yields null" - {
 
     "commits exactly once and returns the null, rather than retrying forever" in {
-      STM
-        .runtime[IO]
-        .flatMap { implicit stm =>
-          for {
-            // Counts publishes: every lap of the retry loop re-applies this.
-            laps <- TxnVar.of(0)
-            result <- (for {
-                        n <- laps.get
-                        _ <- laps.set(n + 1)
-                        s <- STM[IO].delay[String](null)
-                      } yield s).commit
-            published <- laps.get.commit
-          } yield (result, published)
-        }
+      withRuntime { implicit stm =>
+        for {
+          // Counts publishes: every lap of the retry loop re-applies this.
+          laps <- TxnVar.of(0)
+          result <- (for {
+                      n <- laps.get
+                      _ <- laps.set(n + 1)
+                      s <- STM[IO].delay[String](null)
+                    } yield s).commit
+          published <- laps.get.commit
+        } yield (result, published)
+      }
         // The pre-fix failure is an UNBOUNDED retry loop, so there is nothing to
-        // assert against — it never returns. The timeout is the assertion.
-        .timeout(30.seconds)
+        // assert against — it never returns. StmSuite's timeout is the assertion.
         .asserting { case (result, published) =>
           result shouldBe null
           published shouldBe 1
@@ -77,16 +72,12 @@ class NullResultSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
     }
 
     "a null read back out of a TxnVar is returned unchanged" in {
-      STM
-        .runtime[IO]
-        .flatMap { implicit stm =>
-          for {
-            tVar   <- TxnVar.of[IO, String](null)
-            result <- tVar.get.commit
-          } yield result
-        }
-        .timeout(30.seconds)
-        .asserting(_ shouldBe null)
+      withRuntime { implicit stm =>
+        for {
+          tVar   <- TxnVar.of[IO, String](null)
+          result <- tVar.get.commit
+        } yield result
+      }.asserting(_ shouldBe null)
     }
   }
 }

@@ -45,16 +45,20 @@ import bengal.stm.syntax.all._
   * once. That drives the whole machine — `TxnResultRetry`, `submitTxnForRetry`'s two park-time checks, the retry map,
   * `checkRetryQueue`'s wake sweeps, and the fresh incarnation each wake builds.
   *
-  * THREE THINGS ARE CHECKED, and they are different kinds of thing:
+  * THREE THINGS ARE CHECKED, and they are different kinds of thing. Read the qualifications: two of the three are GROSS
+  * failure detectors, and the section below says what they cannot see.
   *
   *   1. LIVENESS. Every transaction completes. A lost wakeup does not corrupt anything — it HANGS — so the failure mode
-  *      is a timeout, not an assertion. This is the H1 class.
+  *      is a timeout, not an assertion. This catches a wake path that is BROKEN (nothing sweeps, nothing fires, the
+  *      predicate is never re-checked). It does NOT catch H1, whose window a running program essentially never lands in.
   *   2. CORRECTNESS. Every item produced is consumed exactly once. A lost update or a double-take would break the
-  *      multiset equality, and no amount of parking should be able to.
+  *      multiset equality, and no amount of parking should be able to. This one is a real assertion and it holds
+  *      unconditionally.
   *   3. BOUNDEDNESS. How many times does each transaction body actually run? Parking is EXPECTED here, so unlike the
   *      serializability soak the floor is not 2 — a producer legitimately re-runs each time it is woken. What must not
-  *      happen is unbounded churn, which is what the spurious-wake spin was. The distribution is reported and the
-  *      maximum is bounded, so a spin is a red test rather than a slow one.
+  *      happen is unbounded churn. The distribution is reported and the maximum is bounded, so a RUNAWAY spin is a red
+  *      test rather than a slow one — but the spurious self-wake spin itself needs adversarial scheduling to diverge,
+  *      and under a real scheduler it does not.
   *
   * ===========================================================================
   * WHAT THIS SUITE CANNOT DO, MEASURED RATHER THAN ASSUMED
@@ -93,9 +97,7 @@ class RetrySoakSpec extends AnyFreeSpec with Matchers {
   // single one has been taken. If a single wakeup is lost, it never ends.
   private val Total = Producers * PerProducer
 
-  /** Generous, because parking is expected and a woken transaction legitimately re-runs. This exists to catch a SPIN —
-    * unbounded churn — not to pin a tight number.
-    */
+  /** This exists to catch a SPIN — unbounded churn — not to pin a tight number. */
   private val MaxBodyRuns = 400
 
   private case class Outcome(consumed: List[Long], execs: Vector[Int])
@@ -157,8 +159,6 @@ class RetrySoakSpec extends AnyFreeSpec with Matchers {
           } yield got.collect { case l: Long => l }
         }
       }
-      // A LOST WAKEUP HANGS. There is nothing to assert against — the parked
-      // transaction simply never runs again — so the timeout IS the assertion.
       .timeout(90.seconds)
       .unsafeRunSync()
       .pipe(consumed => Outcome(consumed, (0 until 2 * Total).map(execs.get).toVector))
@@ -170,10 +170,6 @@ class RetrySoakSpec extends AnyFreeSpec with Matchers {
 
   "producer/consumer under a bounded buffer" - {
 
-    /* A lost wakeup does not corrupt anything, it HANGS, so the timeout is the
-     * assertion here rather than any `shouldBe`. Note the honest limit recorded
-     * in the class comment: this catches a GROSS wake failure, not H1 itself.
-     */
     "every transaction completes, and every item is consumed exactly once" in {
       val rounds   = 8
       val allExecs = Vector.newBuilder[Int]
@@ -195,12 +191,7 @@ class RetrySoakSpec extends AnyFreeSpec with Matchers {
       val mean  = execs.sum.toDouble / execs.size
       val max   = execs.max
 
-      // Parking is EXPECTED here, so the floor is not 2: a woken transaction
-      // legitimately re-runs. What is being watched for is unbounded churn.
-      info(
-        f"body executions across $rounds rounds: mean $mean%.1f, max $max " +
-          "(parking is expected — a woken transaction re-runs, so this is well above the uncontended floor of 2)"
-      )
+      info(f"body executions across $rounds rounds: mean $mean%.1f, max $max")
 
       withClue(
         s"a transaction body ran $max times. Parking accounts for a lot of that, but not this much — suspect a " +

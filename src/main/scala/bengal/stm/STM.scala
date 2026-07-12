@@ -30,11 +30,17 @@ import bengal.stm.runtime.{ TxnCompilerContext, TxnLogContext, TxnRuntimeContext
 /** Software Transactional Memory runtime for Cats Effect.
   *
   * STM provides composable in-memory transactions with automatic concurrency management including locking, retries,
-  * semantic blocking, and intelligent scheduling. Create a runtime via [[STM.runtime]] and use the implicit syntax
-  * classes to build and commit transactions.
+  * semantic blocking, and intelligent scheduling. Create a runtime via [[STM.runtime]].
+  *
+  * BOTH IMPORTS ARE REQUIRED. An implicit `STM[F]` in scope does not on its own make `.get`/`.set`/`.modify`/`.commit`
+  * available — a member of an implicit value is not an implicit-conversion candidate, so the syntax has to be imported.
+  * Omitting it gives a confusing error rather than a missing-import one: the runtime's own `private[stm]` members
+  * shadow the extension methods, so `counter.get` reports "cannot be accessed" instead of "not a member".
   *
   * {{{
-  * import bengal.stm.model.TxnVar
+  * import ai.entrolution.bengal.stm.STM
+  * import ai.entrolution.bengal.stm.model.TxnVar
+  * import ai.entrolution.bengal.stm.syntax.all._
   *
   * STM.runtime[IO].flatMap { implicit stm =>
   *   for {
@@ -44,6 +50,12 @@ import bengal.stm.runtime.{ TxnCompilerContext, TxnLogContext, TxnRuntimeContext
   *   } yield value
   * }
   * }}}
+  *
+  * A transaction runs TWICE per commit attempt: once in a static-analysis pass that computes its footprint (the
+  * variables and keys it touches), and once for real. The scheduler uses the footprint to run only transactions that
+  * cannot conflict. Two consequences reach callers, and the README covers both: `delay`/`fromF` thunks are evaluated in
+  * both passes, so they must not carry side effects; and a transaction whose analysis pass THROWS gets an
+  * under-approximated footprint, which conflicts with everything and therefore runs alone.
   *
   * @tparam F
   *   the effect type (must have an `Async` instance)
@@ -63,7 +75,9 @@ abstract class STM[F[_]: Async]
   def allocateTxnVarMap[K, V](valueMap: Map[K, V]): F[TxnVarMap[F, K, V]]
   private[stm] def commitTxn[V](txn: Txn[V]): F[V]
 
-  /** Provides transaction operations on `TxnVar` instances. Automatically available when an `STM[F]` is implicit. */
+  /** Transaction operations on `TxnVar`. Requires `import ai.entrolution.bengal.stm.syntax.all._` (or `import stm._`) —
+    * an implicit `STM[F]` alone does not bring these into scope.
+    */
   implicit class TxnVarOps[V](txnVar: TxnVar[F, V]) {
 
     /** Retrieves the current value within a transaction. */
@@ -79,7 +93,9 @@ abstract class STM[F[_]: Async]
       modifyTxnVar(f, txnVar)
   }
 
-  /** Provides transaction operations on `TxnVarMap` instances. Automatically available when an `STM[F]` is implicit. */
+  /** Transaction operations on `TxnVarMap`. Requires `import ai.entrolution.bengal.stm.syntax.all._` (or
+    * `import stm._`) — an implicit `STM[F]` alone does not bring these into scope.
+    */
   implicit class TxnVarMapOps[K, V](txnVarMap: TxnVarMap[F, K, V]) {
 
     /** Retrieves an immutable snapshot of the entire map. Prefer per-key access for performance. */
@@ -94,7 +110,9 @@ abstract class STM[F[_]: Async]
     def modify(f: Map[K, V] => Map[K, V]): Txn[Unit] =
       modifyTxnVarMap(f, txnVarMap)
 
-    /** Retrieves the value for a key, returning `None` if the key was deleted in this transaction. */
+    /** Retrieves the value for a key. Returns `None` when the key does not exist — whether it was never created, or was
+      * deleted earlier in this transaction. It does not fail.
+      */
     def get(key: => K): Txn[Option[V]] =
       getTxnVarMapValue(key, txnVarMap)
 
@@ -102,11 +120,16 @@ abstract class STM[F[_]: Async]
     def set(key: => K, newValue: => V): Txn[Unit] =
       setTxnVarMapValue(key, newValue, txnVarMap)
 
-    /** Modifies the value for a key by applying a pure function. Throws if the key is absent. */
+    /** Modifies the value for a key by applying a pure function. FAILS THE TRANSACTION if the key is absent: nothing is
+      * thrown at `Txn`-construction time, the resulting `F` from `commit` fails, no writes are published, and it is
+      * recoverable with `handleErrorWith`.
+      */
     def modify(key: => K, f: V => V): Txn[Unit] =
       modifyTxnVarMapValue(key, f, txnVarMap)
 
-    /** Removes a key-value pair from the map. Throws if the key is absent. */
+    /** Removes a key-value pair from the map. FAILS THE TRANSACTION if the key is absent, on the same terms as
+      * `modify(key, f)` above — a failed `F`, not a thrown exception, and recoverable.
+      */
     def remove(key: => K): Txn[Unit] =
       removeTxnVarMapValue(key, txnVarMap)
   }
@@ -118,7 +141,11 @@ abstract class STM[F[_]: Async]
     def commit: F[V] =
       commitTxn(txn)
 
-    /** Recovers from transaction errors/aborts by mapping the throwable to a fallback transaction. */
+    /** Recovers from transaction errors and aborts by mapping the throwable to a fallback transaction.
+      *
+      * It does NOT absorb a `waitFor` retry. A retry is re-raised past this handler by design, so wrapping a blocking
+      * transaction in `handleErrorWith` does not make it stop blocking.
+      */
     def handleErrorWith(f: Throwable => Txn[V]): Txn[V] =
       handleErrorWithInternal(txn)(f)
   }

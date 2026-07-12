@@ -41,10 +41,29 @@ private[stm] trait TxnCompilerContext[F[_]] {
     idFootprint: IdFootprint
   ) extends RuntimeException
 
-  // @nowarn on FunctionK.apply: The compiler cannot verify exhaustive pattern matching
-  // on TxnOrErr[V] (= Either[TxnErratum, TxnAdt[F, V]]) due to type erasure. The match
-  // is exhaustive in practice — all TxnAdt and TxnErratum cases are covered, with a
-  // fallback wildcard for safety.
+  // @nowarn on BOTH FunctionK.apply methods below, and not for exhaustivity:
+  // each match ends in `case _ =>`, so it is exhaustive by construction and no
+  // compiler ever asks. What the annotation suppresses is the free-monad
+  // interpreter's unavoidable Unit casts. A FunctionK must produce a V for every
+  // op, including the ops whose result genuinely is Unit — the setters, the
+  // no-ops, the errata — so those arms hand back ().asInstanceOf[V], and Scala
+  // 2.13 flags every one as a "dubious usage of asInstanceOf with unit value".
+  // Scala 3 instead flags the opposite: the trailing `case _ =>` in
+  // txnLogCompiler's erratum match is UNREACHABLE, TxnRetry and TxnError having
+  // already exhausted TxnErratum. CI compiles both, with warnings fatal.
+  //
+  // The two walkers do not cover the same ground, which matters more than the
+  // annotation does. txnLogCompiler enumerates the errata — TxnRetry schedules a
+  // retry, TxnError raises. staticAnalysisCompiler matches NO erratum: its
+  // `case _ =>` swallows the whole Left side, so the walk carries on past a
+  // retry or an abort that will terminate the real run. That is safe, because a
+  // footprint declares what a transaction MAY touch: walking past a
+  // short-circuit can only OVER-approximate, and over-approximation costs
+  // concurrency rather than soundness (`covers` still holds; the scheduler just
+  // serializes more than it needs to). Under-approximation is the unsound
+  // direction — H3, and the reason TxnRuntime.commit flags it. Where the
+  // continuation cannot cope with the Unit it gets handed back, the walk throws
+  // instead, and that same handler flags the footprint.
   private[stm] def staticAnalysisCompiler: FunctionK[TxnOrErr, IdFootprintStore] =
     new (FunctionK[TxnOrErr, IdFootprintStore]) {
 
@@ -181,6 +200,32 @@ private[stm] trait TxnCompilerContext[F[_]] {
                       Async[F].delay((s.markUnderApproximated, ()))
                     }
                 }
+              // The FOURTH error-swallowing handler in this walker, and the only
+              // one that neither short-circuits nor flags — so read it against
+              // the three above, which call the flag mandatory.
+              //
+              // On an inner failure this returns `s`, discarding everything the
+              // inner analysis accumulated, a
+              // StaticAnalysisShortCircuitException's partial footprint
+              // included. And adt.f — the RECOVERY branch — is never analysed at
+              // all, though txnLogCompiler folds it at run time. So a recovery
+              // branch's reads and writes reach the real log while being absent
+              // from the declared footprint, and nothing marks the footprint
+              // under-approximated.
+              //
+              // NOT a soundness hole, because H6 catches it downstream:
+              // coversActualFootprint compares the declared footprint against the
+              // actual log under the commit locks and BEFORE the publish, so an
+              // error-recovering transaction that touched undeclared state
+              // refines and re-runs instead of publishing. The undeclared write
+              // never lands and the undeclared read never reaches a caller. What
+              // it costs is a mandatory re-run on every such transaction.
+              //
+              // Flagging it here would be worse, not better: an under-approximated
+              // footprint is incompatible with everything and never refines (see
+              // IdFootprint.isCompatibleWith), so the transaction would be
+              // serialized against all peers for good rather than re-running once
+              // with an accurate footprint.
               case adt: TxnHandleError[_] =>
                 StateT[F, IdFootprint, V] { s =>
                   adt.fa

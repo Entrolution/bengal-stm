@@ -6,11 +6,15 @@
 #
 #   ./specs/check_expected.sh <config.cfg> <module.tla> <InvariantName>
 #       — require TLC to report exactly "Invariant <InvariantName> is
-#         violated". This pins an EXPECTED-RED verdict: the spec documents a
-#         confirmed defect, and CI fails if the counterexample stops
-#         reproducing (e.g. the protocol was fixed) so that the spec, the
-#         verdict table in specs/README.md, and the plan's hypothesis rows
-#         get updated together.
+#         violated". This pins an EXPECTED-RED verdict: the config documents a
+#         defect the protocol still has, and CI fails if the counterexample
+#         stops reproducing (e.g. someone fixed it) so that the spec and the
+#         verdict table in specs/README.md get updated together.
+#
+#   ./specs/check_expected.sh <config.cfg> <module.tla> DEADLOCK
+#       — require TLC to report "Deadlock reached". Same contract as an
+#         expected-red invariant, for defects whose symptom is a dead end
+#         rather than a violated predicate.
 #
 # Run from the repository root. TLC's jar is expected at specs/tla2tools.jar.
 
@@ -19,9 +23,9 @@
 # interpreted below instead. Adding -e would kill every pinned-red check.
 set -uo pipefail
 
-CFG="${1:?usage: check_expected.sh <cfg> <tla> <NONE|InvariantName> [ALLOW_DEADLOCK]}"
-TLA="${2:?usage: check_expected.sh <cfg> <tla> <NONE|InvariantName> [ALLOW_DEADLOCK]}"
-EXPECTED="${3:?usage: check_expected.sh <cfg> <tla> <NONE|InvariantName> [ALLOW_DEADLOCK]}"
+CFG="${1:?usage: check_expected.sh <cfg> <tla> <NONE|InvariantName|DEADLOCK> [ALLOW_DEADLOCK]}"
+TLA="${2:?usage: check_expected.sh <cfg> <tla> <NONE|InvariantName|DEADLOCK> [ALLOW_DEADLOCK]}"
+EXPECTED="${3:?usage: check_expected.sh <cfg> <tla> <NONE|InvariantName|DEADLOCK> [ALLOW_DEADLOCK]}"
 # Optional 4th arg ALLOW_DEADLOCK passes TLC's -deadlock flag (suppresses
 # deadlock detection). Default is detection ON: specs with legitimate
 # terminal states model them as an explicit Terminating stutter, so any
@@ -50,17 +54,25 @@ if [[ "$EXPECTED" == "NONE" ]]; then
   exit 1
 fi
 
-# EXPECTED=DEADLOCK pins a reachable dead-end state (e.g. a transaction
-# parked forever — the H1 class): the spec's Terminating stutter covers
-# legitimate ends, so a reported deadlock is the pinned defect.
+# EXPECTED=DEADLOCK pins a reachable dead-end state. Every spec here models its
+# legitimate terminals as an explicit Terminating stutter, so a reported
+# deadlock is a real one.
+#
+# The live pin is SchedulerAbsentKey.cfg, and it is a NEGATIVE CONTROL rather
+# than an open defect: it withholds the log entry that anyReadChangedSinceRead
+# folds over — which is what a waitFor on an ABSENT MAP KEY used to do — and the
+# parker sleeps forever. If it ever stops deadlocking, then either the model
+# stopped modelling the unlogged read or the park protocol changed shape, and
+# H1's second guard is no longer under test. H1 itself is fixed; the pin for the
+# fix is SchedulerRetry.cfg, which must stay CLEAN.
 if [[ "$EXPECTED" == "DEADLOCK" ]]; then
   if grep -q "Deadlock reached" "$OUT"; then
     echo "OK: $TLA ($CFG) — reproduced the pinned deadlock."
     exit 0
   fi
   echo "UNEXPECTED: $TLA ($CFG) did not reproduce the pinned deadlock (exit $TLC_EXIT)." >&2
-  echo "If the protocol was fixed, update the verdict table in specs/README.md," >&2
-  echo "the hypothesis rows in docs/plans/formal-specs.md, and this CI expectation." >&2
+  echo "If the protocol changed, update specs/README.md's verdict table and this CI" >&2
+  echo "expectation together — those two are the only places a verdict is recorded." >&2
   tail -40 "$OUT" >&2
   exit 1
 fi
@@ -71,7 +83,7 @@ if grep -q "Invariant $EXPECTED is violated" "$OUT"; then
 fi
 
 echo "UNEXPECTED: $TLA ($CFG) did not reproduce the pinned $EXPECTED violation (exit $TLC_EXIT)." >&2
-echo "If the protocol was fixed, update the verdict table in specs/README.md," >&2
-echo "the hypothesis rows in docs/plans/formal-specs.md, and this CI expectation." >&2
+echo "If the protocol changed, update specs/README.md's verdict table and this CI" >&2
+echo "expectation together — those two are the only places a verdict is recorded." >&2
 tail -40 "$OUT" >&2
 exit 1

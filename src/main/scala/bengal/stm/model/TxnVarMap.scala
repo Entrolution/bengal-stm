@@ -74,9 +74,31 @@ case class TxnVarMap[F[_]: STM: Async, K, V](
                 }
     } yield result
 
+  // EXISTENTIAL because it does not need the key to exist. Hashed from
+  // (mapId, key) rather than taken from a TxnVar, it names a slot that may hold
+  // nothing at all — which is the only reason an ABSENT-key read is visible to
+  // the scheduler. Reading a missing key is still a read: it observes that the
+  // key is missing, and a transaction that inserts it must conflict with the
+  // reader. Without a stable id for the absent slot there would be nothing to
+  // declare and nothing to compare, and every waitFor on a key-not-yet-created
+  // would be invisible to the conflict relation.
+  //
+  // It is also a SECOND ID SPACE, and that has bitten twice. This id is what the
+  // entry is LOGGED under, but an absent key has no TxnVar, so the entry LOCKS
+  // the map's structural lock instead — owner and log key are different
+  // entities, which is H2 (see TxnLogContext.withLock). And an absent-key read
+  // sat in the declared footprint while recording no log entry at all, which is
+  // the absent-key lost wakeup: Contract C and the wake sweeps could see the
+  // read, and the park-time staleness check — which walks the LOG — could not.
   private def getRuntimeExistentialId(key: K): TxnVarRuntimeId =
     TxnVarRuntimeId(UUID.nameUUIDFromBytes((id, key).toString.getBytes).hashCode())
 
+  // The parent link, and the whole of the id hierarchy the conflict relation
+  // reasons over: an entry's id carries the MAP's id as its parent. That is what
+  // lets IdFootprint conflict a whole-map read against a write to any single key
+  // (its third conjunct, the H5 fix) and lets a declared map-level id COVER the
+  // per-key ids a whole-map read expands into at run time (its coverage check,
+  // the H6 fix). Both tests are one hop; see TxnVarRuntimeId.
   private[stm] def getRuntimeId(
     key: K
   ): F[TxnVarRuntimeId] =

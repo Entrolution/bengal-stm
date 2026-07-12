@@ -62,7 +62,15 @@ lazy val bengalStm = (project in file("."))
   .settings(
     commonSettings,
     name := "bengal-stm",
-    libraryDependencies ++= Dependencies.bengalStm
+    libraryDependencies ++= Dependencies.bengalStm,
+    // src/test/scala/usercode is deliberately outside `ai.entrolution`, so that the
+    // public API is compiled from a user's vantage point (see PublicApiSpec -- the
+    // README's imports were broken for everyone but us, and no in-package test could
+    // see it). sbt's default layering caches project classes in a SEPARATE class
+    // loader from the test classes, and `STM[F]` extends `private[stm]` traits, which
+    // the JVM enforces per-loader -- so a test outside the package fails to link.
+    // A real user gets one flat classpath from the published jar and never hits this.
+    Test / classLoaderLayeringStrategy := ClassLoaderLayeringStrategy.Flat
   )
 
 // Throughput benchmarks. Deliberately NOT aggregated into the root project, so
