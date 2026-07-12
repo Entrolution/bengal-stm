@@ -88,9 +88,10 @@ class RetrySoakSpec extends AnyFreeSpec with Matchers {
 
   private val Capacity    = 4
   private val Producers   = 12
-  private val Consumers   = 8
   private val PerProducer = 6
-  private val Total       = Producers * PerProducer
+  // One consuming transaction per produced item, so the run only ends when every
+  // single one has been taken. If a single wakeup is lost, it never ends.
+  private val Total = Producers * PerProducer
 
   /** Generous, because parking is expected and a woken transaction legitimately re-runs. This exists to catch a SPIN —
     * unbounded churn — not to pin a tight number.
