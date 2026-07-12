@@ -1089,12 +1089,18 @@ private[stm] trait TxnLogContext[F[_]] {
         .parTraverse(_.hasChangedSinceRead)
         .map(_.exists(identity))
 
+    // foldLeft from empty, NOT reduce: an EMPTY log is perfectly ordinary — a
+    // transaction of pure/delay steps touches nothing, and reading an absent map
+    // key records no entry at all — and `reduce` throws on an empty list. The
+    // bug was latent while this was only forced on the dirty path (where the log
+    // is non-empty by construction); the H6 coverage check forces it on every
+    // commit, which is what brought it out.
     override private[stm] lazy val idFootprint: F[IdFootprint] =
       log.values.toList
         .parTraverse { entry =>
           entry.idFootprint
         }
-        .map(_.reduce(_ mergeWith _))
+        .map(_.foldLeft(IdFootprint.empty)(_ mergeWith _))
 
     // SPEC: NoWaitsForCycle — the H2 fix. Acquire the write set's commitLocks
     // in ascending order of THE ID OF THE ENTITY THAT OWNS EACH LOCK. Because

@@ -132,8 +132,13 @@ expected to reproduce a **pinned counterexample** (an EXPECTED-RED verdict):
 ./specs/check_expected.sh specs/commit/CommitH3Writer.cfg \
     specs/commit/CommitProtocol.tla NONE
 
-# The one case the fallback IS caught — a pure write-write collision, by the
-# commit locks plus the dirty check. EXPECTED CLEAN.
+# H6 — data-dependent footprint divergence. The declared footprint names the
+# WRONG ids because the walker computed them from a value that changed before
+# the transaction was scheduled. EXPECTED CLEAN since the H6 fix.
+./specs/check_expected.sh specs/commit/CommitH6.cfg \
+    specs/commit/CommitProtocol.tla NONE
+
+# The dirty-refinement path. EXPECTED CLEAN.
 ./specs/check_expected.sh specs/commit/CommitDirty.cfg \
     specs/commit/CommitProtocol.tla NONE
 
@@ -205,6 +210,9 @@ judgement below is **computed** by `common/Footprint.tla`, never hand-assigned.
 | `ContractCHolds` | **HOLDS** on every config — but read it as a *guard pin*, not a verified protocol property: it restates `TxnEnter`'s guard, so it goes red only if a future edit weakens the guard and silently widens the model's concurrency. It is **trivially true in fallback mode**, where the declared footprints are empty and empty is compatible with everything. The property itself is *earned* by Spec B, which checks `ContractC` against the real scheduler | all `commit/` cfgs |
 | `TypeOK`, `LocksHeldConsistent`, `BoundsNeverBind`, `PublishedExactlyOnce` | **HOLD** on every config — model sanity checks, not protocol results. `LocksHeldConsistent` earned its keep: it caught a real model bug (a release path that freed the locks but left the acquired-prefix bookkeeping stale). `PublishedExactlyOnce` is **structurally unfalsifiable here** — `pubCount` increments only in `Publish`, which is the sole exit from `validate` to `release`, and nothing re-enters. The real once-per-incarnation guarantee is Spec B's `NoDoublePublish`, which *can* fail and did, pre-H4-fix | all `commit/` cfgs |
 
+| **H6 — data-dependent footprint divergence** (`CommitSnapshotValid`) | **CONFIRMED and FIXED (2026-07-12).** The hole the H3 fix could not reach. `staticAnalysisCompiler` runs in `TxnRuntime.commit` **before** `submitTxn` — outside `activeTransactions`, outside any Contract-C window — and computes the access set from **live reads**. So a transaction whose keys or targets depend on a value it read can be scheduled on a footprint naming **the wrong ids**: read a key from a var, have a peer change that var in the gap before scheduling, and the run touches an entry nobody declared. **Nothing throws**, so the H3 flag never fires and the scheduler simply trusts it. Same mechanism as H3, same invariant — an inaccurate declared footprint is an inaccurate declared footprint, whether it got that way by throwing or by racing. **FIXED**: a commit-time **coverage check**. Under the locks and *before publishing*, ask whether the declared footprint COVERS what the run actually touched; if not, refine from the actual log and re-run. Checking before the publish is what makes it work in both directions — our undeclared write never lands, so a peer's unvalidated read of it stays valid, and our own undeclared read never reaches a caller | `CommitH6.cfg` (CI, expected clean) |
+| **Coverage is not a subset test** | `IdFootprint.covers` asks whether declaring one footprint excludes at least as much concurrency as declaring another would. A subset test on raw ids would be **unusable**: a whole-map read legitimately expands, in the log, into a read-only entry for *every existing key*, so the actual footprint properly contains ids the walker never named — and a subset test would abort every whole-map read in the library. Those ids *are* covered, because a parent read conflicts with any child write via the relation's third conjunct. Note the asymmetry: a parent **read** covers a child **read**, but only a parent **write** covers a child **write**. `LemmaCoverageIsSound` checks the whole thing exhaustively over every ordered *triple* of footprints — it is proven, not argued | `FootprintLemmas.cfg` |
+
 **The central design fact, now machine-checked.** Removing *only* the Contract C
 guard — accurate footprints, the H5-fixed relation, and every lock and dirty
 check left intact — makes `CommitSnapshotValid` fail (negative control NC-4).
@@ -272,6 +280,8 @@ fixes are pre-validated against the model before a line of Scala moves.
 | # | Break / fix applied | Result |
 |---|---------------------|--------|
 | NC-1 | **Revert the H2 fix**: sort by the **log key** again instead of the lock's owner id | `CommitH2.cfg` goes **red** (`NoWaitsForCycle`) — the model still detects H2, so the post-fix clean verdict means the fix works rather than that the model stopped looking |
+| NC-6 | Remove the commit-time coverage check | `CommitH6.cfg` goes **red** (`CommitSnapshotValid`) — the model still detects H6 |
+| NC-7 | Break `Covers` so a declared write "covers" a **sibling** entry of the same map (H6's exact mechanism) | `LemmaCoverageIsSound` **fails** — the lemma specifically rejects H6, rather than being satisfiable by any plausible-looking definition |
 | NC-5 | Remove `withLock`'s `.distinct` | `CommitH2.cfg` **deadlocks** — `dbl`'s two fresh keys in one map alias to that map's single lock, and taking a 1-permit `Semaphore` twice self-deadlocks. Pins the dedup, which the H2 fix changed |
 | NC-2 | **Revert the H3 fix**: drop the `~f.under /\ ~g.under` clause from `IsCompatible` | All three H3 configs go **red** again (`CommitSnapshotValid`) — the model still detects H3, so the post-fix clean verdicts mean the fix works rather than that the model stopped looking. This control also predicted, *before the fix existed*, that it would make `CommitDirty`'s refinement path unreachable, which is why that config was rebuilt around `ddw` |
 | NC-3 | Remove the relation's **third conjunct** (the pre-H5-fix relation) | `CommitAccurate.cfg` goes **red** (`CommitSnapshotValid`) — the H5 fix is load-bearing here, confirmed from the commit-protocol side |

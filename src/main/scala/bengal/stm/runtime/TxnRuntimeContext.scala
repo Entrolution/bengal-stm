@@ -388,6 +388,34 @@ private[stm] trait TxnRuntimeContext[F[_]] {
             Async[F].delay((TxnLogError(ex), None))
         }
 
+    // SPEC: CommitSnapshotValid — the H6 fix. The scheduler placed this
+    // transaction using its DECLARED footprint, computed by the static-analysis
+    // walker BEFORE submitTxn — outside activeTransactions, outside any
+    // Contract-C window, and from LIVE reads. A transaction whose access set
+    // depends on a value it read can therefore be scheduled on a footprint that
+    // names the WRONG IDS: read a key from a var, have another transaction
+    // change that var in the gap before this one is scheduled, and the real run
+    // touches an entry nobody declared. Nothing throws, so the H3 flag never
+    // fires and the scheduler simply trusts a footprint that does not describe
+    // the transaction.
+    //
+    // So, under the locks and BEFORE publishing, ask whether the declared
+    // footprint COVERS what the run actually touched. If it does, Contract C on
+    // the declared footprint implies Contract C on the actual one and the
+    // scheduling was sound. If it does not, refine from the actual log and
+    // re-run — the same road the dirty path takes.
+    //
+    // Checking BEFORE the publish is what makes this work in both directions:
+    // our undeclared write never lands, so a peer's unvalidated read of it stays
+    // valid; and our own undeclared read never reaches a caller.
+    private def coversActualFootprint(actual: IdFootprint): Boolean =
+      // An under-approximated footprint is incompatible with everything (the H3
+      // fix), so this transaction ran ALONE. Nothing could change under it and
+      // its reads are valid whatever it touched, so coverage is meaningless
+      // here — and checking it would send every such transaction round again for
+      // no gain, since a partial footprint covers nothing by construction.
+      idFootprint.isUnderApproximated || idFootprint.covers(actual.getValidated)
+
     // SPEC: NoDoublePublish — log.commit below publishes the write set; a
     // second concurrent execute fiber for the same txn re-runs the whole
     // pipeline and publishes again (Scheduler.tla checks once-per-incarnation).
@@ -400,10 +428,18 @@ private[stm] trait TxnRuntimeContext[F[_]] {
                       Async[F]
                         .uncancelable { _ =>
                           log.withLock {
-                            Async[F].ifM[Option[V]](log.isDirty)(
-                              Async[F].delay(None),
-                              log.commit.as(logValue)
-                            )
+                            for {
+                              actual <- log.idFootprint
+                              sound  <- Async[F].delay(coversActualFootprint(actual))
+                              // An unsound placement is treated exactly like a
+                              // dirty log: release, refine, re-run. isDirty is
+                              // skipped when we already know we must refine.
+                              refine <- if (sound) log.isDirty else Async[F].pure(true)
+                              result <- Async[F].ifM[Option[V]](Async[F].pure(refine))(
+                                          Async[F].delay(None),
+                                          log.commit.as(logValue)
+                                        )
+                            } yield result
                           }
                         }
                         .flatMap { s =>
@@ -418,18 +454,29 @@ private[stm] trait TxnRuntimeContext[F[_]] {
                               )
                           )
                         }
+                    // The park path needs the same coverage check. A parked
+                    // transaction's DECLARED footprint is what the retry map
+                    // wakes it on (checkRetryQueue compares against it), so a
+                    // transaction that parks on a footprint not covering its
+                    // real reads can be left asleep by a conflictor the
+                    // scheduler never matched it against. Refine and re-run
+                    // instead, and it parks with a footprint that describes it.
                     case retry @ TxnLogRetry(_) =>
                       Async[F].uncancelable { _ =>
                         retry.validLog.withLock {
-                          Async[F].ifM[TxnResult](log.isDirty)(
-                            retry.validLog.idFootprint.map(footprint =>
-                              TxnResultLogDirty(footprint)
-                                .asInstanceOf[TxnResult]
-                            ),
-                            Async[F].delay(
-                              TxnResultRetry(retry.validLog).asInstanceOf[TxnResult]
-                            )
-                          )
+                          for {
+                            actual <- retry.validLog.idFootprint
+                            sound  <- Async[F].delay(coversActualFootprint(actual))
+                            refine <- if (sound) log.isDirty else Async[F].pure(true)
+                            result <- Async[F].ifM[TxnResult](Async[F].pure(refine))(
+                                        Async[F].delay(
+                                          TxnResultLogDirty(actual).asInstanceOf[TxnResult]
+                                        ),
+                                        Async[F].delay(
+                                          TxnResultRetry(retry.validLog).asInstanceOf[TxnResult]
+                                        )
+                                      )
+                          } yield result
                         }
                       }
                     case err @ TxnLogError(_) =>
