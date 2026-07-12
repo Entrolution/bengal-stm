@@ -648,9 +648,32 @@ private[stm] trait TxnLogContext[F[_]] {
                                             case Some(entry) =>
                                               Async[F].delay((this, entry.get))
                                             case _ =>
-                                              Async[F].delay[
-                                                (TxnLogValid, Option[V])
-                                              ]((this, None))
+                                              // SPEC: NoLostWakeup — an ABSENT key is still a
+                                              // READ, and it has to be logged like any other.
+                                              // anyReadChangedSinceRead folds over log.values,
+                                              // so a read that records no entry is invisible to
+                                              // it — and that fold IS H1's second park guard.
+                                              // Leaving this unlogged parks a waitFor on an
+                                              // absent key forever: the scan misses a conflictor
+                                              // that already left, and the staleness check that
+                                              // exists to catch exactly that case cannot see the
+                                              // read (specs/scheduler/SchedulerAbsentKey.cfg).
+                                              for {
+                                                newEntry <-
+                                                  Async[F].delay(
+                                                    rid -> TxnLogReadOnlyVarMapEntry(
+                                                      materializedKey,
+                                                      None,
+                                                      txnVarMap
+                                                    )
+                                                  )
+                                                newLogRaw <-
+                                                  Async[F].delay(log + newEntry)
+                                                newLog <-
+                                                  Async[F].delay(
+                                                    TxnLogValid(newLogRaw)
+                                                  )
+                                              } yield (newLog, Option.empty[V])
                                           }
                          } yield innerResult
                      }
