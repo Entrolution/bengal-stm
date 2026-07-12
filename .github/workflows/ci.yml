@@ -202,4 +202,5 @@ jobs:
       - name: Submit Dependencies
         uses: scalacenter/sbt-dependency-submission@v2
         with:
+          modules-ignore: bengal-stm-benchmarks_2.13 bengal-stm-benchmarks_3
           configs-ignore: test scala-tool scala-doc-tool test-internal
