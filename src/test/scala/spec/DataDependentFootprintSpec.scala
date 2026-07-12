@@ -103,10 +103,10 @@ class DataDependentFootprintSpec extends AnyFreeSpec with Matchers {
           readerFiber <- reader.commit.start
           _           <- IO.sleep(100.millis) // let the analysis read kv1/kv2 and park
           _           <- (kv1.set("a") >> kv2.set("b")).commit
-          _           <- analysisGate.complete(())  // analysis resumes and declares "c"/"d"
-          _           <- IO.sleep(100.millis)       // let the log run read entry "a" and park
-          _           <- transfer.commit            // slips through: judged compatible with "c"/"d"
-          _           <- readGate.complete(())      // log run resumes and reads entry "b"
+          _           <- analysisGate.complete(()) // analysis resumes and declares "c"/"d"
+          _           <- IO.sleep(100.millis) // let the log run read entry "a" and park
+          _           <- transfer.commit // slips through: judged compatible with "c"/"d"
+          _           <- readGate.complete(()) // log run resumes and reads entry "b"
           _           <- readerFiber.joinWithNever
           result      <- obs.get.commit
         } yield result
@@ -115,7 +115,7 @@ class DataDependentFootprintSpec extends AnyFreeSpec with Matchers {
       .unsafeRunSync()
 
   "H6 regression — a data-dependent footprint cannot expose a torn read" in {
-    val reps = 20
+    val reps     = 20
     val observed = (1 to reps).map(_ => observedSum)
 
     withClue(
