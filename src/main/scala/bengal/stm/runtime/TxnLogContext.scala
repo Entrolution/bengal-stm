@@ -1095,9 +1095,22 @@ private[stm] trait TxnLogContext[F[_]] {
     // bug was latent while this was only forced on the dirty path (where the log
     // is non-empty by construction); the H6 coverage check forces it on every
     // commit, which is what brought it out.
+    // `traverse`, NOT `parTraverse`. Every entry's idFootprint is a pure
+    // computation — a cached runtimeId for a var, a UUID hash for a map entry —
+    // so there is nothing to overlap and a fiber per entry is pure overhead.
+    // That did not matter while this was forced only on the dirty path; the H6
+    // coverage check forces it on EVERY commit, and a whole-map read expands
+    // into a log entry per key, so the fiber count tracked the map size.
+    //
+    // Measured (benchmarks/StmThroughputBench, on dedicated hardware): the
+    // whole-map-read + insert workload goes 566 -> 676 ops/s, +19%, which turns
+    // the H6 fix's cost on that workload from -21% into -6%. Everything else is
+    // unchanged within noise. See the benchmark's header for why the hardware
+    // matters: the first attempt at this measurement was taken on a thermally
+    // throttling laptop and said the exact opposite.
     override private[stm] lazy val idFootprint: F[IdFootprint] =
       log.values.toList
-        .parTraverse { entry =>
+        .traverse { entry =>
           entry.idFootprint
         }
         .map(_.foldLeft(IdFootprint.empty)(_ mergeWith _))

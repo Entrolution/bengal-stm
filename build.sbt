@@ -64,3 +64,18 @@ lazy val bengalStm = (project in file("."))
     name := "bengal-stm",
     libraryDependencies ++= Dependencies.bengalStm
   )
+
+// Throughput benchmarks. Deliberately NOT aggregated into the root project, so
+// `sbt test` and CI never build them; run them explicitly with
+// `sbt benchmarks/Jmh/run`. They exist to answer one question before a release --
+// what did the correctness fixes cost? -- and the answer is only meaningful when
+// measured against a prior revision, which is why the module depends on the
+// library through its PUBLIC api only (every fix in this workstream was
+// private[stm], so the same benchmark compiles against both).
+lazy val benchmarks = (project in file("benchmarks"))
+  .dependsOn(bengalStm)
+  .enablePlugins(JmhPlugin, NoPublishPlugin)
+  .settings(
+    commonSettings,
+    name := "bengal-stm-benchmarks"
+  )
