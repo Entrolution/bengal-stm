@@ -173,7 +173,10 @@ class SerializabilitySoakSpec extends AnyFreeSpec with Matchers {
     // Runs in the static-analysis pass AND in every admitted log run, which is
     // precisely the count we want: how many times does this body really execute?
     val countExecution: Txn[Unit] =
-      STM[IO].delay(execs.incrementAndGet(txnId))
+      STM[IO].delay {
+        execs.incrementAndGet(txnId)
+        () // incrementAndGet returns the new count; -Werror rejects discarding it
+      }
 
     val empty = TxnRecord(txnId, Map.empty, Map.empty)
 
