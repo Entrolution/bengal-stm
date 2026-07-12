@@ -52,8 +52,15 @@ test — a whole-map read legitimately expands into a log entry per key — and
 `LemmaCoverageIsSound` proves the real thing exhaustively over every ordered
 triple of footprints.
 
-**All six hypotheses (H1–H6) are now confirmed and fixed.** Ten TLC expectations,
-all expected-clean; no pinned counterexamples remain.
+H6 is confirmed **behaviourally as well as in the model**, and deterministically:
+`DataDependentFootprintSpec` suspends the analysis pass itself (via `STM[F].fromF`,
+since the walker executes `TxnDelay` thunks), flips the key sources while the
+transaction is not yet in `activeTransactions`, and watches the reader observe a
+**torn** transfer — 20/20 reps pre-fix, 0/20 post-fix.
+
+**All six hypotheses (H1–H6) are now confirmed and fixed**, each at BOTH levels —
+model and shipped code. Ten TLC expectations, all expected-clean; no pinned
+counterexamples remain.
 Two results came out of Spec A besides the verdicts: **the H5 fix is what
 discharges Spec B's atomic-commit abstraction** (§3's refinement obligation),
 and **the commit protocol alone is not serializable** — removing only the
