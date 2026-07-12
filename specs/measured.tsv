@@ -1,0 +1,17 @@
+# Measured state spaces. GENERATED -- do not hand-edit.
+# Regenerate with: ./specs/expectations.sh --measure
+#
+# Only exhaustive (@expect NONE) configs appear. A run that halts on a
+# violation explores a scheduling-dependent prefix and its counts do not
+# reproduce, so pinning them would produce a guard that fails at random.
+#
+# config                                  	generated	distinct	depth
+specs/commit/CommitAccurate.cfg           	31368	11385	48
+specs/commit/CommitDirty.cfg              	187	121	27
+specs/commit/CommitH2.cfg                 	6082	2100	36
+specs/commit/CommitH3.cfg                 	51	45	21
+specs/commit/CommitH3Partial.cfg          	91	69	27
+specs/commit/CommitH3Writer.cfg           	45	41	20
+specs/commit/CommitH6.cfg                 	155	97	25
+specs/scheduler/Scheduler.cfg             	3775555	845687	85
+specs/scheduler/SchedulerRetry.cfg        	22483	7665	61

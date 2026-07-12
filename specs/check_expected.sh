@@ -71,8 +71,10 @@ if [[ "$EXPECTED" == "DEADLOCK" ]]; then
     exit 0
   fi
   echo "UNEXPECTED: $TLA ($CFG) did not reproduce the pinned deadlock (exit $TLC_EXIT)." >&2
-  echo "If the protocol changed, update specs/README.md's verdict table and this CI" >&2
-  echo "expectation together — those two are the only places a verdict is recorded." >&2
+  echo "If the protocol changed, update the config's '\\* @expect' directive and" >&2
+  echo "specs/README.md's verdict table. @expect is the ONLY place the verdict is" >&2
+  echo "declared -- do NOT restate it in the config's prose. specs/expectations.sh" >&2
+  echo "--list rejects that: a restatement is a thing that can rot, and did." >&2
   tail -40 "$OUT" >&2
   exit 1
 fi
@@ -83,7 +85,9 @@ if grep -q "Invariant $EXPECTED is violated" "$OUT"; then
 fi
 
 echo "UNEXPECTED: $TLA ($CFG) did not reproduce the pinned $EXPECTED violation (exit $TLC_EXIT)." >&2
-echo "If the protocol changed, update specs/README.md's verdict table and this CI" >&2
-echo "expectation together — those two are the only places a verdict is recorded." >&2
+echo "If the protocol changed, update the config's '\\* @expect' directive and" >&2
+echo "specs/README.md's verdict table. @expect is the ONLY place the verdict is" >&2
+echo "declared -- do NOT restate it in the config's prose. specs/expectations.sh" >&2
+echo "--list rejects that: a restatement is a thing that can rot, and did." >&2
 tail -40 "$OUT" >&2
 exit 1
