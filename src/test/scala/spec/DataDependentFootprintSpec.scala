@@ -19,8 +19,8 @@ package spec
 
 import scala.concurrent.duration._
 
-import cats.effect.{ Deferred, IO, Ref }
 import cats.effect.unsafe.implicits.global
+import cats.effect.{ Deferred, IO, Ref }
 import cats.syntax.all._
 import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.should.Matchers
