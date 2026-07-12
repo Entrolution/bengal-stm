@@ -17,8 +17,10 @@
 package ai.entrolution
 package soak
 
+import org.scalatest.concurrent.TimeLimits
 import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.should.Matchers
+import org.scalatest.time.SpanSugar._
 
 import soak.History._
 
@@ -31,7 +33,7 @@ import soak.History._
   * This is the same discipline as the TLA+ negative controls: a clean run proves nothing until you have watched the
   * thing go red for the right reason.
   */
-class HistorySpec extends AnyFreeSpec with Matchers {
+class HistorySpec extends AnyFreeSpec with Matchers with TimeLimits {
 
   private val x: Key = VarKey(0)
   private val y: Key = VarKey(1)
@@ -166,12 +168,28 @@ class HistorySpec extends AnyFreeSpec with Matchers {
       )
     }.toList
 
+    // THE ASSERTION IS THAT IT FINISHES, and the timeout is how that is expressed.
+    //
+    // This used to assert `millis < 5000`, which is a measurement of the MACHINE, not of
+    // the algorithm. It passes on an idle box and fails on a loaded one -- it failed during
+    // a `sbt +test` cross-build, where two Scala versions compete for cores, which is
+    // exactly what CONTRIBUTING tells people to run. A test whose verdict depends on what
+    // else is running is a flaky test, and flaky tests get disabled: that is how the two
+    // TxnLogDirtySpec park/wake tests were switched off for four months while they were
+    // faithfully reporting H1.
+    //
+    // What this test exists to show is that cycle detection is tractable at a scale the
+    // permutation oracle cannot touch. The oracle is O(n!) and caps out around four
+    // transactions; 5,000! does not finish before the heat death of the universe. So
+    // COMPLETING AT ALL is the claim, and `failAfter` is a real bound that still catches a
+    // catastrophic regression without pretending to measure complexity with a stopwatch.
     val start = System.nanoTime()
-    check(finalState, txns) shouldBe empty
+    failAfter(60.seconds) {
+      check(finalState, txns) shouldBe empty
+    }
     val millis = (System.nanoTime() - start) / 1000000
 
-    withClue(s"a 5,000-transaction history took ${millis}ms — detection should be near-linear in V+E: ") {
-      millis should be < 5000L
-    }
+    // Reported, not asserted. Useful to a human, and it cannot flake.
+    info(s"cycle detection over a 5,000-transaction history: ${millis}ms")
   }
 }

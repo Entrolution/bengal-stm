@@ -80,4 +80,40 @@ class NullResultSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers with S
       }.asserting(_ shouldBe null)
     }
   }
+
+  "a null value stored in a TxnVarMap" - {
+
+    /* THE SAME ROOT CAUSE AS ABOVE, one layer down, and it lost data silently.
+     *
+     * TxnVarMap.get(key) encodes a live null as Some(null) -- the key EXISTS, its value is
+     * null. But the log's read entry built its `initial` with Option(txnVal), which
+     * collapses null to None, and None in that position means "the key is not there". So
+     * the live map and the transaction log disagreed about a key that had just been set,
+     * and two things followed:
+     *
+     *   1. get(key) reported the key ABSENT, and a whole-map read dropped it entirely
+     *      (extractMap only matches Some(initial)). Setting a null silently lost the key.
+     *   2. hasChangedSinceRead computed Some(null) != None -- PERPETUALLY TRUE -- so the
+     *      park-time staleness guard misfired on every null-valued key.
+     *
+     * The fix is Some(txnVal) rather than Option(txnVal), which makes the log agree with
+     * TxnVarMap.get. For any non-null value Option(v) == Some(v), so nothing else moves.
+     */
+    "is read back, rather than making the key disappear" in {
+      withRuntime { implicit stm =>
+        for {
+          map <- TxnVarMap.of[IO, String, String](Map.empty)
+          _   <- map.set("k", null: String).commit
+          one <- map.get("k").commit
+          all <- map.get.commit
+        } yield (one, all)
+      }
+        .asserting { case (one, all) =>
+          // The key EXISTS. Its value happens to be null.
+          one shouldBe Some(null)
+          // ...and a whole-map read must not quietly drop it.
+          all shouldBe Map("k" -> null)
+        }
+    }
+  }
 }

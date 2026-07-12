@@ -433,6 +433,37 @@ private[stm] trait TxnLogContext[F[_]] {
     private def getLogEntry[V](rId: TxnVarRuntimeId): F[Option[TxnLogEntry[V]]] =
       Async[F].delay(log.get(rId).map(_.asInstanceOf[TxnLogEntry[V]]))
 
+    // THE one answer to: which id does this map key's log entry live under, is there a
+    // live TxnVar behind it, and is it already in the log?
+    //
+    // TWO UNRELATED ID SPACES, and every keyed operation has to choose between them
+    // identically. A key that EXISTS has a TxnVar, and its log entry is keyed by that
+    // VAR's own runtimeId. A key that does NOT exist yet has no TxnVar, and its entry is
+    // keyed by the EXISTENTIAL id hashed from (mapId, key) — the same id the static
+    // analysis walker puts in the footprint, which is why the scheduler can protect a read
+    // of a key that is not there. (Which LOCK it takes is a third question again: a new-key
+    // entry locks the MAP's structural commitLock. That was H2.)
+    //
+    // This resolution used to be written out FIVE times, once per keyed operation. Four of
+    // the copies recorded a log entry for an absent key and one did not — and that one was
+    // a lost wakeup, because the park-time staleness check folds over the LOG, so a read
+    // that recorded nothing was invisible to it. The omission survived the entire H1
+    // workstream, because it was one line different from four other places nobody was
+    // diffing side by side. It is one place now, and an omission here is an omission
+    // everywhere, which is the point: it fails loudly instead of in one caller.
+    private def resolveMapKey[K, V](
+      key: K,
+      txnVarMap: TxnVarMap[F, K, V]
+    ): F[(TxnVarRuntimeId, Option[TxnVar[F, V]], Option[TxnLogEntry[Option[V]]])] =
+      for {
+        oTxnVar <- txnVarMap.getTxnVar(key)
+        rid <- oTxnVar match {
+                 case Some(txnVar) => Async[F].delay(txnVar.runtimeId)
+                 case None => txnVarMap.getRuntimeId(key)
+               }
+        entry <- getLogEntry[Option[V]](rid)
+      } yield (rid, oTxnVar, entry)
+
     // @nowarn: the error branch has no V to hand back — the log is now a
     // TxnLogError and the fold is running only to reach a handleError — so it
     // returns ().asInstanceOf[V], which Scala 2.13 flags as a dubious Unit cast.
@@ -508,44 +539,32 @@ private[stm] trait TxnLogContext[F[_]] {
         result <- Async[F].delay(rawResult.asInstanceOf[TxnLog])
       } yield result).handleErrorWith(raiseError)
 
+    // A LOOKUP, not a read: it answers "is there an entry for this key?" and does not
+    // create one. getVarMapValue is the read, and it must record.
     private def getVarMapValueEntry[K, V](
       key: K,
       txnVarMap: TxnVarMap[F, K, V]
     ): F[Option[(TxnVarRuntimeId, TxnLogEntry[Option[V]])]] =
-      for {
-        oTxnVar <- txnVarMap.getTxnVar(key)
-        result <- oTxnVar match {
-                    case Some(txnVar) =>
-                      for {
-                        rId   <- Async[F].delay(txnVar.runtimeId)
-                        entry <- getLogEntry[Option[V]](rId)
-                        innerResult <- entry match {
-                                         case Some(res) =>
-                                           Async[F].pure(res)
-                                         case None =>
-                                           for {
-                                             txnVal <- txnVar.get
-                                             entry <-
-                                               Async[F].delay(
-                                                 TxnLogReadOnlyVarMapEntry(
-                                                   key,
-                                                   Option(txnVal),
-                                                   txnVarMap
-                                                 ).asInstanceOf[TxnLogEntry[
-                                                   Option[V]
-                                                 ]]
-                                               )
-                                           } yield entry
-                                       }
-                      } yield Some((rId, innerResult))
-                    case None =>
-                      for {
-                        rid <- txnVarMap.getRuntimeId(key)
-                        innerResult <-
-                          getLogEntry[Option[V]](rid).map(_.map((rid, _)))
-                      } yield innerResult
-                  }
-      } yield result
+      resolveMapKey[K, V](key, txnVarMap).flatMap {
+        case (rid, _, Some(entry)) =>
+          Async[F].pure(Some((rid, entry)))
+
+        case (rid, Some(txnVar), None) =>
+          // The key exists, and this transaction has not touched it yet: materialize a
+          // read-only entry from the live value.
+          txnVar.get.map { txnVal =>
+            Some(
+              (
+                rid,
+                TxnLogReadOnlyVarMapEntry(key, Some(txnVal), txnVarMap)
+                  .asInstanceOf[TxnLogEntry[Option[V]]]
+              )
+            )
+          }
+
+        case (_, None, None) =>
+          Async[F].pure(None)
+      }
 
     override private[stm] def getVarMap[K, V](
       txnVarMap: TxnVarMap[F, K, V]
@@ -607,171 +626,91 @@ private[stm] trait TxnLogContext[F[_]] {
     ): F[(TxnLog, Option[V])] = {
       val result = for {
         materializedKey <- key
-        oTxnVar         <- txnVarMap.getTxnVar(materializedKey)
-        rawResult <- oTxnVar match {
-                       case Some(txnVar) =>
-                         for {
-                           rId   <- Async[F].delay(txnVar.runtimeId)
-                           entry <- getLogEntry[Option[V]](rId)
-                           innerResult <- entry match {
-                                            case Some(entry) =>
-                                              Async[F].delay(
-                                                (this, entry.get)
-                                              ) // Noop
-                                            case None =>
-                                              for {
-                                                txnVal <- txnVar.get
-                                                newEntry <-
-                                                  Async[F].delay(
-                                                    rId -> TxnLogReadOnlyVarMapEntry(
-                                                      materializedKey,
-                                                      Option(txnVal),
-                                                      txnVarMap
-                                                    )
-                                                  )
-                                                newLogRaw <-
-                                                  Async[F].delay(log + newEntry)
-                                                newLog <-
-                                                  Async[F].delay(
-                                                    TxnLogValid(newLogRaw)
-                                                  )
-                                              } yield (newLog, Option(txnVal))
-                                          }
-                         } yield innerResult
+        resolved        <- resolveMapKey[K, V](materializedKey, txnVarMap)
+        (rid, oTxnVar, oEntry) = resolved
+        rawResult <- oEntry match {
+                       // Already in this transaction's log: read it back, record nothing new.
+                       case Some(entry) =>
+                         Async[F].delay[(TxnLog, Option[V])]((this, entry.get))
+
+                       // SPEC: NoLostWakeup — THE READ IS RECORDED WHETHER OR NOT THE KEY
+                       // EXISTS. The two cases differ only in the initial value: a live key
+                       // reads as its value, an absent key reads as None. Both are reads and
+                       // both belong in the log.
+                       //
+                       // They used to be two separately-written branches, and only one of
+                       // them recorded. The absent one did not, which made
+                       // anyReadChangedSinceRead blind to it — and that fold IS the second of
+                       // H1's two park guards, the one that catches a conflictor which
+                       // already committed and left. A waitFor on an absent key therefore
+                       // parked forever. specs/scheduler/SchedulerAbsentKey.cfg pins it, and
+                       // TxnLogEntrySpec asserts the entry is here.
                        case None =>
                          for {
-                           rid      <- txnVarMap.getRuntimeId(materializedKey)
-                           rawEntry <- getLogEntry[Option[V]](rid)
-                           innerResult <- rawEntry match {
-                                            case Some(entry) =>
-                                              Async[F].delay((this, entry.get))
-                                            case _ =>
-                                              // SPEC: NoLostWakeup — an ABSENT key is still a
-                                              // READ, and it has to be logged like any other.
-                                              // anyReadChangedSinceRead folds over log.values,
-                                              // so a read that records no entry is invisible to
-                                              // it — and that fold IS H1's second park guard.
-                                              // Leaving this unlogged parks a waitFor on an
-                                              // absent key forever: the scan misses a conflictor
-                                              // that already left, and the staleness check that
-                                              // exists to catch exactly that case cannot see the
-                                              // read (specs/scheduler/SchedulerAbsentKey.cfg).
-                                              for {
-                                                newEntry <-
-                                                  Async[F].delay(
-                                                    rid -> TxnLogReadOnlyVarMapEntry(
-                                                      materializedKey,
-                                                      None,
-                                                      txnVarMap
-                                                    )
-                                                  )
-                                                newLogRaw <-
-                                                  Async[F].delay(log + newEntry)
-                                                newLog <-
-                                                  Async[F].delay(
-                                                    TxnLogValid(newLogRaw)
-                                                  )
-                                              } yield (newLog, Option.empty[V])
-                                          }
-                         } yield innerResult
+                           initial <- oTxnVar match {
+                                        case Some(txnVar) => txnVar.get.map(v => Some(v): Option[V])
+                                        case None => Async[F].pure(Option.empty[V])
+                                      }
+                           newLog <- Async[F].delay(
+                                       TxnLogValid(
+                                         log + (rid -> TxnLogReadOnlyVarMapEntry(
+                                           materializedKey,
+                                           initial,
+                                           txnVarMap
+                                         ))
+                                       )
+                                     )
+                         } yield (newLog: TxnLog, initial)
                      }
-      } yield (rawResult._1.asInstanceOf[TxnLog], rawResult._2)
+      } yield rawResult
 
       result.handleErrorWith { ex =>
         raiseError(ex).map((_, None))
       }
     }
 
+    // Computes the log entry a write WOULD need, or None if it needs none. Used by
+    // setVarMap to diff a whole-map replacement into per-key entries.
+    //
+    // ONE RULE, and the two id spaces do not change it: if the new value differs from what
+    // was there, record an update; if it does not, nothing changed and no entry is needed.
+    // A live key's "what was there" is its value; an ABSENT key's is None. So inserting
+    // into an absent key records an entry (None -> Some), and "deleting" an absent key
+    // records nothing (None -> None) because nothing changed.
+    //
+    // That last case reads like a silent no-op next to removeTxnVarMapValue, which FAILS
+    // the transaction on an absent key. They are not in conflict: this is setVarMap's
+    // internal diff, where a key absent from both the old and new map is simply not a
+    // change, and `remove` is a user asking to delete something that is not there. The two
+    // used to be written far apart and it was easy to read them as contradicting.
     private def writeVarMapValueEntry[K, V](
       key: K,
       newOpt: Option[V],
       txnVarMap: TxnVarMap[F, K, V]
     ): F[Option[(TxnVarRuntimeId, TxnLogEntry[Option[V]])]] =
-      for {
-        oTxnVar <- txnVarMap.getTxnVar(key)
-        result <- oTxnVar match {
-                    case Some(txnVar) =>
-                      for {
-                        rId   <- Async[F].delay(txnVar.runtimeId)
-                        entry <- getLogEntry[Option[V]](rId)
-                        innerResult <- entry match {
-                                         case Some(entry) =>
-                                           Async[F].delay(
-                                             Option((rId, entry.set(newOpt)))
-                                           )
-                                         case None =>
-                                           for {
-                                             txnVal <- txnVar.get
-                                             i2Result <-
-                                               Async[F].ifM(
-                                                 Async[F].delay(
-                                                   Option(txnVal) != newOpt
-                                                 )
-                                               )(
-                                                 Async[F].delay(
-                                                   Option(
-                                                     (
-                                                       rId,
-                                                       TxnLogUpdateVarMapEntry(
-                                                         key,
-                                                         Option(txnVal),
-                                                         newOpt,
-                                                         txnVarMap
-                                                       ).asInstanceOf[
-                                                         TxnLogEntry[Option[V]]
-                                                       ]
-                                                     )
-                                                   )
-                                                 ),
-                                                 Async[F].pure[Option[
-                                                   (
-                                                     TxnVarRuntimeId,
-                                                     TxnLogEntry[Option[V]]
-                                                   )
-                                                 ]](None)
-                                               )
-                                           } yield i2Result
-                                       }
-                      } yield innerResult
-                    case None =>
-                      for {
-                        rid      <- txnVarMap.getRuntimeId(key)
-                        rawEntry <- getLogEntry[Option[V]](rid)
-                        innerResult <- rawEntry match {
-                                         case Some(entry) =>
-                                           Async[F].delay(
-                                             Option((rid, entry.set(newOpt)))
-                                           )
-                                         case _ =>
-                                           newOpt match {
-                                             case Some(_) =>
-                                               Async[F].delay(
-                                                 Option(
-                                                   (
-                                                     rid,
-                                                     TxnLogUpdateVarMapEntry(
-                                                       key,
-                                                       None,
-                                                       newOpt,
-                                                       txnVarMap
-                                                     ).asInstanceOf[TxnLogEntry[
-                                                       Option[V]
-                                                     ]]
-                                                   )
-                                                 )
-                                               )
-                                             case None =>
-                                               Async[F].pure[Option[
-                                                 (
-                                                   TxnVarRuntimeId,
-                                                   TxnLogEntry[Option[V]]
-                                                 )
-                                               ]](None)
-                                           }
-                                       }
-                      } yield innerResult
-                  }
-      } yield result
+      resolveMapKey[K, V](key, txnVarMap).flatMap {
+        case (rid, _, Some(entry)) =>
+          Async[F].delay(Some((rid, entry.set(newOpt))))
+
+        case (rid, oTxnVar, None) =>
+          for {
+            initial <- oTxnVar match {
+                         case Some(txnVar) => txnVar.get.map(v => Some(v): Option[V])
+                         case None => Async[F].pure(Option.empty[V])
+                       }
+          } yield
+            if (initial == newOpt) {
+              None
+            } else {
+              Some(
+                (
+                  rid,
+                  TxnLogUpdateVarMapEntry(key, initial, newOpt, txnVarMap)
+                    .asInstanceOf[TxnLogEntry[Option[V]]]
+                )
+              )
+            }
+      }
 
     override private[stm] def setVarMap[K, V](
       newMap: F[Map[K, V]],
@@ -834,6 +773,22 @@ private[stm] trait TxnLogContext[F[_]] {
       result.handleErrorWith(raiseError)
     }
 
+    // The user-facing keyed write: map.set(k, v) and map.remove(k).
+    //
+    // Same rule as writeVarMapValueEntry -- if the new value differs from the initial,
+    // record an update -- with ONE deliberate difference at the bottom: removing a key that
+    // is not there FAILS the transaction, because the user asked to delete something that
+    // does not exist and STM.scala says so. writeVarMapValueEntry returns None for the same
+    // input instead, and that is not a contradiction: it serves setVarMap's internal diff,
+    // where a key absent from both the old and the new map is simply not a change. The two
+    // used to be written far apart, and it was easy to read them as opposite policies.
+    //
+    // NOTE ON NULL. `initial` is built with Some(...) here and Option(...) in the read
+    // paths, and for a null value those disagree. It is not observable today, because a null
+    // map value is invisible on the way back out: Option(null) is None, so get(key) reports
+    // the key as ABSENT and extractMap drops it from a whole-map read. Storing null in a
+    // TxnVarMap silently loses the key. That is a real defect and it is tracked separately;
+    // preserving behaviour exactly is the whole point of a collapse, so it is not fixed here.
     private def writeVarMapValue[K, V](
       key: F[K],
       newOpt: Option[F[V]],
@@ -842,93 +797,60 @@ private[stm] trait TxnLogContext[F[_]] {
       val resultSpec = for {
         materializedKey    <- key
         materializedNewOpt <- newOpt.traverse(identity)
-        oTxnVar            <- txnVarMap.getTxnVar(materializedKey)
-        result <- oTxnVar match {
-                    case Some(txnVar) =>
-                      for {
-                        rId   <- Async[F].delay(txnVar.runtimeId)
-                        entry <- getLogEntry[Option[V]](rId)
-                        innerResult <- entry match {
-                                         case Some(entry) =>
-                                           for {
-                                             newEntry <-
-                                               Async[F].delay(
-                                                 rId -> entry.set(
-                                                   materializedNewOpt
-                                                 )
-                                               )
-                                             newLog <-
-                                               Async[F].delay(log + newEntry)
-                                           } yield TxnLogValid(newLog)
-                                         case None =>
-                                           for {
-                                             txnVal <- txnVar.get
-                                             i2Result <-
-                                               Async[F].ifM(
-                                                 Async[F].delay(
-                                                   Option(txnVal) != materializedNewOpt
-                                                 )
-                                               )(
-                                                 for {
-                                                   newEntry <-
-                                                     Async[F].delay(
-                                                       rId -> TxnLogUpdateVarMapEntry(
-                                                         materializedKey,
-                                                         Some(txnVal),
-                                                         materializedNewOpt,
-                                                         txnVarMap
-                                                       )
-                                                     )
-                                                   newLog <- Async[F].delay(
-                                                               log + newEntry
-                                                             )
-                                                 } yield TxnLogValid(newLog),
-                                                 Async[F].pure(this)
-                                               )
-                                           } yield i2Result
-                                       }
-                      } yield innerResult.asInstanceOf[TxnLog]
+        resolved           <- resolveMapKey[K, V](materializedKey, txnVarMap)
+        (rid, oTxnVar, oEntry) = resolved
+        result <- oEntry match {
+                    case Some(entry) =>
+                      Async[F].delay(
+                        TxnLogValid(log + (rid -> entry.set(materializedNewOpt))): TxnLog
+                      )
+
                     case None =>
-                      for {
-                        rid      <- txnVarMap.getRuntimeId(materializedKey)
-                        rawEntry <- getLogEntry[Option[V]](rid)
-                        innerResult <- rawEntry match {
-                                         case Some(entry) =>
-                                           for {
-                                             newEntry <-
-                                               Async[F].delay(
-                                                 rid -> entry.set(
-                                                   materializedNewOpt
-                                                 )
-                                               )
-                                             newLog <-
-                                               Async[F].delay(log + newEntry)
-                                           } yield TxnLogValid(newLog)
-                                         case _ =>
-                                           materializedNewOpt match {
-                                             case Some(_) =>
-                                               for {
-                                                 newEntry <-
-                                                   Async[F].delay(
-                                                     rid -> TxnLogUpdateVarMapEntry(
-                                                       materializedKey,
-                                                       None,
-                                                       materializedNewOpt,
-                                                       txnVarMap
-                                                     )
-                                                   )
-                                                 newLog <-
-                                                   Async[F].delay(log + newEntry)
-                                               } yield TxnLogValid(newLog)
-                                             case None =>
-                                               Async[F].delay(TxnLogError {
-                                                 new RuntimeException(
-                                                   s"Tried to remove non-existent key $materializedKey in transactional map"
-                                                 )
-                                               })
-                                           }
-                                       }
-                      } yield innerResult.asInstanceOf[TxnLog]
+                      oTxnVar match {
+                        case Some(txnVar) =>
+                          for {
+                            txnVal <- txnVar.get
+                            out <- Async[F].ifM(
+                                     Async[F].delay(Some(txnVal) != materializedNewOpt)
+                                   )(
+                                     Async[F].delay(
+                                       TxnLogValid(
+                                         log + (rid -> TxnLogUpdateVarMapEntry(
+                                           materializedKey,
+                                           Some(txnVal),
+                                           materializedNewOpt,
+                                           txnVarMap
+                                         ))
+                                       ): TxnLog
+                                     ),
+                                     Async[F].pure(this: TxnLog)
+                                   )
+                          } yield out
+
+                        case None =>
+                          materializedNewOpt match {
+                            // Insert: the key does not exist, and we are creating it.
+                            case Some(_) =>
+                              Async[F].delay(
+                                TxnLogValid(
+                                  log + (rid -> TxnLogUpdateVarMapEntry(
+                                    materializedKey,
+                                    None,
+                                    materializedNewOpt,
+                                    txnVarMap
+                                  ))
+                                ): TxnLog
+                              )
+
+                            // Remove of a key that is not there. Fails the transaction.
+                            case None =>
+                              Async[F].delay(TxnLogError {
+                                new RuntimeException(
+                                  s"Tried to remove non-existent key $materializedKey in transactional map"
+                                )
+                              }: TxnLog)
+                          }
+                      }
                   }
       } yield result
 
@@ -942,6 +864,10 @@ private[stm] trait TxnLogContext[F[_]] {
     ): F[TxnLog] =
       writeVarMapValue(key, Some(newValue), txnVarMap)
 
+    // Read-modify-write on one key. Fails if the key is not there to modify -- including
+    // when it was deleted earlier in THIS transaction, which the log records as an entry
+    // whose value is None. That is why the "no key" test is on the entry's VALUE and not on
+    // the entry's existence.
     override private[stm] def modifyVarMapValue[K, V](
       key: F[K],
       f: V => F[V],
@@ -949,108 +875,53 @@ private[stm] trait TxnLogContext[F[_]] {
     ): F[TxnLog] = {
       val resultSpec = for {
         materializedKey <- key
-        mapEntry        <- txnVarMap.getTxnVar(materializedKey)
-        result <- mapEntry match {
-                    case Some(txnVar) =>
-                      for {
-                        rId   <- Async[F].delay(txnVar.runtimeId)
-                        entry <- getLogEntry[Option[V]](rId)
-                        innerResult <- entry match {
-                                         case Some(entry) =>
-                                           for {
-                                             oEntry <- Async[F].delay(entry.get)
-                                             i2Result <- oEntry match {
-                                                           case Some(v) =>
-                                                             for {
-                                                               evaluation <- f(
-                                                                               v
-                                                                             )
-                                                               newEntry <-
-                                                                 Async[F].delay(
-                                                                   rId -> entry
-                                                                     .set(
-                                                                       Some(
-                                                                         evaluation
-                                                                       )
-                                                                     )
-                                                                 )
-                                                               newLog <-
-                                                                 Async[F].delay(
-                                                                   log + newEntry
-                                                                 )
-                                                             } yield TxnLogValid(
-                                                               newLog
-                                                             )
-                                                           case None =>
-                                                             Async[F].delay {
-                                                               TxnLogError(
-                                                                 new RuntimeException(
-                                                                   s"Key $materializedKey not found for modification"
-                                                                 )
-                                                               )
-                                                             }
-                                                         }
-                                           } yield i2Result.asInstanceOf[TxnLog]
-                                         case None =>
-                                           for {
-                                             v          <- txnVar.get
-                                             evaluation <- f(v)
-                                             newEntry <-
-                                               Async[F].delay(
-                                                 rId -> TxnLogUpdateVarMapEntry(
-                                                   materializedKey,
-                                                   Some(v),
-                                                   Some(evaluation),
-                                                   txnVarMap
-                                                 )
-                                               )
-                                             newLog <-
-                                               Async[F].delay(log + newEntry)
-                                           } yield TxnLogValid(newLog)
-                                             .asInstanceOf[TxnLog]
-                                       }
-                      } yield innerResult
+        resolved        <- resolveMapKey[K, V](materializedKey, txnVarMap)
+        (rid, oTxnVar, oEntry) = resolved
+        result <- oEntry match {
+                    // Already in the log. Modify whatever it currently holds -- unless it
+                    // holds nothing, i.e. this transaction already deleted the key.
+                    case Some(entry) =>
+                      entry.get match {
+                        case Some(v) =>
+                          f(v).map { evaluation =>
+                            TxnLogValid(log + (rid -> entry.set(Some(evaluation)))): TxnLog
+                          }
+                        case None =>
+                          Async[F].delay(
+                            TxnLogError(
+                              new RuntimeException(
+                                s"Key $materializedKey not found for modification"
+                              )
+                            ): TxnLog
+                          )
+                      }
+
+                    // Not in the log yet. If the key exists, read it live and modify it;
+                    // if it does not, there is nothing to modify.
                     case None =>
-                      for {
-                        rid      <- txnVarMap.getRuntimeId(materializedKey)
-                        rawEntry <- getLogEntry[Option[V]](rid)
-                        innerResult <- rawEntry match {
-                                         case Some(entry) =>
-                                           for {
-                                             oEntry <- Async[F].delay(entry.get)
-                                             i2Result <- oEntry match {
-                                                           case Some(v) =>
-                                                             for {
-                                                               evaluation <- f(v)
-                                                               newEntry <-
-                                                                 Async[F].delay(rid -> entry.set(Some(evaluation)))
-                                                               newLog <-
-                                                                 Async[F].delay(
-                                                                   log + newEntry
-                                                                 )
-                                                             } yield TxnLogValid(
-                                                               newLog
-                                                             )
-                                                           case None =>
-                                                             Async[F].delay {
-                                                               TxnLogError(
-                                                                 new RuntimeException(
-                                                                   s"Key $materializedKey not found for modification"
-                                                                 )
-                                                               )
-                                                             }
-                                                         }
-                                           } yield i2Result.asInstanceOf[TxnLog]
-                                         case _ =>
-                                           Async[F].delay {
-                                             TxnLogError(
-                                               new RuntimeException(
-                                                 s"Key $materializedKey not found for modification"
-                                               )
-                                             ).asInstanceOf[TxnLog]
-                                           }
-                                       }
-                      } yield innerResult
+                      oTxnVar match {
+                        case Some(txnVar) =>
+                          for {
+                            v          <- txnVar.get
+                            evaluation <- f(v)
+                          } yield TxnLogValid(
+                            log + (rid -> TxnLogUpdateVarMapEntry(
+                              materializedKey,
+                              Some(v),
+                              Some(evaluation),
+                              txnVarMap
+                            ))
+                          ): TxnLog
+
+                        case None =>
+                          Async[F].delay(
+                            TxnLogError(
+                              new RuntimeException(
+                                s"Key $materializedKey not found for modification"
+                              )
+                            ): TxnLog
+                          )
+                      }
                   }
       } yield result
 

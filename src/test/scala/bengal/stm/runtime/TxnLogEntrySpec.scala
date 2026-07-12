@@ -17,6 +17,7 @@
 package ai.entrolution
 package bengal.stm.runtime
 
+import cats.effect.IO
 import cats.effect.testing.scalatest.AsyncIOSpec
 import org.scalatest.freespec.AsyncFreeSpec
 import org.scalatest.matchers.should.Matchers
@@ -636,6 +637,68 @@ class TxnLogEntrySpec extends AsyncFreeSpec with AsyncIOSpec with Matchers with 
           lock shouldBe Some((tvarMap.runtimeId, tvarMap.commitLock))
           // and emphatically NOT the existential id the log keys it by
           lock.map(_._1) should not be Some(existentialId)
+        }
+    }
+  }
+
+  /* THE REGRESSION GUARD FOR THE ABSENT-KEY LOST WAKEUP, and it has to be white-box.
+   *
+   * Reading a map key that does not exist used to record NO LOG ENTRY. That mattered
+   * because TxnLogValid.anyReadChangedSinceRead folds over the log, and that fold is the
+   * SECOND of the two guards submitTxnForRetry consults before parking -- the one that
+   * catches a conflictor which already committed and left activeTransactions. A read with
+   * no entry is invisible to it, so for an absent-key predicate the guard was structurally
+   * dead, and the parker slept forever.
+   *
+   * NOTHING BEHAVIOURAL CATCHES A REGRESSION OF THIS. AbsentKeyParkSpec exercises the
+   * path and stays GREEN with the fix reverted -- verified, and its own comment says so --
+   * because the interleaving needed is the one H1's was, and a conflictor that arrives
+   * early enough to be caught subscribes to the parker instead, which makes hasDownstream
+   * resubmit it rather than park. The TLA+ pin (SchedulerAbsentKey.cfg) models the DEFECT
+   * as a negative control, so it stays red either way and pins the protocol, not this code.
+   *
+   * So the only thing that can guard the fix is an assertion about the log itself. That is
+   * what this is. It fails the moment getVarMapValue stops recording the read.
+   */
+  "an absent-key read" - {
+
+    "is recorded in the log, so the park-time staleness check can see it" in withRuntime { implicit stm =>
+      import stm._
+      TxnVarMap
+        .of[IO, String, Int](Map.empty)
+        .flatMap { map =>
+          for {
+            res <- TxnLogValid.empty.getVarMapValue(IO.pure("ghost"), map)
+            (log, value) = res
+            valid        = log.asInstanceOf[TxnLogValid]
+          } yield {
+            value shouldBe None
+            // The read of a key that is not there is still a READ, and it must be logged
+            // like any other. This is the entire fix.
+            valid.log should not be empty
+          }
+        }
+    }
+
+    "reports as changed once the key it looked for appears" in withRuntime { implicit stm =>
+      import stm._
+      TxnVarMap
+        .of[IO, String, Int](Map.empty)
+        .flatMap { map =>
+          for {
+            res <- TxnLogValid.empty.getVarMapValue(IO.pure("ghost"), map)
+            valid = res._1.asInstanceOf[TxnLogValid]
+            // Nothing has moved yet.
+            before <- valid.anyReadChangedSinceRead
+            // A conflicting writer creates the key underneath us.
+            _     <- map.set("ghost", 1).commit
+            after <- valid.anyReadChangedSinceRead
+          } yield {
+            before shouldBe false
+            // ...and THIS is what has to be true, or a transaction parked on that key
+            // is never woken. It was false for the whole of the H1 workstream.
+            after shouldBe true
+          }
         }
     }
   }
