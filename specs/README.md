@@ -560,6 +560,37 @@ split — and Spec B is what earns the right to assume it.
   the spec stays load-bearing while the defect exists, and the flip to green
   is forced through this README and the plan together.
 
+## Which defects behavioural testing could — and could not — have found
+
+Every fix in this workstream was reverted in turn and the behavioural suites re-run.
+The result is the clearest argument in this project for why the models were worth
+building, and it is recorded here rather than left as a matter of opinion.
+
+| Defect | Reproducible by a test? | Evidence |
+|---|---|---|
+| **H2** lock-order deadlock | **Yes** | `CommitLockOrderSpec` deadlocked and timed out pre-fix |
+| **H3** under-declared footprint | **Yes** | 198/200 contended reps skewed; the soak catches it too (G2) |
+| **H5** phantom | **Yes** | ~98% of contended reps; the soak catches it too (G2) |
+| **H6** data-dependent footprint | **Only if ENGINEERED** | `DataDependentFootprintSpec` had to suspend the analysis pass with a gate. The randomized soak does **not** catch it |
+| **H1** lost wakeup | **NO** | reverting the fix leaves `RetrySoakSpec` green |
+| **spurious self-wake spin** | **NO** | reverting the fix leaves `RetrySoakSpec` green |
+
+**Three of six could not have been found by running the code.** H6 needed a probe
+that already knew the answer; H1 and the self-wake spin cannot be reached at all.
+
+Why H1 resists: it needs the conflictor's entire submit-and-sweep to complete inside
+the window between the parker leaving `activeTransactions` and the parker taking the
+retry semaphore — about two microseconds. Land early and the conflictor's scan sees
+the parker still active, subscribes, and `hasDownstream` makes it resubmit instead of
+park (no park, no bug). Land late and the conflictor's sweep blocks on the semaphore
+the parker holds, finds it, and wakes it (the rescue path, working). A running program
+essentially never lands between the two. **In production it is reachable** — a GC pause
+widens that gap to milliseconds — which is exactly why it is a real bug rather than a
+curiosity, and exactly why only exhaustive interleaving could find it.
+
+The corollary matters as much: a green behavioural suite is **not** evidence that these
+protocols are correct. The pins in this file are.
+
 ## Keeping Specs and Code in Sync
 
 1. **Source anchors** (`// SPEC: <Name>`) verified by
