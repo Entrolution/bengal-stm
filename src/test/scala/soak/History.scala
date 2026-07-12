@@ -38,8 +38,8 @@ package soak
   *     ANTI-DEPENDENCY is the one that matters — it is the edge that unprotected reads create, and every anomaly this
   *     project has fixed (H3, H5, H6) is an rw cycle.
   *
-  * A cycle in that graph is, by Adya's theorem, precisely a violation of conflict-serializability. Detection is
-  * O(V + E), so it scales to millions of transactions where permutation checking dies at eight.
+  * A cycle in that graph is, by Adya's theorem, precisely a violation of conflict-serializability. Detection is O(V +
+  * E), so it scales to millions of transactions where permutation checking dies at eight.
   *
   * The cycle's shape also NAMES the anomaly, which is worth as much as detecting it: no rw edges is a write cycle;
   * exactly one is read skew; two or more is write skew / phantom.
@@ -66,7 +66,7 @@ object History {
 
   /** A transactional location: either a plain var or one entry of one map. */
   sealed trait Key
-  final case class VarKey(idx: Int)                extends Key
+  final case class VarKey(idx: Int) extends Key
   final case class EntryKey(map: Int, key: String) extends Key
 
   /** What one transaction observed and what it wrote.
@@ -94,7 +94,7 @@ object History {
   }
 
   private def keyName(k: Key): String = k match {
-    case VarKey(i)      => s"v$i"
+    case VarKey(i) => s"v$i"
     case EntryKey(m, s) => s"m$m[$s]"
   }
 
@@ -153,8 +153,8 @@ object History {
 
   private def lostAppends(finalState: Map[Key, Vector[Tag]], txns: List[TxnRecord]): List[Violation] =
     for {
-      t             <- txns
-      (key, tag)    <- t.appends.toList
+      t          <- txns
+      (key, tag) <- t.appends.toList
       if !finalState.getOrElse(key, Vector.empty).contains(tag)
     } yield LostAppend(t.id, key, tag)
 
@@ -170,9 +170,13 @@ object History {
   def buildGraph(finalState: Map[Key, Vector[Tag]], txns: List[TxnRecord]): List[Edge] = {
     val wwEdges: List[Edge] =
       finalState.toList.flatMap { case (key, order) =>
-        order.sliding(2).collect { case Vector(a, b) if writerOf(a) != writerOf(b) =>
-          Edge(writerOf(a), writerOf(b), WW, key)
-        }.toList
+        order
+          .sliding(2)
+          .collect {
+            case Vector(a, b) if writerOf(a) != writerOf(b) =>
+              Edge(writerOf(a), writerOf(b), WW, key)
+          }
+          .toList
       }
 
     val readEdges: List[Edge] =
@@ -225,7 +229,7 @@ object History {
             colour(e.to) match {
               case White =>
                 colour(e.to) = Grey
-                via(e.to) = e
+                via(e.to)    = e
                 stack.push((e.to, adj(e.to)))
               case Grey =>
                 // Back edge: e.to is on the current path, so walking `via`
@@ -235,7 +239,7 @@ object History {
                 while (cur != e.to) {
                   val in = via(cur)
                   path = in :: path
-                  cur = in.from
+                  cur  = in.from
                 }
                 return Some(Cycle(path))
               case _ => () // Black: already fully explored, cannot be on the current path

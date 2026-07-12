@@ -129,15 +129,15 @@ class SerializabilitySoakSpec extends AnyFreeSpec with Matchers {
   // ---------------------------------------------------------------------------
 
   sealed private trait Op
-  private case class ReadVar(i: Int)                extends Op
-  private case class AppendVar(i: Int)              extends Op
-  private case class ReadKey(m: Int, k: String)     extends Op
-  private case class AppendKey(m: Int, k: String)   extends Op
-  private case class ReadWholeMap(m: Int)           extends Op
+  private case class ReadVar(i: Int) extends Op
+  private case class AppendVar(i: Int) extends Op
+  private case class ReadKey(m: Int, k: String) extends Op
+  private case class AppendKey(m: Int, k: String) extends Op
+  private case class ReadWholeMap(m: Int) extends Op
   private case class DataDepAppend(src: Int, m: Int) extends Op
-  private case class DataDepRead(src: Int, m: Int)   extends Op
-  private case class Transfer(m: Int, i: Int)        extends Op
-  private case object UnderDeclare                  extends Op
+  private case class DataDepRead(src: Int, m: Int) extends Op
+  private case class Transfer(m: Int, i: Int) extends Op
+  private case object UnderDeclare extends Op
 
   private def genOps(rnd: Random): List[Op] =
     List.fill(opsPerTxn) {
@@ -154,7 +154,7 @@ class SerializabilitySoakSpec extends AnyFreeSpec with Matchers {
         case n if n < 80 => DataDepAppend(rnd.nextInt(NumVars), rnd.nextInt(NumMaps))
         case n if n < 88 => DataDepRead(rnd.nextInt(NumVars), rnd.nextInt(NumMaps))
         case n if n < 96 => Transfer(rnd.nextInt(NumMaps), rnd.nextInt(KeyPool.size))
-        case _           => UnderDeclare
+        case _ => UnderDeclare
       }
     }
 
@@ -262,7 +262,7 @@ class SerializabilitySoakSpec extends AnyFreeSpec with Matchers {
             for {
               v <- vars(src).get
               _ <- STM[IO].fromF(IO.sleep(2.millis))
-              i = v.length % KeyPool.size
+              i  = v.length % KeyPool.size
               k1 = KeyPool(i)
               k2 = KeyPool((i + 1) % KeyPool.size)
               c1 <- maps(m).get(k1)
@@ -270,7 +270,7 @@ class SerializabilitySoakSpec extends AnyFreeSpec with Matchers {
               c2 <- maps(m).get(k2)
             } yield rec.copy(
               reads = rec.reads
-                + ((VarKey(src): Key)    -> v)
+                + ((VarKey(src): Key)     -> v)
                 + ((EntryKey(m, k1): Key) -> c1.getOrElse(Vector.empty))
                 + ((EntryKey(m, k2): Key) -> c2.getOrElse(Vector.empty))
             )

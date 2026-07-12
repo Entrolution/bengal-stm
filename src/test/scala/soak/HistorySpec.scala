@@ -46,19 +46,19 @@ class HistorySpec extends AnyFreeSpec with Matchers {
 
     "a purely serial history" in {
       // T1 appends to x, then T2 reads what T1 wrote and appends to y.
-      val t1x = tagFor(1, 0)
-      val t2y = tagFor(2, 0)
+      val t1x        = tagFor(1, 0)
+      val t2y        = tagFor(2, 0)
       val finalState = state(x -> Vector(t1x), y -> Vector(t2y))
       val txns = List(
-        t(1)(x -> t1x),
+        t(1)(x                   -> t1x),
         t(2, x -> Vector(t1x))(y -> t2y)
       )
       check(finalState, txns) shouldBe empty
     }
 
     "concurrent transactions touching disjoint keys" in {
-      val t1x = tagFor(1, 0)
-      val t2y = tagFor(2, 0)
+      val t1x        = tagFor(1, 0)
+      val t2y        = tagFor(2, 0)
       val finalState = state(x -> Vector(t1x), y -> Vector(t2y))
       check(finalState, List(t(1)(x -> t1x), t(2)(y -> t2y))) shouldBe empty
     }
@@ -77,8 +77,8 @@ class HistorySpec extends AnyFreeSpec with Matchers {
     "WRITE SKEW (G2) — each read what the other then wrote: H3, H6" in {
       // T1: read y (empty), append x.   T2: read x (empty), append y.
       // Neither saw the other's write, so each must precede the other. Cycle.
-      val t1x = tagFor(1, 0)
-      val t2y = tagFor(2, 0)
+      val t1x        = tagFor(1, 0)
+      val t2y        = tagFor(2, 0)
       val finalState = state(x -> Vector(t1x), y -> Vector(t2y))
       val txns = List(
         t(1, y -> Vector.empty)(x -> t1x),
@@ -95,10 +95,10 @@ class HistorySpec extends AnyFreeSpec with Matchers {
       // Two transactions each read the whole map (observing NO entry for the
       // key the other will insert) and then insert their own. The empty
       // observation is what makes the phantom visible.
-      val ka = EntryKey(0, "a")
-      val kb = EntryKey(0, "b")
-      val t1a = tagFor(1, 0)
-      val t2b = tagFor(2, 0)
+      val ka         = EntryKey(0, "a")
+      val kb         = EntryKey(0, "b")
+      val t1a        = tagFor(1, 0)
+      val t2b        = tagFor(2, 0)
       val finalState = state(ka -> Vector(t1a), kb -> Vector(t2b))
       val txns = List(
         t(1, ka -> Vector.empty, kb -> Vector.empty)(ka -> t1a),
@@ -112,8 +112,8 @@ class HistorySpec extends AnyFreeSpec with Matchers {
     "READ SKEW (G-single) — a torn view across two keys: H6's probe" in {
       // A transfer T1 appends to both x and y. Reader T2 saw x BEFORE the
       // transfer and y AFTER it: exactly one rw edge, one wr edge, a cycle.
-      val t1x = tagFor(1, 0)
-      val t1y = tagFor(1, 1)
+      val t1x        = tagFor(1, 0)
+      val t1y        = tagFor(1, 1)
       val finalState = state(x -> Vector(t1x), y -> Vector(t1y))
       val txns = List(
         t(1)(x -> t1x, y -> t1y),
@@ -127,8 +127,8 @@ class HistorySpec extends AnyFreeSpec with Matchers {
     "LOST UPDATE — an append vanished from the final state" in {
       // T1 and T2 both appended to x, but only T2's survived: T2 overwrote the
       // list wholesale rather than extending it.
-      val t1x = tagFor(1, 0)
-      val t2x = tagFor(2, 0)
+      val t1x        = tagFor(1, 0)
+      val t2x        = tagFor(2, 0)
       val violations = check(state(x -> Vector(t2x)), List(t(1)(x -> t1x), t(2)(x -> t2x)))
       violations should have size 1
       violations.head shouldBe a[LostAppend]
@@ -152,7 +152,7 @@ class HistorySpec extends AnyFreeSpec with Matchers {
     // strictly in series: each reads the full prefix of x written before it,
     // then appends. Serializable by construction, and the graph is a 5,000-node
     // chain — so this measures the cost of cycle detection, not of the history.
-    val n = 5000
+    val n                                 = 5000
     val order: Vector[Tag]                = (1 to n).map(i => tagFor(i, 0)).toVector
     val finalState: Map[Key, Vector[Tag]] = state(x -> order, y -> Vector.empty[Tag])
 
