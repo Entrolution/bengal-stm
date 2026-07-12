@@ -62,82 +62,73 @@ import bengal.stm.syntax.all._
   * regression guard. This suite is the coverage floor: it proves the absent-key park/wake path works at all, which
   * would catch a gross breakage, and it must not be read as more than that.
   */
-class AbsentKeyParkSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
+class AbsentKeyParkSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers with StmSuite {
 
   "parking on an absent map key" - {
 
     "a transaction blocked on a key that does not exist is woken when the key is created" in {
-      STM
-        .runtime[IO]
-        .flatMap { implicit stm =>
-          for {
-            map <- TxnVarMap.of[IO, String, Int](Map.empty)
-            // Parks: "k" is absent, so the predicate is false and there is no
-            // entry for it in the map at all.
-            reader <- (for {
-                        ov <- map.get("k")
-                        _  <- STM[IO].waitFor(ov.isDefined)
-                      } yield ov.getOrElse(-1)).commit.start
-            // Give the reader time to reach the retry map, so the writer's
-            // submission sweep is the thing that wakes it.
-            _      <- IO.sleep(100.millis)
-            _      <- map.set("k", 42).commit
-            result <- reader.joinWithNever
-          } yield result
-        }
-        // A lost wakeup HANGS — there is nothing to assert against, so the
+      withRuntime { implicit stm =>
+        for {
+          map <- TxnVarMap.of[IO, String, Int](Map.empty)
+          // Parks: "k" is absent, so the predicate is false and there is no
+          // entry for it in the map at all.
+          reader <- (for {
+                      ov <- map.get("k")
+                      _  <- STM[IO].waitFor(ov.isDefined)
+                    } yield ov.getOrElse(-1)).commit.start
+          // Give the reader time to reach the retry map, so the writer's
+          // submission sweep is the thing that wakes it.
+          _      <- IO.sleep(100.millis)
+          _      <- map.set("k", 42).commit
+          result <- reader.joinWithNever
+        } yield result
+      }
+        // A lost wakeup HANGS — there is nothing to assert against, so StmSuite's
         // timeout is the assertion.
-        .timeout(30.seconds)
         .asserting(_ shouldBe 42)
     }
 
     "a transaction blocked on an absent key is woken by a key created in a DIFFERENT transaction's write" in {
-      STM
-        .runtime[IO]
-        .flatMap { implicit stm =>
-          for {
-            map   <- TxnVarMap.of[IO, String, Int](Map.empty)
-            other <- TxnVar.of(0)
-            reader <- (for {
-                        ov <- map.get("target")
-                        _  <- STM[IO].waitFor(ov.exists(_ > 5))
-                      } yield ov.getOrElse(-1)).commit.start
-            _ <- IO.sleep(100.millis)
-            // A write that does NOT satisfy the predicate: the key now exists,
-            // but the value is too small. The reader must wake, re-run, and
-            // park again rather than commit a stale view.
-            _ <- map.set("target", 1).commit
-            _ <- other.set(1).commit
-            // Now satisfy it.
-            _      <- map.set("target", 9).commit
-            result <- reader.joinWithNever
-          } yield result
-        }
-        .timeout(30.seconds)
-        .asserting(_ shouldBe 9)
+      withRuntime { implicit stm =>
+        for {
+          map   <- TxnVarMap.of[IO, String, Int](Map.empty)
+          other <- TxnVar.of(0)
+          reader <- (for {
+                      ov <- map.get("target")
+                      _  <- STM[IO].waitFor(ov.exists(_ > 5))
+                    } yield ov.getOrElse(-1)).commit.start
+          _ <- IO.sleep(100.millis)
+          // A write that does NOT satisfy the predicate: the key now exists,
+          // but the value is too small. The reader must wake, re-run, and
+          // park again rather than commit a stale view.
+          _ <- map.set("target", 1).commit
+          _ <- other.set(1).commit
+          // Now satisfy it.
+          _      <- map.set("target", 9).commit
+          result <- reader.joinWithNever
+        } yield result
+      }.asserting(_ shouldBe 9)
     }
 
     "many transactions parked on distinct absent keys are all woken" in {
       val keys = (0 until 12).toList.map(i => s"k$i")
 
-      STM
-        .runtime[IO]
-        .flatMap { implicit stm =>
-          for {
-            map <- TxnVarMap.of[IO, String, Int](Map.empty)
-            readers <- keys.traverse { k =>
-                         (for {
-                           ov <- map.get(k)
-                           _  <- STM[IO].waitFor(ov.isDefined)
-                         } yield ov.getOrElse(-1)).commit.start
-                       }
-            _       <- IO.sleep(200.millis)
-            _       <- keys.zipWithIndex.traverse { case (k, i) => map.set(k, i).commit }
-            results <- readers.traverse(_.joinWithNever)
-          } yield results
-        }
-        .timeout(60.seconds)
-        .asserting(_ shouldBe keys.indices.toList)
+      // Twelve parked readers plus twelve waking writers: more scheduling than the
+      // default budget assumes, and a timeout that fires under load leaks fibers.
+      withRuntime(60.seconds) { implicit stm =>
+        for {
+          map <- TxnVarMap.of[IO, String, Int](Map.empty)
+          readers <- keys.traverse { k =>
+                       (for {
+                         ov <- map.get(k)
+                         _  <- STM[IO].waitFor(ov.isDefined)
+                       } yield ov.getOrElse(-1)).commit.start
+                     }
+          _       <- IO.sleep(200.millis)
+          _       <- keys.zipWithIndex.traverse { case (k, i) => map.set(k, i).commit }
+          results <- readers.traverse(_.joinWithNever)
+        } yield results
+      }.asserting(_ shouldBe keys.indices.toList)
     }
   }
 }

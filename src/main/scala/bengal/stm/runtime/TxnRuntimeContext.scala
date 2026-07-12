@@ -65,6 +65,11 @@ private[stm] trait TxnRuntimeContext[F[_]] {
     // transactions with equal footprints to share a chained wake.
     retryMap: MutableMap[TxnId, (IdFootprint, F[Unit])]
   ) {
+
+    // A case class over two live TrieMaps: the derived toString would deep-print
+    // the whole active set and retry map, under concurrent mutation, from
+    // wherever a scheduler lands in an error message or a debug log. Pin it to
+    // the class name.
     override val toString: String = "TxnScheduler"
 
     // Wakes every parked transaction whose footprint conflicts with the one
@@ -118,8 +123,7 @@ private[stm] trait TxnRuntimeContext[F[_]] {
       retrySemaphore.permit
         .use { _ =>
           for {
-            // ORDER IS LOAD-BEARING (see the comment above): the scan first,
-            // the staleness check LAST, immediately before the insert.
+            // ORDER IS LOAD-BEARING — see above.
             conflictActive <-
               Async[F].delay(
                 activeTransactions.values.exists(aTxn => !analysedTxn.idFootprint.isCompatibleWith(aTxn.idFootprint))
@@ -148,6 +152,30 @@ private[stm] trait TxnRuntimeContext[F[_]] {
           )
         }
 
+    // The dirty path's resubmission, and its only caller: this transaction ran,
+    // found its log stale or its footprint unsound, and is going round again on
+    // a refined one. It repeats submitTxn's sequence exactly — same steps, same
+    // order, same reasons (documented there) — and departs from it in one
+    // respect: the dependency edges are directed by the PEER'S STATUS.
+    //
+    //   Running    the peer is already inside its execute window. We cannot get
+    //              in front of it, so we take the ordinary edge and wait.
+    //   Scheduled  the peer has not started. The edge is REVERSED: it waits for
+    //              US.
+    //
+    // The reversal is anti-starvation. Re-entering through submitTxn would queue
+    // this transaction behind every incompatible peer, including ones that
+    // arrived while it was running and can dirty its log all over again — so it
+    // would refine, go to the back, and refine again. Taking priority over peers
+    // that have not yet started is what stops it losing that race indefinitely.
+    //
+    // The reversed edge is sound because of the admission gate: raising a
+    // Scheduled peer's tally happens under the graph semaphore, and
+    // admitForExecution re-tests that tally under the same semaphore. A peer
+    // whose execute fiber is already in flight therefore loses the gate and
+    // exits rather than running with a dependency it has just acquired. This
+    // site carries the same Contract C obligation as submitTxn, where the anchor
+    // sits.
     def submitTxnForImmediateRetry(analysedTxn: AnalysedTxn[_]): F[Unit] =
       for {
         _ <- analysedTxn.resetDependencyTally
@@ -202,14 +230,34 @@ private[stm] trait TxnRuntimeContext[F[_]] {
         _ <- checkRetryQueue(analysedTxn.id, analysedTxn.idFootprint).start
       } yield ()
 
+    // The canonical submission sequence, and the order inside the graph
+    // semaphore is load-bearing (Scheduler.tla walks it step by step —
+    // submitPc/scanPending):
+    //
+    //   - The scan snapshots activeTransactions BEFORE we insert ourselves into
+    //     it. A writer's footprint is incompatible with ITSELF
+    //     (LemmaWriterSelfIncompatible), so scanning after the insert would
+    //     subscribe us to ourselves and the tally would never drain.
+    //   - The scan fibers are JOINED before the readiness test, so the tally is
+    //     final when we test it. Testing earlier could read a zero that an
+    //     edge still forming is about to raise.
+    //   - The readiness test stays under the semaphore, which is what serializes
+    //     it against admitForExecution and against a concurrent scan raising our
+    //     tally.
+    //
+    // The wake sweep runs afterwards, on its own fiber: it takes the OTHER
+    // semaphore, and the park window it closes is submitTxnForRetry's.
     def submitTxn(analysedTxn: AnalysedTxn[_]): F[Unit] =
       for {
         _ <- analysedTxn.resetDependencyTally
         _ <- graphBuilderSemaphore.permit.use { _ =>
                for {
-                 // SPEC: ContractC — this scan is the mechanism meant to keep
-                 // footprint-incompatible txns out of overlapping execute
-                 // windows (Scheduler.tla checks the guarantee itself).
+                 // SPEC: ContractC — footprint-incompatible transactions never
+                 // overlap in their execute windows. This scan builds the edges;
+                 // admitForExecution is what makes them BINDING. Both run under
+                 // the graph semaphore, so no peer can be admitted between the
+                 // scan and the insert below (Scheduler.tla checks the guarantee
+                 // itself).
                  testAndLink <- activeTransactions.values.toList.parTraverse { aTxn =>
                                   Async[F]
                                     .ifM(
@@ -423,9 +471,12 @@ private[stm] trait TxnRuntimeContext[F[_]] {
       // no gain, since a partial footprint covers nothing by construction.
       idFootprint.isUnderApproximated || idFootprint.covers(actual.getValidated)
 
-    // SPEC: NoDoublePublish — log.commit below publishes the write set; a
-    // second concurrent execute fiber for the same txn re-runs the whole
-    // pipeline and publishes again (Scheduler.tla checks once-per-incarnation).
+    // SPEC: NoDoublePublish — log.commit below is the only publish of the write
+    // set, and commit is reachable only from execute, which is behind
+    // admitForExecution. A second concurrent execute fiber for the same
+    // incarnation loses that CAS and exits without re-running the pipeline (the
+    // H4 fix), so the write set is published at most once per incarnation
+    // (Scheduler.tla).
     private val commit: F[TxnResult] =
       for {
         logResult <- getTxnLogResult
@@ -511,6 +562,25 @@ private[stm] trait TxnRuntimeContext[F[_]] {
                          Right[Throwable, V](result.asInstanceOf[V])
                        )
                        .void
+                   // hasDownstream is TRUE exactly when an incompatible peer
+                   // subscribed to us while we were still in
+                   // activeTransactions — so that peer's submission sweep is
+                   // already SPENT: it swept before we could park and did not
+                   // see us. Parking now would be the H1 shape from the other
+                   // side, since nothing sweeps for us again and that peer's
+                   // commit is the very event our predicate waits on. Resubmit
+                   // instead: the resubmission's scan puts us downstream of it
+                   // and we re-run once it completes. Only a transaction with no
+                   // such peer takes the park path.
+                   //
+                   // This branch is also why the absent-key lost wakeup has no
+                   // behavioural reproduction. A conflictor early enough for the
+                   // park-time checks to be blind to it has necessarily already
+                   // set this flag, so we never park at all; one that arrives
+                   // later is caught by the park's own scan or staleness check.
+                   // The defect needs a conflictor's entire lifecycle to land
+                   // between the two, which is why it is pinned in the model
+                   // (specs/scheduler/SchedulerAbsentKey.cfg) and not in a test.
                    case TxnResultRetry(validLog) =>
                      Async[F].ifM(hasDownstream.get)(
                        freshIncarnation(idFootprint).flatMap(ex.submitTxn),
@@ -529,10 +599,8 @@ private[stm] trait TxnRuntimeContext[F[_]] {
             completionSignal.complete(Left[Throwable, V](unexpectedErr)).void
           }
         },
-        // Lost the admission gate: a duplicate or stale spawn for an
-        // incarnation that is already running, already completed, or has
-        // live dependencies again. Exit without side effects — whoever
-        // holds the last dependency edge respawns on drain.
+        // Lost the admission gate: a duplicate or stale spawn. Exit without side
+        // effects (see admitForExecution).
         Async[F].unit
       )
   }
@@ -550,53 +618,52 @@ private[stm] trait TxnRuntimeContext[F[_]] {
             .map { res =>
               (res._1, Option(res._2))
             }
-            // Sometimes the static analysis will unavoidably throw
-            // due to impossible casts being attempted. In this case, we
-            // leverage the footprint gathered to the point in the free recursion
-            // up to where the error is generated. In the worst case,
-            // we fall back to blindly optimistic scheduling (for the
-            // first transaction attempt)
+            // SPEC: CommitSnapshotValid — the H3 fix, producer side. The static
+            // analysis can throw, and both branches below then yield an
+            // UNDER-APPROXIMATED footprint: the first carries whatever partial
+            // footprint the walker had reached when it threw, the second has
+            // nothing at all. Neither is a statement about what the transaction
+            // touches. Both are an admission that we do not know.
             //
-            // SPEC: CommitSnapshotValid — EXPECTED-RED; this is the H3
-            // mechanism site. Both branches yield an UNDER-APPROXIMATED
-            // footprint, and an under-approximated footprint is not merely a
-            // weaker hint — it is UNSOUND. Reads are never commit-validated
-            // and take no lock (see TxnLogReadOnlyVarEntry), so the scheduler
-            // is the only thing standing between a transaction and a stale
-            // read; an empty or partial footprint switches it off. Unsound in
-            // BOTH directions: an under-declared transaction reads what a peer
-            // overwrites (specs/commit/CommitH3.cfg), AND its undeclared
-            // writes invalidate a correctly-declared peer's reads
-            // (CommitH3Writer.cfg). Only a pure write-write collision is
-            // caught, by the commit locks and the dirty check
-            // (CommitDirty.cfg).
+            // That is not a weaker hint — it is UNSOUND. Reads are never
+            // commit-validated and take no lock (see TxnLogReadOnlyVarEntry), so
+            // the scheduler is the only thing standing between a transaction and
+            // a stale read; an empty or partial footprint switches it off.
+            // Unsound in BOTH directions: an under-declared transaction reads
+            // what a peer overwrites (specs/commit/CommitH3.cfg), AND its
+            // undeclared writes invalidate a correctly-declared peer's reads
+            // (CommitH3Writer.cfg). Only a pure write-write collision is caught,
+            // by the commit locks and the dirty check (CommitDirty.cfg).
             //
-            // Reachable from ORDINARY code, and it is the FIRST branch below —
-            // the partial footprint — that the reachable path takes, not the
-            // empty one. staticAnalysisCompiler executes real reads but never
-            // applies writes, so reading back a key this transaction just
-            // wrote yields None during analysis and Some(v) at run time; a
-            // partial continuation on that value throws during analysis and
-            // nowhere else, the walker converts it to
-            // StaticAnalysisShortCircuitException carrying whatever it had
-            // accumulated, and everything after the throw point goes
-            // undeclared. 198/200 contended reps skew, and holding the whole
-            // transaction fixed while making the continuation TOTAL removes
-            // the skew — so the throw is the cause, not the shape of the
-            // transaction (StaticAnalysisFallbackSpec, controls 1 and 2).
-            // The fix has two halves: flag the under-approximation so it is
-            // treated as incompatible with everything (negative control NC-2),
-            // and give the analyser a shadow log so read-your-own-write stops
-            // throwing in the first place.
+            // Reachable from ORDINARY code, and the reachable path takes the
+            // FIRST branch — the partial footprint — not the empty one.
+            // staticAnalysisCompiler executes real reads but never applies
+            // writes, so reading back a key this transaction just wrote yields
+            // None during analysis and Some(v) at run time; a partial
+            // continuation on that value throws during analysis and nowhere
+            // else, the walker converts it to StaticAnalysisShortCircuitException
+            // carrying whatever it had accumulated, and everything past the
+            // throw point goes undeclared. 198 of 200 contended reps skewed, and
+            // holding the whole transaction fixed while making the continuation
+            // TOTAL removed the skew — so the throw was the cause, not the shape
+            // of the transaction. Post-fix: 0 skews in 1000 reps
+            // (StaticAnalysisFallbackSpec, controls 1 and 2).
             //
-            // BOTH branches are under-approximations and both are now FLAGGED.
-            // The first carries the partial footprint the walker had reached
-            // when it threw; the second has nothing at all. Neither is a
-            // statement about what the transaction touches — both are an
-            // admission that we do not know — so each is marked and the relation
-            // then treats it as incompatible with everything. Before the fix the
-            // partial footprint was used as though it were complete, which is
-            // what let the skew through.
+            // So BOTH branches are FLAGGED, and the compatibility relation then
+            // treats the footprint as incompatible with everything: the
+            // transaction is serialized against all peers and runs alone, which
+            // makes its unvalidated reads trivially safe. Reverting just this
+            // flag is negative control NC-2, and it turns the H3 configs red
+            // again. Before the fix the partial footprint was used as though it
+            // were complete, which is what let the skew through.
+            //
+            // Not taken, and deliberately: shadowing the writes during analysis
+            // so that read-your-own-write stops throwing at all. Every write op
+            // carries its value as an F[V] which the walker never runs, so a
+            // shadow log would have to execute those effects in the analysis
+            // pass and would double-run effectful setters — a user-visible
+            // semantic change, and a throughput fix rather than a soundness one.
+            // Flagging alone is sound; see specs/README.md.
             .handleErrorWith {
               case StaticAnalysisShortCircuitException(idFootprint) =>
                 Async[F].delay((idFootprint.markUnderApproximated, None))

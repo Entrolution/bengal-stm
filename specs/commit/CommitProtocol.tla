@@ -7,10 +7,10 @@
  * method names, never line numbers — line refs rot and verify_anchors.sh
  * cannot guard them.
  *
- * SCOPE (docs/plans/formal-specs.md §4, §8 phase 3): the log run (read
- * phase), lock resolution, lock acquisition, the commit-time dirty check,
- * publish, release, and the dirty-resubmission refinement. The SCHEDULER is
- * not modelled — it is ASSUMED, as Contract C:
+ * SCOPE: the log run (read phase), lock resolution, lock acquisition, the
+ * commit-time dirty check, the commit-time COVERAGE check (CoverageOk — the
+ * H6 fix), publish, release, and the refinement path that both checks share.
+ * The SCHEDULER is not modelled — it is ASSUMED, as Contract C:
  *
  *     Contract C: no two transactions whose DECLARED footprints are
  *     incompatible (IdFootprint.isCompatibleWith = FALSE) are ever
@@ -19,16 +19,32 @@
  * Contract C is an ACTION GUARD here (TxnEnter). It is not an article of
  * faith: Spec B (scheduler/Scheduler.tla) CHECKS it as an invariant, and
  * since the H4 fix it verifies exhaustively. The assume-guarantee split is
- * therefore discharged, not aspirational.
+ * therefore discharged at both ends.
  *
- * THE CENTRAL DESIGN FACT this spec exists to interrogate (plan §3):
+ * THE CENTRAL DESIGN FACT this spec exists to interrogate:
  * read-only log entries are NEVER validated at commit time
  * (TxnLogReadOnlyVarEntry.isDirty = pure(false)) and they hold NO locks
  * (lock = None). Commit locks cover the WRITE SET only. The commit protocol
  * alone therefore does not give serializability — the scheduler's
  * footprint-based conflict avoidance is the only defence against stale
- * reads. Footprint ACCURACY is thus a safety precondition (H3), and any gap
- * in the compatibility relation is a direct hole (H5, fixed).
+ * reads. Footprint ACCURACY is thus a safety precondition, and any gap in the
+ * compatibility relation is a direct hole (H5, fixed).
+ *
+ * ACCURACY IS ENFORCED FROM BOTH ENDS, and the two ends catch disjoint
+ * failures. BEFORE the fact, the analyser FLAGS a footprint it could not
+ * finish computing, and the relation makes a flagged footprint incompatible
+ * with everything, so its transaction runs alone (H3, fixed —
+ * common/Footprint.tla). AFTER the fact, the commit protocol CHECKS, under
+ * the locks and before publishing anything, that the footprint it was
+ * scheduled on actually COVERS what the run really touched, and aborts the
+ * run without publishing if it does not (H6, fixed — CoverageOk below).
+ * Neither end suffices alone: the flag cannot see a footprint that was
+ * computed successfully from values that have since moved, and the coverage
+ * check is deliberately SKIPPED for a flagged footprint, which describes
+ * nothing and therefore covers nothing. Every collapse in the granularity
+ * argument below rests on accuracy holding one of these three ways — by the
+ * relation where the footprint is honest, by the flag where it is unknown, by
+ * the coverage check where it is simply wrong.
  *
  * ---------------------------------------------------------------------------
  * TWO ID SPACES — the subtlety at the heart of H2
@@ -79,8 +95,8 @@
  * right one, and it still explains why the FIXED protocol is safe: it
  * enumerates every lock two compatible transactions can share.
  *
- * WHY 2 TXNS AND 2 MAPS IS MINIMAL AND SUFFICIENT (the plan's mandatory
- * bounds note). Enumerate every way two COMPATIBLE transactions could share
+ * WHY 2 TXNS AND 2 MAPS IS MINIMAL AND SUFFICIENT — the bounds note every
+ * scenario here owes. Enumerate every way two COMPATIBLE transactions could share
  * a lock — every lock producer in TxnLogContext:
  *   - a plain var's lock: both must WRITE that var => raw-id overlap =>
  *     conjunct 1 => incompatible => Contract-C-excluded.
@@ -110,9 +126,53 @@
  * ---------------------------------------------------------------------------
  * GRANULARITY — one model step = one operation on one shared object
  * ---------------------------------------------------------------------------
- * Split in CODE ORDER. The rule learned in Phase 2 (H1) is that collapsing a
- * region can VERIFY A WRONG PROTOCOL CLEAN, so every collapse below carries
- * a written justification and none of them collapses a check-then-act gap.
+ * Split in CODE ORDER. The rule learned from H1 is that collapsing a region
+ * can VERIFY A WRONG PROTOCOL CLEAN, so every collapse below carries a
+ * written justification and none of them collapses a check-then-act gap.
+ *
+ * THE PREMISE THE COLLAPSES REST ON, and the three mechanisms that establish
+ * it. A4, A5 and A8 each fuse a region that touches several shared entities
+ * into a single step. Fusing is sound exactly when NO OTHER TRANSACTION CAN
+ * TOUCH THOSE ENTITIES MID-REGION — otherwise the model simply never
+ * generates the interleaving that tears them, and cannot report what it never
+ * generates. Nothing in this file's own structure supplies that premise. The
+ * protocol does, and post-fix it supplies it three different ways, one per
+ * kind of footprint a transaction can be scheduled on:
+ *
+ *   ACCURATE (declared = actual). Contract C excludes every transaction whose
+ *   footprint conflicts with ours, and since the H5 fix "conflicts" includes a
+ *   structure READER against a child WRITER (the relation's third conjunct).
+ *   So no peer in our window touches anything we write, or writes anything
+ *   under something we read.
+ *
+ *   FLAGGED (the static-analysis fallback) — THE H3 FIX. An under-approximated
+ *   footprint is FPU, and IsCompatible is FALSE against every footprint there
+ *   is: the empty one, a pure reader, itself. Contract C's guard therefore
+ *   admits such a transaction only when nobody else is in a window, and admits
+ *   nobody else while it is in one. IT RUNS ALONE — so there is no concurrency
+ *   for a coarser model to hide. Neither half of that is taken on trust:
+ *   LemmaUnderApproximatedIncompatibleWithAll machine-checks the
+ *   "incompatible with everything" half over the entire footprint universe, and
+ *   ContractCHolds — asserted by every fallback config — pins the guard that
+ *   turns it into mutual exclusion.
+ *
+ *   WRONG BUT UNFLAGGED (data-dependent divergence — ddw) — THE H6 FIX.
+ *   Neither mechanism above reaches a transaction whose analysis COMPLETED on
+ *   ids that have since gone stale: nothing threw, so nothing is flagged, so
+ *   the scheduler trusts it and lets it overlap. The commit-time coverage
+ *   check catches it under the locks and ABORTS IT BEFORE THE PUBLISH, so a
+ *   write the scheduler never knew about never lands; its re-run declares from
+ *   the actual log and rejoins the accurate case.
+ *
+ * THAT ARGUMENT IS LOAD-BEARING, AND IT USED TO BE WEAKER. It used to run: a
+ * coarser model can only HIDE anomalies and never invent them, and the
+ * fallback configs go RED anyway (H3), so no hidden anomaly could change their
+ * verdict. Every fallback config is now expected CLEAN. The escape hatch has
+ * evaporated, and an unsound collapse here would today be a FALSE GREEN on
+ * precisely the configs that used to excuse it. So the premise has to actually
+ * hold — and note that two of the three mechanisms that make it hold ARE the
+ * fixes, which is why these reductions became sound at the same moment the
+ * protocol did.
  *
  *   A1. The read phase is ONE STEP PER ACCESSED ENTITY. The log run reads
  *       live state entity by entity (getVar/getVarMapValue capture `initial`;
@@ -129,25 +189,37 @@
  *       (`.distinct` keeps first occurrence — so two entries aliasing to one
  *       map lock acquire it once, which is what stops a 1-permit Semaphore
  *       self-deadlocking). This is where H2's cycle forms.
- *   A4. The dirty check (isDirty) is ONE step. JUSTIFICATION: it reads only
- *       WRITE-SET entities (read-only entries hardcode isDirty = false), and
- *       every write-set entity contributes a lock to withLock. A concurrent
- *       writer to any of them either holds the same lock (excluded) or is
- *       footprint-incompatible (excluded by Contract C in accurate mode). In
- *       FALLBACK mode that justification weakens — but a coarser check can
- *       only HIDE anomalies, never invent them, and the fallback config
- *       already goes red (H3), so the verdict is unaffected.
- *   A5. Publish (log.commit) is ONE step. JUSTIFICATION — and this is the
- *       refinement obligation from plan §3, now DISCHARGED: in accurate mode
- *       no concurrent transaction can read OR write any entity in our write
- *       set. A reader or writer of a written entity has raw-id overlap; a
- *       reader of a written entity's PARENT is caught by the relation's
- *       third conjunct — THE H5 FIX. So the publish is unobservable-as-torn,
- *       which is exactly what licenses Spec B's atomic-commit abstraction.
- *       NOTE THE DEPENDENCY: before the H5 fix a whole-map reader COULD
- *       observe a partial write set, so the two-spec decomposition itself
- *       rested on that fix. Same conservative-abstraction argument as A4 for
- *       fallback mode.
+ *   A4. The dirty check (isDirty) is ONE step, and it needs LESS than the
+ *       premise above. It reads WRITE-SET entities only (read-only entries
+ *       hardcode isDirty = false); a transaction holds a lock on every entity
+ *       it writes; and any transaction whose publish could move one of those
+ *       entities holds THE SAME lock, so nothing the check reads can move
+ *       while it runs — whatever the footprints happen to say. That the lock
+ *       identity cannot go stale between resolution and use is not assumed
+ *       either: LockOwnerStable pins it. The one aliasing case the lock leg
+ *       does not cover — a structure WRITER against a child writer, whose
+ *       publishes move the same version while holding different locks — is
+ *       conjunct 2 of the relation and so is Contract-C-excluded; and no
+ *       catalogued transaction writes a structure at all, setVarMap being
+ *       barred by the scenario precondition below.
+ *       The COVERAGE half of the same guard reads no shared state whatsoever:
+ *       declared[t] moves only on t's own restart and ActualFP is a constant.
+ *       Collapsing that is not a reduction.
+ *   A5. Publish (log.commit) is ONE step — the refinement obligation the
+ *       two-spec split owes, now DISCHARGED. This one needs the FULL premise,
+ *       and in its strongest form: no concurrent transaction may so much as
+ *       READ an entity in our write set, or it could observe a half-applied
+ *       log. Three exclusions, and each is owed to a different fix. A reader
+ *       or writer of a written entity has raw-id overlap, so Contract C
+ *       excludes it. A reader of a written entity's PARENT is excluded only by
+ *       the relation's third conjunct (H5). And a peer TOUCHING an id its own
+ *       footprint never named — read or write alike, since Covers ranges over
+ *       both — is excluded only by the coverage check (H6), which aborts it
+ *       before it can publish anything it saw. With all three the publish is
+ *       unobservable-as-torn, which is what licenses Spec B's atomic-commit
+ *       abstraction: the two-spec decomposition rests on this reduction, and
+ *       this reduction rests on those fixes. Pre-H5 a whole-map reader really
+ *       could observe a partial write set.
  *   A6. Lock RELEASE is one step (Resource releases in reverse order).
  *       JUSTIFICATION: releasing only ever frees locks. Splitting it adds
  *       states in which strictly fewer locks are held, which cannot create a
@@ -165,13 +237,12 @@
  *       counterexample must be validated against the code before acceptance.
  *   A8. A whole-map READ is one step. TxnVarMap.get is NOT atomic in the code
  *       (it reads the index Ref, then each entry's Ref in turn), so it can in
- *       principle observe a torn map. Sound here by EXACTLY the A5 argument:
- *       in accurate mode the relation's third conjunct makes any child-entry
- *       writer incompatible with a structure reader, so no one can mutate the
- *       map under a whole-map read. LIKE A5, THIS REDUCTION DEPENDS ON THE H5
- *       FIX; pre-fix it was unsound, and it weakens in fallback mode (where,
- *       as with A4/A5, a coarser model can only hide anomalies, and the
- *       fallback configs already go red).
+ *       principle observe a torn map. The premise again, approached from the
+ *       other side: tearing our read takes a peer publishing a child of the
+ *       map we are reading, and the relation's third conjunct makes that peer
+ *       incompatible with us. PRE-H5 THIS REDUCTION WAS UNSOUND — the pair it
+ *       relies on being excluded was exactly the pair the relation let
+ *       through.
  *
  * VALUES ARE VERSION COUNTERS. A var's value is abstracted to a monotone
  * commit counter. The code's isDirty compares VALUES, so a write of an
@@ -200,7 +271,7 @@
  *
  * OUT OF SCOPE, deliberately:
  *   - The TxnLogRetry re-validation branch, as BEHAVIOUR. Its park/wake
- *     consequences are Spec B's (Phase 2, H1). What Spec A owes it is the
+ *     consequences are Spec B's (H1). What Spec A owes it is the
  *     fidelity pin that it is VACUOUS for a pure reader — no locks, never
  *     dirty — and that is the NoLocksWithoutWrites invariant below, which a
  *     read-only transaction in the accurate config makes non-trivial. A
@@ -215,9 +286,11 @@ EXTENDS Footprint, Integers, FiniteSets, Sequences
 
 CONSTANTS
     Txns,            \* the scenario's transaction set (catalogue below)
-    UnderDeclared,   \* txns whose static analysis fell back to an EMPTY
-                     \* footprint (TxnRuntime.commit's handleErrorWith) — the
-                     \* "fallback mode" of plan §4, per-transaction
+    UnderDeclared,   \* "fallback mode", per transaction: the txns whose static
+                     \* analysis THREW (TxnRuntime.commit's handleErrorWith).
+                     \* DeclaredInit gives them FPU({}, {}) — FLAGGED as
+                     \* under-approximated, NOT empty. Conflating those two was
+                     \* H3; keeping them apart is the fix.
     MaxInc           \* dirty-resubmission bound per txn
 
 ---------------------------------------------------------------------------
@@ -305,16 +378,30 @@ LockOfWrite(e, exists) ==
      h3a, h3b : H3. The classic write skew: r x / w y against r y / w x.
                 With ACCURATE footprints these are incompatible (raw-id
                 overlap) and Contract C serializes them. Put them in
-                UnderDeclared and the guard evaporates.
+                UnderDeclared and, PRE-FIX, the guard evaporated and both
+                published. Post-fix the flag serializes them instead — by a
+                different route, to the same place.
      h5a, h5b : the H5 idiom — read the whole map, insert a new key. Post-fix
                 the relation's third conjunct makes them incompatible, so
                 Contract C serializes them and CommitSnapshotValid HOLDS.
                 This is the H5 fix's independent, model-side confirmation.
-     wwa, wwb : two under-declared transactions that both WRITE x. The
-                contrast case for H3: the fallback IS caught here, by the
-                commit locks plus the dirty check, and the loser refines its
-                footprint from the actual log and re-runs. Exercises the
-                dirty-resubmission path.
+     wwa, wwb : plain writers of x. wwa serves two configs. In CommitDirty it
+                declares x ACCURATELY and plays the honest peer that ddw
+                collides with; in CommitH3Writer it goes in UnderDeclared, to
+                show that an under-declared transaction with NO READS AT ALL
+                could still (pre-fix) wreck a correctly-declared peer's reads.
+                HISTORICAL: wwa+wwb both under-declared used to be H3's
+                contrast case — the fallback WAS caught when the conflict
+                landed on the write set, which the locks and the dirty check do
+                cover. The H3 fix serializes them, so that pair can no longer
+                collide and wwb is now unused. See CommitDirty.cfg, which had
+                to be rebuilt around ddw for exactly this reason.
+     ddw      : declares a write to y, really writes x — DATA-DEPENDENT
+                divergence, with nothing flagged because nothing threw. The
+                only remaining way declared can differ from actual, hence the
+                only transaction that can still trip the coverage check (H6,
+                CommitH6.cfg) or reach the refinement path at all
+                (CommitDirty.cfg).
      pfa, pfb : H3 AS ORDINARY CODE ACTUALLY REACHES IT — the exact shape of
                 StaticAnalysisFallbackSpec. Each writes a fresh scratch key,
                 reads it back, and trips over a partial continuation; the
@@ -422,11 +509,12 @@ StaticFP(t) ==
       [] t = "pfb" -> FPU({}, {M1b})
       \* ddw DECLARES a write to Y but ACTUALLY writes X. Its static analysis
       \* COMPLETED -- nothing threw -- so it is NOT flagged and the scheduler
-      \* trusts it. This is the data-dependent-footprint divergence recorded in
-      \* plan section 10: a key or target computed from a value read BEFORE the
-      \* transaction was submitted, which then changed. Post-H3-fix it is the ONLY
-      \* remaining way declared can differ from actual, and therefore the only way
-      \* a transaction can still go DIRTY -- see CommitDirty.cfg.
+      \* trusts it. This is DATA-DEPENDENT FOOTPRINT DIVERGENCE: a key or target
+      \* computed from a value read BEFORE the transaction was submitted, which
+      \* then changed underneath it. Post-H3-fix it is the ONLY remaining way
+      \* declared can differ from actual, which makes it both the only thing that
+      \* can still drive the refinement path (CommitDirty.cfg) and the whole of
+      \* what the coverage check is for (CommitH6.cfg).
       [] t = "ddw" -> FP({}, {Y})
       [] OTHER     -> ActualFP(t)
 
@@ -605,11 +693,29 @@ Init ==
 
 ---------------------------------------------------------------------------
 (* CONTRACT C — the assumed scheduler guarantee, as an action guard.
-   Spec B checks this; here we assume it. In ACCURATE mode declared = actual
-   and the guard really excludes conflictors. In FALLBACK mode the declared
-   footprints are empty, the guard evaporates, and TLC explores exactly the
-   concurrency the real scheduler would permit. ONE guard, two behaviours —
-   the mode lives entirely in the footprints, never in the guard. *)
+   Spec B checks this; here we assume it. ONE guard, and the mode lives entirely
+   in the footprints and never in the guard. But what each mode DOES to it
+   inverted with the H3 fix, and the reading this paragraph used to carry is the
+   exact error that fix exists to destroy.
+
+     ACCURATE. declared = actual, and the guard excludes precisely the
+     conflictors.
+
+     FALLBACK. The declared footprint is FPU({}, {}), which the relation reads
+     as "I do not know what I touch" and never as "I touch nothing".
+     IsCompatible is therefore FALSE against every footprint, the empty one and
+     itself included (LemmaUnderApproximatedIncompatibleWithAll), and the guard
+     DOES NOT EVAPORATE: it tightens to TOTAL SERIALIZATION. An under-declared
+     transaction enters only when nobody else is in a window, and keeps everyone
+     out while it is in one. That is what makes its unvalidated reads safe — it
+     runs alone, so nothing can change underneath them — and it is why the
+     fallback configs now verify clean.
+
+     DATA-DEPENDENT. declared /= actual with NOTHING FLAGGED, because nothing
+     threw. The guard admits the overlap it would admit for any accurate pair,
+     and it is right to: it has no evidence of a conflict. Nothing HERE stops
+     that transaction. The commit-time coverage check does, under the locks,
+     before the publish (CoverageOk). *)
 ---------------------------------------------------------------------------
 
 TxnEnter(t) ==
@@ -654,7 +760,10 @@ ReadOne(t, e) ==
                    truncated>>
 
 (* Log run complete -> enter withLock. The write entries are now sorted by
-   their LOG KEY, which depends on the existence captured above. *)
+   their LOCK'S OWNER (LockOwnerVal — the H2 fix), which for a map entry is
+   what the existence captured above decides: the ENTRY's own TxnVar if the key
+   exists, THE MAP if it does not. Sorting on the log key instead is negative
+   control NC-1. *)
 ReadDone(t) ==
     /\ pc[t] = "read"
     /\ readPend[t] = {}
@@ -751,22 +860,49 @@ Publish(t) ==
     /\ UNCHANGED <<inc, declared, readPend, snapVer, snapEx, writeSeq, resIdx,
                    lockSeq, lockIdx, lockHolder, truncated>>
 
-(* DIRTY -> TxnResultLogDirty: release the locks, refine the declared
+(* NEEDS REFINEMENT -> TxnResultLogDirty: release the locks, refine the declared
    footprint from the ACTUAL log (freshIncarnation(refinement.getValidated)),
-   and re-run via submitTxnForImmediateRetry. This is where an under-declared
-   transaction self-corrects — but only ever on its WRITE set, because that
-   is all isDirty looks at. *)
-DirtyRestart(t) ==
-    /\ pc[t] = "validate"
-    /\ NeedsRefinement(t)
-    /\ inc[t] < MaxInc
+   and re-run via submitTxnForImmediateRetry.
+
+   BOTH failure modes arrive here, and the H6 fix changed what that is worth.
+   The DIRTY check reads the write set alone, so by itself it can only ever
+   self-correct a WRITE. The COVERAGE check quantifies over reads and writes
+   alike (see Covers), so an under-declared READ is caught here too — which it
+   never was before, and which is the whole reason a read-side defect could
+   survive the dirty machinery for as long as it did.
+
+   WHO ACTUALLY REACHES THIS ACTION: only a transaction whose declared footprint
+   diverged WITHOUT the analyser throwing. A FLAGGED transaction cannot — it
+   runs alone, so nothing moves underneath it and it is never dirty, and
+   CoverageOk short-circuits on the flag. DirtyRestart accordingly has ZERO
+   action coverage in every fallback config, and `ddw` is the only transaction in
+   the catalogue that ever gets here.
+
+   THE ACTION IS SPLIT IN TWO, AND THE SPLIT IS THE POINT. Both restarts do the
+   same thing; only the guard differs, and the two guards are DISJOINT. That
+   costs nothing — IsDirty \/ (~IsDirty /\ ~CoverageOk) is exactly
+   NeedsRefinement, so the transition relation, the state count and every verdict
+   are unchanged — but it makes TLC's action coverage attribute each transition
+   to the trigger that CAUSED it.
+
+   Without the split, "DirtyRestart fires" was the stated non-vacuity evidence for
+   CommitDirty.cfg, and it had quietly stopped meaning what it claimed: `ddw`
+   under-declares unconditionally, so COVERAGE restarts it whether or not the
+   dirty check works at all. Delete the entire IsDirty disjunct and the config
+   still verified clean with DirtyRestart still firing. The check had become
+   untested, and nothing said so. Now a dead dirty check reads as DirtyRestart: 0,
+   and a dead coverage check reads as CoverageRestart: 0. *)
+RefineAndRestart(t) ==
     /\ lockHolder' = [l \in Locks |->
                         IF lockHolder[l] = t THEN "none" ELSE lockHolder[l]]
     /\ inc'        = [inc      EXCEPT ![t] = inc[t] + 1]
     \* Refined from the ACTUAL log, which is complete by construction (it is built
-    \* from real log entries), so the refinement is NOT under-approximated. The
-    \* transaction therefore pays the serialization cost once and then runs at
-    \* full concurrency.
+    \* from real log entries), so the refinement is never flagged and the re-run is
+    \* scheduled on a footprint that describes the transaction. Note which way the
+    \* concurrency moves: ddw was TRUSTED and overlapping on its wrong footprint,
+    \* and its refined one conflicts with its peers HONESTLY — so the re-run is more
+    \* serialized than the run that failed, not less. Correctness is what the
+    \* refinement buys; it does not buy throughput back.
     /\ declared'   = [declared EXCEPT ![t] = Validated(ActualFP(t))]
     /\ pc'         = [pc       EXCEPT ![t] = "start"]
     /\ lockSeq'    = [lockSeq  EXCEPT ![t] = << >>]
@@ -776,6 +912,23 @@ DirtyRestart(t) ==
     /\ snapVer'    = [snapVer  EXCEPT ![t] = [e \in Entities |-> 0]]
     /\ snapEx'     = [snapEx   EXCEPT ![t] = [e \in Entities |-> FALSE]]
     /\ UNCHANGED <<readPend, version, keyExists, readValid, pubCount, truncated>>
+
+(* The write set moved under us: the commit-time dirty check. *)
+DirtyRestart(t) ==
+    /\ pc[t] = "validate"
+    /\ inc[t] < MaxInc
+    /\ IsDirty(t)
+    /\ RefineAndRestart(t)
+
+(* The write set is intact, but the DECLARED footprint does not describe the run:
+   the H6 coverage check. Guarded on ~IsDirty so the two are mutually exclusive
+   and each transition is attributed to one cause. *)
+CoverageRestart(t) ==
+    /\ pc[t] = "validate"
+    /\ inc[t] < MaxInc
+    /\ ~IsDirty(t)
+    /\ ~CoverageOk(t)
+    /\ RefineAndRestart(t)
 
 (* At the incarnation bound the fiber retires. The ghost makes the truncation
    VISIBLE — a clipped exploration horizon must never masquerade as a clean
@@ -825,7 +978,7 @@ Next ==
         \/ ReadDone(t)
         \/ ResolveOne(t)  \/ ResolveDone(t)
         \/ AcquireOne(t)  \/ AcquireDone(t)
-        \/ Publish(t)     \/ DirtyRestart(t) \/ DirtyTruncate(t)
+        \/ Publish(t)     \/ DirtyRestart(t) \/ CoverageRestart(t) \/ DirtyTruncate(t)
         \/ Release(t)
     \/ \E t \in Txns, e \in Entities : ReadOne(t, e)
     \/ Terminating
@@ -840,7 +993,8 @@ StateConstraint ==
     \A e \in Entities : version[e] <= 4
 
 ---------------------------------------------------------------------------
-(* Invariants (plan §4 property table) *)
+(* Invariants — the property table lives in specs/README.md, which also
+   carries each one's verdict and its negative control. *)
 ---------------------------------------------------------------------------
 
 TypeOK ==
@@ -872,25 +1026,34 @@ NoWaitsForCycle ==
     LET TC == TCRec(WaitsFor, Cardinality(Txns))
     IN  \A t \in Txns : <<t, t>> \notin TC
 
-(* --- H3 / H5: CommitSnapshotValid ---------------------------------------
-   At its publish, every entity a transaction READ was still at the version
-   it read. This is the strong (snapshot) form of strict serializability:
-   sufficient, not necessary. If it fails in ACCURATE mode by some mechanism
-   other than a known one, fall back to an explicit history-based
-   serializability check before declaring an anomaly (plan §4).
+(* --- H3 / H5 / H6: CommitSnapshotValid -----------------------------------
+   At its publish, every entity a transaction READ was still at the version it
+   read. This is the strong (snapshot) form of strict serializability:
+   sufficient, not necessary. If it ever fails by some mechanism other than a
+   known one, fall back to an explicit history-based serializability check
+   before declaring an anomaly.
 
-   FALLBACK mode: expected RED (H3 — reads are never commit-validated and
-   there are no read locks, so r x/w y against r y/w x both publish).
-   ACCURATE mode: expected to HOLD, INCLUDING for the H5 idiom (whole-map
-   read + new-key insert) — the relation's third conjunct makes that pair
-   incompatible and Contract C serializes it. That is the H5 fix, confirmed
-   from the model side. *)
+   THIS INVARIANT CARRIED EVERY READ-SIDE DEFECT THIS SPEC FOUND, and it now
+   HOLDS IN EVERY MODE — one mode per fix:
+
+     ACCURATE, including the H5 idiom (whole-map read + new-key insert): the
+     relation's third conjunct makes that pair incompatible and Contract C
+     serializes it. The H5 fix, confirmed from the model side.
+     FALLBACK: the declared footprint is flagged, so it is incompatible with
+     everything and the transaction runs alone. The H3 fix. This is where the
+     `r x / w y` against `r y / w x` skew used to publish both sides.
+     DATA-DEPENDENT: the coverage check aborts the divergent transaction under
+     the locks, before its unannounced write can land under a peer's read. The
+     H6 fix.
+
+   All three are still hunted: the negative controls in specs/README.md revert
+   each fix in turn, and this invariant goes red again for every one of them. *)
 CommitSnapshotValid == \A t \in Txns : readValid[t] /= "bad"
 
 (* A transaction's writes are published at most once per run. *)
 PublishedExactlyOnce == \A t \in Txns : pubCount[t] <= 1
 
-(* --- Fidelity pin (plan §4) ---------------------------------------------
+(* --- Fidelity pin --------------------------------------------------------
    Only UPDATE entries contribute a lock (TxnLogEntry.lock = None on every
    read-only entry), and only update entries can be dirty. A pure reader
    therefore acquires NO locks and can NEVER report dirty — which is exactly

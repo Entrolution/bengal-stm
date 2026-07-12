@@ -8,15 +8,35 @@
 
 Software Transactional Memory for [Cats Effect](https://typelevel.org/cats-effect/) with intelligent scheduling.
 
-Bengal STM is a library for writing composable concurrency operations based on in-memory transactions. The library handles all aspects of concurrency management including locking, retries, semantic blocking, and optimised transaction scheduling. STM provides a higher-level concurrency abstraction that offers a safe, efficient, and composable alternative to locks, mutexes, and other low-level primitives.
+Bengal STM lets you compose concurrent operations as in-memory transactions: you write the
+sequence of reads and writes you want, and the library takes care of locking, retries,
+semantic blocking and scheduling.
 
 ## Key Features
 
-- **Intelligent Runtime Scheduler**: Unlike blindly optimistic STM implementations, Bengal's runtime uses a custom scheduler that performs fast static analysis of transaction variable domains to reduce retry likelihood. This ensures consistent performance even for highly-contentious transactional variables.
+- **A scheduler that knows what each transaction will touch.** Before running a transaction,
+  Bengal computes its **footprint** — the variables and map keys it will access — and runs
+  only transactions that cannot conflict at the same time. A blindly optimistic STM lets
+  conflicting transactions race and then throws the loser's work away; Bengal mostly avoids
+  the collision. The footprint is more than a throughput device: reads take no locks and are
+  never validated at commit time, so the footprint check is the *only* thing standing between
+  a transaction and a stale read. See [Static analysis and transaction
+  footprints](#static-analysis-and-transaction-footprints) — it also explains the one shape
+  that costs you concurrency, and how to avoid it.
 
-- **First-Class Transactional Maps**: In addition to transactional variables (`TxnVar`), Bengal includes performant transactional maps (`TxnVarMap`) as a core API data structure, providing performance benefits over wrapping an entire map in a transactional variable.
+- **Transactional maps as a first-class structure.** `TxnVarMap` tracks conflicts per *key*,
+  so two transactions writing different keys of the same map run concurrently. Wrapping a
+  `Map` in a `TxnVar` makes every write conflict with every other.
 
-- **Cats Effect Integration**: Built on Cats Effect for seamless integration with the Typelevel ecosystem.
+- **Semantic blocking.** `waitFor` parks a transaction until its condition can hold, without
+  blocking a thread. See [How `waitFor` wakes up](#how-waitfor-wakes-up) — the rule there is
+  load-bearing, and getting it wrong parks a transaction permanently.
+
+- **Built on Cats Effect**, polymorphic in `F[_]` over `Async`.
+
+The commit and scheduling protocols are specified in TLA+ and model-checked in CI. That work
+found six concurrency defects, three of which no test could have caught — see
+[Correctness](#correctness).
 
 ## Requirements
 
@@ -36,16 +56,16 @@ See the [Maven Central badge](#bengal-stm) above for the latest version.
 ## Quick Start
 
 ```scala
-import bengal.stm.STM
-import bengal.stm.model._
-import bengal.stm.syntax.all._
+import ai.entrolution.bengal.stm.STM
+import ai.entrolution.bengal.stm.model._
+import ai.entrolution.bengal.stm.syntax.all._
 import cats.effect.{IO, IOApp}
 
 object QuickStart extends IOApp.Simple {
   def run: IO[Unit] =
     STM.runtime[IO].flatMap { implicit stm =>
       for {
-        counter <- TxnVar.of(0)
+        counter <- TxnVar.of[IO, Int](0)
         _       <- counter.modify(_ + 1).commit
         value   <- counter.get.commit
         _       <- IO.println(s"Counter: $value")
@@ -53,6 +73,10 @@ object QuickStart extends IOApp.Simple {
     }
 }
 ```
+
+All three imports are needed. `syntax.all._` is what brings `.get` / `.set` / `.modify` / `.commit`
+into scope; without it you get a `get is not a member` error rather than a missing-import one,
+because the runtime's own `private[stm]` members shadow the extension methods.
 
 ## API Reference
 
@@ -64,18 +88,20 @@ object QuickStart extends IOApp.Simple {
 | `TxnVarMap.of[IO, String, Int](Map())` | Creates a transactional map | `def of[F[_]: STM: Async, K, V](valueMap: Map[K, V]): F[TxnVarMap[F, K, V]]` | |
 | `txnVar.get` | Retrieves value of transactional variable | `def get: Txn[V]` | |
 | `txnVarMap.get` | Retrieves an immutable map (i.e. a view) representing transactional map state | `def get: Txn[Map[K, V]]` | Performance-wise it is better to retrieve individual keys instead of acquiring the entire map |
-| `txnVarMap.get("David")` | Retrieves optional value depending on whether key exists in the map | `def get(key: K): Txn[Option[V]]` | Will raise an error if the key is never created (previously or current transaction). A `None` is returned if the value has been deleted in the current transaction. |
-| `txnVar.set(100)` | Sets the value of transactional variable | `def set(newValue: V): Txn[Unit]` | |
-| `txnVarMap.set(Map("David" -> 100))` | Uses an immutable map to set the transactional map state | `def set(newValueMap: Map[K, V]): Txn[Unit]` | Performance-wise it is better to set individual keys instead of setting the entire map. This operation will create/delete key-values as needed. |
-| `txnVarMap.set("David", 100)` | Upserts the key-value into the transactional map | `def set(key: K, newValue: V): Txn[Unit]` | Will create the key-value in the transactional map if the key was not present |
+| `txnVarMap.get("David")` | Retrieves the value for a key, if present | `def get(key: => K): Txn[Option[V]]` | Returns `None` when the key does not exist — whether it was never created, or was deleted earlier in this transaction. It does **not** raise. |
+| `txnVar.set(100)` | Sets the value of transactional variable | `def set(newValue: => V): Txn[Unit]` | |
+| `txnVarMap.set(Map("David" -> 100))` | Uses an immutable map to set the transactional map state | `def set(newValueMap: => Map[K, V]): Txn[Unit]` | Better to set individual keys than the whole map. Creates/deletes key-values as needed. |
+| `txnVarMap.set("David", 100)` | Upserts the key-value into the transactional map | `def set(key: => K, newValue: => V): Txn[Unit]` | Creates the key if it was not present |
 | `txnVar.modify(_ + 5)` | Modifies the value of a transactional variable | `def modify(f: V => V): Txn[Unit]` | |
-| `txnVarMap.modify("David", _ + 20)` | Modifies the value in a transactional map for a given key | `def modify(key: K, f: V => V): Txn[Unit]` | Will throw an error if the `key` is not present in the map |
-| `txnVarMap.remove("David")` | Removes a key-value from the transactional map | `def remove(key: K): Txn[Unit]` | Will throw an error if the key doesn't exist in the map |
-| `pure(10)` | Lifts a value into a transactional monad | `def pure[V](value: V): Txn[V]` | |
-| `delay(10+2)` | Lifts a computation into a transactional monad (by-name value) | `def delay[V](value: => V): Txn[V]` | Argument will be evaluated every time a transaction is attempted. Not advised for side effects. |
-| `abort(new RuntimeException("foo"))` | Aborts the current transaction | `def abort(ex: Throwable): Txn[Unit]` | Variables/Maps changes will not be persisted if the transaction is aborted |
-| `txn.handleErrorWith(_ => pure("bar"))` | Absorbs an error/abort and remaps to another transaction | `def handleErrorWith(f: Throwable => Txn[V]): Txn[V]` | |
-| `waitFor(value > 10)` | Semantically blocks a transaction until a condition is met | `def waitFor(predicate: => Boolean): Txn[Unit]` | Blocking is semantic (no thread locking). Implemented via retries initiated by variable/map updates. |
+| `txnVarMap.modify("David", _ + 20)` | Modifies the value in a transactional map for a given key | `def modify(key: => K, f: V => V): Txn[Unit]` | Fails the transaction if the key is absent. Recoverable with `handleErrorWith`. |
+| `txnVarMap.remove("David")` | Removes a key-value from the transactional map | `def remove(key: => K): Txn[Unit]` | Fails the transaction if the key is absent. Recoverable with `handleErrorWith`. |
+| `STM[IO].pure(10)` | Lifts a value into a transactional monad | `def pure[V](value: V): Txn[V]` | |
+| `STM[IO].delay(10 + 2)` | Lifts a by-name computation into a transactional monad | `def delay[V](value: => V): Txn[V]` | **Runs at least twice per commit attempt** — once in the analysis pass, once in the real run — and again on every retry. Must be free of side effects. See [Static analysis](#static-analysis-and-transaction-footprints). |
+| `STM[IO].fromF(someIO)` | Lifts an `F[V]` into a transactional monad | `def fromF[V](spec: F[V]): Txn[V]` | Same multiple-evaluation rule as `delay`, and the same warning applies with more force: this is the only way to lift an arbitrary effect into a transaction. |
+| `STM[IO].unit` | The unit transaction | `val unit: Txn[Unit]` | |
+| `STM[IO].abort(new RuntimeException("foo"))` | Aborts the current transaction | `def abort(ex: Throwable): Txn[Unit]` | No changes are persisted. Surfaces as a failed `F` from `commit`, and is recoverable with `handleErrorWith`. |
+| `txn.handleErrorWith(_ => STM[IO].pure("bar"))` | Absorbs an error/abort and remaps to another transaction | `def handleErrorWith(f: Throwable => Txn[V]): Txn[V]` | Recovers errors and aborts. It does **not** absorb a `waitFor` retry — a blocked transaction stays blocked. |
+| `STM[IO].waitFor(value > 10)` | Semantically blocks a transaction until a condition is met | `def waitFor(predicate: => Boolean): Txn[Unit]` | No thread is blocked. **The predicate's inputs must be read from a `TxnVar`/`TxnVarMap` inside the same transaction** — see [How `waitFor` wakes up](#how-waitfor-wakes-up). A predicate that *throws* aborts the transaction rather than retrying it. |
 | `txnVar.setF(Async[F].pure(100))` | Sets value via an effect `F[V]` | `def setF(newValue: F[V]): Txn[Unit]` | Requires `syntax.all._` import |
 | `txnVar.modifyF(v => Async[F].pure(v + 1))` | Modifies value via an effectful function | `def modifyF(f: V => F[V]): Txn[Unit]` | Requires `syntax.all._` import |
 | `txnVarMap.set(Async[F].pure(Map("k" -> 1)))` | Sets map state via an effect | `def set(newValueMap: F[Map[K, V]]): Txn[Unit]` | Requires `syntax.all._` import |
@@ -84,16 +110,28 @@ object QuickStart extends IOApp.Simple {
 | `txnVarMap.modifyF(key, v => Async[F].pure(v))` | Modifies key-value via an effectful function | `def modifyF(key: => K, f: V => F[V]): Txn[Unit]` | Requires `syntax.all._` import |
 | `txn.handleErrorWithF(e => Async[F].pure(pure("fallback")))` | Effectful error recovery | `def handleErrorWithF(f: Throwable => F[Txn[V]]): Txn[V]` | Requires `syntax.all._` import |
 
-**Note on F-variant methods:** The methods suffixed with `F` (e.g. `setF`, `modifyF`, `handleErrorWithF`) are available via the `import bengal.stm.syntax.all._` import. The `F[_]` arguments passed to these methods **must not encapsulate side effects** — they are evaluated during transaction attempts and may be retried.
+**On `STM[F].` and the imports.** `pure`, `delay`, `fromF`, `unit`, `abort` and `waitFor` are
+members of `STM[F]`, not free functions — call them as `STM[IO].pure(...)`. The extension
+methods (`.get`, `.set`, `.modify`, `.commit`, and the `F`-variants) come from
+`import ai.entrolution.bengal.stm.syntax.all._`. An implicit `STM[F]` in scope is **not**
+enough on its own; you need the import.
+
+**On effectful arguments.** The `F`-variants (`setF`, `modifyF`, `handleErrorWithF`, and the
+`F[_]` overloads of `set`) and the `delay`/`fromF` combinators **must not encapsulate side
+effects**: they are evaluated at least twice per commit attempt, and again on every retry.
+
+**On by-name arguments.** Every `=>` above is load-bearing rather than cosmetic. Whether an
+expression is evaluated during the analysis pass — and can therefore throw there — depends on
+exactly this; see [Static analysis](#static-analysis-and-transaction-footprints).
 
 ## Example: Bank Transfer
 
 This example demonstrates transactional transfers between accounts with semantic blocking until the bank opens:
 
 ```scala
-import bengal.stm.STM
-import bengal.stm.model._
-import bengal.stm.syntax.all._
+import ai.entrolution.bengal.stm.STM
+import ai.entrolution.bengal.stm.model._
+import ai.entrolution.bengal.stm.syntax.all._
 import cats.effect.{IO, IOApp}
 import scala.concurrent.duration._
 
@@ -169,59 +207,87 @@ are not applied**, because the transaction has not been scheduled yet.
 
 That last point has a consequence worth knowing about.
 
+### What the analysis pass actually evaluates
+
+Not everything in your transaction runs during analysis, and the distinction decides whether
+a given expression can throw there:
+
+| Evaluated during analysis | Not evaluated during analysis |
+|---|---|
+| `delay` / `fromF` thunks | the **value** argument to `set` / `modify` |
+| **map key** thunks (`map.get(k)`, `map.set(k, _)`, …) | `pure` values |
+
+Both columns are by-name, so it is not something you can read off the call site — it is a
+property of the combinator. The value you pass to `set` is suspended and the analyser never
+looks at it; the *key* you pass to `set` is forced, because the footprint cannot be computed
+without it.
+
 ### Reading back a value you just wrote
 
 During the analysis pass, a read of something the transaction itself wrote earlier returns
-the **pre-transaction** value, not the written one. If the next step cannot cope with that,
-it throws — during analysis only, never at run time:
+the **pre-transaction** value, not the written one. If a step in the *forced* column cannot
+cope with that, it throws — during analysis only, never at run time:
 
 ```scala
 for {
   _   <- inventory.set(sku, 10)
-  qty <- inventory.get(sku)      // analysis sees None; the real run sees Some(10)
-  _   <- restock.set(sku, qty.get + 1)  // `.get` on None throws — but only during analysis
+  qty <- inventory.get(sku)                      // analysis sees None; the real run sees Some(10)
+  n   <- STM[IO].delay(qty.get + 1)              // forced: `.get` on None throws, in analysis only
+  _   <- restock.set(sku, n)
 } yield ()
 ```
+
+Note where the `.get` sits. Written as `restock.set(sku, qty.get + 1)` this transaction is
+**fine** — the value argument is never evaluated by the analyser, so nothing throws and the
+footprint is complete. Move the same expression into a `delay` and it becomes the problem
+case. The hazard follows the combinator, not the expression.
+
+The other way to hit it is a key thunk that throws — for example, computing a map key from
+a value you read back and `.get`-ing an `Option` to do it.
 
 Bengal handles this safely, and the safe answer costs throughput. When analysis cannot
 determine the whole footprint, the transaction is marked as **under-approximated**, and an
 under-approximated footprint is treated as conflicting with *everything*. The transaction
-runs **alone**.
+runs **alone**, and it keeps doing so on every attempt — this is not a one-off cost that a
+retry recovers.
 
 That is deliberate, and it is not conservatism for its own sake. Reads are not validated at
 commit time and take no locks, so the scheduler's footprint check is the *only* thing
 standing between a transaction and a stale read. A footprint that is missing entries does
 not make the scheduler slightly less precise — it switches its protection off. Running such
-a transaction on its own is what keeps it correct. (Before this was fixed, the transaction
-above could produce non-serializable results in ~99% of contended runs.)
+a transaction on its own is what keeps it correct. (Before this was fixed, a pair of such
+transactions produced non-serializable results in 198 of 200 contended runs.)
 
-Measured cost: such a transaction commits at roughly **half** the throughput of one whose
-footprint is fully known. Everything else is unaffected.
+Measured cost: **−41%** throughput against the same workload before the fix (6,332 → 3,756
+ops/s), which is about 56% of what a comparable transaction with a fully-known footprint
+achieves. Ordinary workloads pay 1–7%; a data-dependent key (below) pays 12%. See
+[benchmarks](benchmarks/README.md), and read its opening before trusting any number you
+produce there yourself.
 
 ### Avoiding it
 
-Write the step so it does not depend on reading back your own write, or make it total:
+Keep the throwing expression out of the forced positions:
 
 ```scala
-// Keep the value you are about to write, instead of reading it back:
+// Best: keep the value you are about to write, instead of reading it back.
 val qty = 10
 for {
   _ <- inventory.set(sku, qty)
   _ <- restock.set(sku, qty + 1)
 } yield ()
 
-// Or make the continuation total, so nothing throws during analysis:
+// Or make the forced expression total, so nothing throws during analysis.
 for {
   _   <- inventory.set(sku, 10)
   qty <- inventory.get(sku)
-  _   <- restock.set(sku, qty.getOrElse(0) + 1)   // `.getOrElse`, not `.get`
+  n   <- STM[IO].delay(qty.getOrElse(0) + 1)   // `.getOrElse`, not `.get`
+  _   <- restock.set(sku, n)
 } yield ()
 ```
 
-The same applies to anything else that can throw inside a transaction's *analysis* —
-partial pattern matches, `.head` on a possibly-empty collection, and so on. If it throws
-only because a write has not been applied yet, it costs you concurrency rather than
-correctness.
+The same applies to anything else that can throw in a forced position — partial pattern
+matches, `.head` on a possibly-empty collection, and so on. If it throws only because a write
+has not been applied yet, it costs you concurrency rather than correctness.
 
 ### Footprints computed from values you read
 
@@ -229,6 +295,65 @@ A related case: if a map key is computed from a value the transaction reads, the
 depends on that value — and the analysis pass runs *before* the transaction is scheduled, so
 the value can change in between. Bengal detects this at commit time, discards the run before
 it publishes anything, and re-runs with the correct footprint. It is safe; it costs a retry.
+
+## How `waitFor` wakes up
+
+`waitFor(predicate)` parks the transaction until the predicate can hold. What wakes it is
+**not** the predicate — it is the transaction's **read set**. A parked transaction is woken
+when another transaction commits a write that its footprint conflicts with; it then re-runs
+from the top and re-evaluates the predicate against fresh reads.
+
+The rule that follows is short, and getting it wrong parks a transaction permanently:
+
+> **Everything the predicate depends on must be read from a `TxnVar` or `TxnVarMap` inside the
+> same transaction.**
+
+```scala
+// CORRECT — `isOpen` is read inside the transaction, so it is in the read set,
+// and a commit to `bankOpen` wakes this.
+for {
+  isOpen <- bankOpen.get
+  _      <- STM[IO].waitFor(isOpen)
+  _      <- from.modify(_ - amount)
+} yield ()
+
+// WRONG — the read is hoisted out. The transaction's read set is empty, nothing
+// can ever conflict with it, and no commit will ever wake it. It parks forever.
+val isOpen = bankOpenRef.get.unsafeRunSync()
+for {
+  _ <- STM[IO].waitFor(isOpen)
+  _ <- from.modify(_ - amount)
+} yield ()
+```
+
+Two further details:
+
+- A predicate that **throws** aborts the transaction; it does not retry it.
+- `handleErrorWith` does **not** absorb a `waitFor` retry. Wrapping a blocking transaction in
+  an error handler will not make it stop blocking.
+
+## Correctness
+
+Bengal's commit and scheduling protocols are specified in TLA+ and model-checked in CI on
+every change. The specs live in [`specs/`](specs/README.md).
+
+That work found a lock-order deadlock, a write skew, a phantom read, a double execution, two
+distinct lost wakeups, a data-dependent footprint divergence, and an unbounded retry spin —
+all in the shipped library. Every one is fixed, and every one is pinned by a CI expectation,
+so its counterexample would come back if the fix regressed.
+
+The part worth knowing, if you are weighing a library like this one:
+
+> **Several of these cannot be found by running the code at all.** A lost wakeup needs a
+> conflicting transaction's entire submit-and-commit to land inside a window a couple of
+> microseconds wide. Randomized testing did not produce one across millions of operations,
+> and neither did a soak built specifically to try. The model finds it in seconds.
+
+That is measured, not asserted: every fix was reverted in turn and the behavioural suites
+re-run to see which would have caught it. The table is in
+[`specs/README.md`](specs/README.md). The conclusion it points to is worth stating plainly —
+**a green test suite is not evidence that these protocols are correct. The pinned models
+are.**
 
 ## Background
 
@@ -238,21 +363,37 @@ For an introduction to STM concepts, see [Beautiful Concurrency](https://www.mic
 
 ### Why another STM implementation?
 
-Blindly optimistic execution strategies can lead to poor performance in high-contention scenarios. In production, this sometimes required falling back to sequential transaction execution, negating the benefits of STM. Bengal addresses this with a scheduler that performs static analysis to reduce contention, enabling genuine concurrency even in high-contention scenarios.
+Under high contention, a blindly optimistic STM does a lot of work it then throws away. In
+production that pushed us toward running transactions sequentially, which gives up the point of
+STM. Bengal's scheduler works out what each transaction will touch before running it, so
+conflicting transactions are kept apart instead of colliding and retrying.
 
-Additionally, Bengal treats `Map` as a fundamental transactional data structure (analogous to a database index), which presents interesting scheduling challenges around structural updates but proves very useful in practice.
+Bengal also treats `Map` as a first-class transactional structure, roughly the way a database
+treats an index. That makes structural updates an interesting scheduling problem — a whole-map
+read has to conflict with a new-key insert somewhere else in the map, or you get phantoms — and
+it is worth the trouble in practice.
 
 ### How does Bengal differ from cats-stm?
 
-[cats-stm](https://timwspence.github.io/cats-stm/) is an excellent STM implementation for Cats Effect. Bengal differs in:
+[cats-stm](https://timwspence.github.io/cats-stm/) is an excellent STM for Cats Effect. Bengal
+differs in:
 
-- **Implementation**: Bengal uses [Free Monads](https://typelevel.org/cats/datatypes/freemonad.html) with different interpreters for static analysis and building transactional logs
-- **API design**: cats-stm has `orElse` for bypassing retries; Bengal intentionally omits this for clearer `waitFor` semantics
-- **Initialization**: `TxnVar` and `TxnVarMap` initialization occurs outside the `Txn[_]` monad
+- **Scheduling**: cats-stm executes optimistically and retries on conflict. Bengal computes each
+  transaction's footprint up front and schedules around conflicts.
+- **Maps**: `TxnVarMap` tracks conflicts per key, rather than per map.
+- **Implementation**: [Free monads](https://typelevel.org/cats/datatypes/freemonad.html) with two
+  interpreters — one for the static-analysis pass, one for the transaction log.
+- **API**: cats-stm has `orElse` to bypass a retry; Bengal omits it (see below).
+- **Verification**: Bengal's commit and scheduling protocols are specified in TLA+ and
+  model-checked in CI. See [Correctness](#correctness).
 
 ### Why is there no way to bypass `waitFor`?
 
-`waitFor` is designed to have clear semantic delineation from conditional `if` statements. Bengal short-circuits monadic evaluation on failed `waitFor` predicates as a performance optimization, which wouldn't be possible if bypass mechanisms needed to be checked.
+Because Bengal abandons a transaction the instant a `waitFor` predicate fails, rather than running
+it to completion and discarding the result. That short-circuit is only sound if nothing downstream
+could still rescue the transaction — which is exactly what an `orElse` would be. Adding one would
+mean checking, on every failed predicate, whether some later branch might recover it. `waitFor`
+means *block until this holds*, and nothing else.
 
 ### Why 'Bengal'?
 

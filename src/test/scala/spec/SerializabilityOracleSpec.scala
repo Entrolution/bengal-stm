@@ -49,10 +49,15 @@ import bengal.stm.syntax.all._
   *     insert — the H5 phantom, fixed by the relation's third conjunct, DocumentsParentReadChildWriteCaught in
   *     specs/common/FootprintLemmas.tla) is covered deterministically by the dedicated regression test below; folding
   *     ReadWholeMap into the generators is a candidate expansion now that the idiom serializes.
-  *   - waitUntil/retry is out of scope until the Phase 2 spec work lands (park/wake is unmodelled and carries its own
-  *     hypothesis, H1).
-  *   - Transactions here have statically known access sets, so the static-analysis fallback (H4's enabling condition)
-  *     stays dormant.
+  *   - `waitFor`/retry stays out of the GENERATED suite: a parked transaction has no outcome to compare against a
+  *     serial order until something wakes it, and a generator cannot be relied on to produce the waker. The park/wake
+  *     machinery is covered behaviourally by `soak/RetrySoakSpec` and `spec/AbsentKeyParkSpec`, and by the model
+  *     (`specs/scheduler/SchedulerRetry.cfg`, a CI pin). The one deterministic park/wake case that belongs here — a
+  *     reader woken through a fresh incarnation — is below.
+  *   - Transactions here have statically known access sets, so the static-analysis fallback stays dormant. Post-H3-fix
+  *     that is a statement about COST, not safety: an under-approximated footprint is incompatible with everything, so
+  *     it never overlaps a peer and can never go dirty. The only divergence left that can open a commit-time window is
+  *     the DATA-DEPENDENT kind — which is exactly what the dirty-path test below uses to reach it.
   */
 class SerializabilityOracleSpec extends AnyFreeSpec with ScalaCheckPropertyChecks with Matchers {
 
@@ -112,9 +117,9 @@ class SerializabilityOracleSpec extends AnyFreeSpec with ScalaCheckPropertyCheck
       }
     }
 
-  // The timeout turns a deadlock-class regression (the #51/#52 defect
-  // family this oracle exists to catch) into a red test with the workload
-  // in the failure message, instead of a hung CI job.
+  // A deadlock-class regression HANGS rather than failing, so the timeout is
+  // what turns it into a red test — with the workload in the failure message —
+  // instead of a CI job that runs out its 60 minutes and reports nothing.
   private def runWorkload(
     init: ModelState,
     workload: List[List[Op]]
@@ -223,10 +228,6 @@ class SerializabilityOracleSpec extends AnyFreeSpec with ScalaCheckPropertyCheck
   }
 
   // -------------------------------------------------------------------
-  // H5 regression: whole-map read + new-key insert must serialize
-  // -------------------------------------------------------------------
-
-  // -------------------------------------------------------------------
   // Dirty-path exerciser: resubmissions preserve exactly-once effects.
   // NOTE: this drives the machinery the H4 fix hardened (measured: ~120
   // TxnResultLogDirty resubmissions per 300 reps) but does NOT reach the
@@ -306,10 +307,10 @@ class SerializabilityOracleSpec extends AnyFreeSpec with ScalaCheckPropertyCheck
      * transaction as a freshIncarnation. That wake-time rebuild is
      * load-bearing, not hygiene: cascadeFired is sticky on the parked
      * object, so resubmitting it raw would make its next triggerUnsub a
-     * no-op and deadlock any downstream subscriber. This is the only
-     * executable coverage of the park→wake leg until the Phase 2 spec
-     * models it (H1); the 30s timeout turns a wake regression into a red
-     * test rather than a hang.
+     * no-op and deadlock any downstream subscriber. THAT is what this rep
+     * count is for — the rebuild, not park/wake in general, which is
+     * `soak/RetrySoakSpec`'s job and `specs/scheduler/SchedulerRetry.cfg`'s.
+     * A lost wakeup hangs, so the timeout is the assertion.
      */
     "reader parked on waitFor completes after the writer commits" in {
       val reps = 50

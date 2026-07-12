@@ -35,16 +35,24 @@ measurement that is worth doing on hardware that throttles.
 ## Method
 
 `before` is `4b0638d` — the tree with H4/H5/H1 already fixed, but **not** H2, H3 or H6.
-`after` is the current library. Every fix in the workstream was `private[stm]`, so the
-same benchmark compiles unchanged against both:
+`after` is the fixed library, with one caveat recorded under the table: it is not quite a
+single revision. Every fix in the workstream was `private[stm]`, so the same benchmark
+compiles unchanged against both:
 
 ```bash
+mkdir -p /tmp/before   # tar -C does not create its target; without this the next line fails
 git archive 4b0638d src/main/scala | tar -x -C /tmp/before
 # swap /tmp/before/src/main over src/main, sbt clean, re-run, swap back
 ```
 
-`@OperationsPerInvocation(32)` makes JMH report per-**transaction** throughput, so all
-benchmarks are directly comparable.
+`@OperationsPerInvocation(32)` makes JMH divide through by the batch and report
+per-**transaction** throughput on the six batched benchmarks, so all seven are directly
+comparable. `uncontendedCommit` carries no such annotation and needs none — it commits
+exactly one transaction per invocation.
+
+**That `32` is a literal in six places, and `Batch` is a separate `final val 32`. The two
+must track each other.** Change `Batch` to 64 without changing the annotations and every
+number below is silently wrong by 2×, with nothing anywhere to say so.
 
 ## Results
 
@@ -60,8 +68,19 @@ Dedicated Ryzen 9 5900X (24 cores), JDK 21, `-f1 -wi 8 -i 12`. Per-transaction o
 | `dataDependentKey` | 3,653 | 3,223 | **−12%** | H6 coverage check + refinement |
 | `underDeclaredConcurrent` | 6,332 | 3,756 | **−41%** | **the H3 cliff** |
 
-Three of the seven were measured before the `traverse` optimisation below landed; their
-logs are small, so it does not move them measurably.
+**The `after` column is not one revision, and this is the weakest thing on this page.**
+Three of the seven `after` numbers were taken before the `traverse` change below landed,
+and *which* three was never written down. Only one can be recovered from what is here:
+`wholeMapReadPlusInsert` is **not** among them, since its 676 *is* the post-`traverse`
+number by construction (see the section below). That leaves three of the other six
+unidentified.
+
+The reason to think it does not matter is that `traverse` only removes one fiber spawn per
+log entry, and those three have small logs. That is an argument, not a measurement — and by
+this page's own opening rule, an argument is not what belongs in a results table. The A→A
+drift on this box is **6.9%**, so an effect below that would be invisible in these runs
+regardless, which makes the claim **untested rather than confirmed**. Re-run all seven on
+one tree before treating this table as a clean two-revision comparison.
 
 ## What the numbers say
 
@@ -87,7 +106,7 @@ for a map entry), so there is nothing to overlap and the fibers were pure overhe
 a whole-map read expands into one log entry *per key*, so the fiber count tracked the map
 size.
 
-Switching to `traverse` took `wholeMapReadPlusInsert` from **566 → 676 ops/s (+19%)`,
+Switching to `traverse` took `wholeMapReadPlusInsert` from **566 → 676 ops/s** (+19%),
 turning that workload's cost from **−21% into −6%**. Nothing else moved outside noise.
 
 Note that the laptop measured this same change as making things *worse across the board*.

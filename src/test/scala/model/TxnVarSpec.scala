@@ -17,56 +17,48 @@
 package ai.entrolution
 package model
 
-import cats.effect.IO
 import cats.effect.testing.scalatest.AsyncIOSpec
 import org.scalatest.freespec.AsyncFreeSpec
 import org.scalatest.matchers.should.Matchers
 
-import bengal.stm.STM
 import bengal.stm.model._
 import bengal.stm.syntax.all._
 
-class TxnVarSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
+class TxnVarSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers with StmSuite {
   "TxnVar.get" - {
     "return the value of a transactional variable" in {
-      STM
-        .runtime[IO]
-        .flatMap { implicit stm =>
-          for {
-            tVar   <- TxnVar.of(123)
-            result <- tVar.get.commit
-          } yield result
-        }
+      withRuntime { implicit stm =>
+        for {
+          tVar   <- TxnVar.of(123)
+          result <- tVar.get.commit
+        } yield result
+      }
         .asserting(_ shouldBe 123)
     }
   }
 
   "TxnVar.set" - {
     "update the value of a transactional variable" in {
-      STM
-        .runtime[IO]
-        .flatMap { implicit stm =>
-          for {
-            tVar   <- TxnVar.of(123)
-            _      <- tVar.set(2718).commit
-            result <- tVar.get.commit
-          } yield result
-        }
+      withRuntime { implicit stm =>
+        for {
+          tVar   <- TxnVar.of(123)
+          _      <- tVar.set(2718).commit
+          result <- tVar.get.commit
+        } yield result
+      }
         .asserting(_ shouldBe 2718)
     }
   }
 
   "TxnVar.modify" - {
     "modify the value of a transactional variable" in {
-      STM
-        .runtime[IO]
-        .flatMap { implicit stm =>
-          for {
-            tVar   <- TxnVar.of("foo")
-            _      <- tVar.modify(_ + "bar").commit
-            result <- tVar.get.commit
-          } yield result
-        }
+      withRuntime { implicit stm =>
+        for {
+          tVar   <- TxnVar.of("foo")
+          _      <- tVar.modify(_ + "bar").commit
+          result <- tVar.get.commit
+        } yield result
+      }
         .asserting(_ shouldBe "foobar")
     }
   }

@@ -72,15 +72,14 @@ import soak.History._
   *
   * Why it escapes is worth understanding. The DIVERGENCE is rampant — the meter below reports that around 80% of
   * data-dependent operations name a different entry in the analysis pass than the run actually touches. But a
-  * divergence is not yet an ANOMALY. To become one it needs a four-way coincidence: the reader's run-time keys must
+  * divergence is not yet an ANOMALY. To become one it needs a three-way coincidence: the reader's run-time keys must
   * land on exactly the entries some concurrent transaction is writing; the two must be compatible on everything ELSE
   * they touch (with several operations each they usually are not, so the scheduler serializes them and the chance is
   * gone); and the reader's two reads must straddle that transaction's publish, which is a `parTraverse` and so is
   * tearable but brief. Random search does not assemble that. The H6 probe had to ENGINEER every one of those
   * conditions — which, in hindsight, was the clue.
   *
-  * Two things follow, and both are worth saying plainly. H6 is a real defect but a rare one to hit by chance, so its
-  * fix is insurance rather than a fire. And randomized testing would never have found it: only the model did.
+  * So H6 is a real defect but a rare one to hit by chance, and its fix is insurance rather than a fire.
   *
   * INSTRUMENTATION. Each transaction counts how many times its body actually EXECUTES — once in the static-analysis
   * pass plus once per admitted run — so a clean, uncontended transaction is 2. Anything above that is re-execution:
@@ -222,17 +221,18 @@ class SerializabilitySoakSpec extends AnyFreeSpec with Matchers {
             // analysis names whatever key the source held when IT ran — which
             // need not be the key the real run touches.
             //
-            // THE PAUSE IS LOAD-BEARING, and it is not cheating. The window
-            // H6 lives in is [analysis reads the source, log run reads it
-            // again]. TxnRuntime.commit runs the walker BEFORE submitTxn, so
-            // that window is real; its WIDTH in production is whatever the
-            // scheduler, a dependency wait, a GC pause or thread contention
-            // makes it, which is routinely milliseconds. A test that only ever
-            // samples the microsecond case under-explores a window the system
-            // genuinely has, and it shows: without this pause the soak PASSES
-            // with the H6 fix disabled (negative control NC-B), which would
-            // have been false confidence. The pause widens an existing window;
-            // it does not manufacture one.
+            // THE PAUSE WIDENS THE WINDOW, and it does not manufacture one. The
+            // window H6 lives in is [analysis reads the source, log run reads it
+            // again]. TxnRuntime.commit runs the walker BEFORE submitTxn, so that
+            // window is real; its WIDTH in production is whatever the scheduler, a
+            // dependency wait, a GC pause or thread contention makes it, which is
+            // routinely milliseconds. A test that only ever samples the microsecond
+            // case under-explores a window the system genuinely has.
+            //
+            // It does not buy H6 coverage: this suite does not catch H6 with or
+            // without the pause (see the headline table). What it buys is the
+            // divergence the meter reports, which is what keeps the coverage-abort
+            // path — and the re-execution bound below — genuinely exercised.
             for {
               v <- vars(src).get
               _ <- STM[IO].fromF(IO.sleep(2.millis))
@@ -250,18 +250,16 @@ class SerializabilitySoakSpec extends AnyFreeSpec with Matchers {
             // exposes it. A data-dependent WRITE is still protected against
             // whole-map readers, because the wrong key it declares has the SAME
             // PARENT as the right one and the relation's parent rule catches it
-            // anyway. What is NOT protected is a data-dependent READ: its
-            // declared footprint names the wrong entry, so a writer of the entry
-            // it REALLY reads is judged compatible with it and runs concurrently.
-            // Two of these in one transaction can then straddle another
-            // transaction's publish — which is not atomic, being a parTraverse
-            // over the log entries — and observe a TORN write set. That is a
-            // G-single cycle, and it is exactly the shape of the H6 probe.
-            // Reads an ADJACENT PAIR of entries, both data-dependent and both
+            // anyway. What is NOT protected is a data-dependent READ: its declared
+            // footprint names the wrong entry, so a writer of the entry it REALLY
+            // reads is judged compatible with it and runs concurrently.
+            //
+            // Hence the ADJACENT PAIR of entries, both data-dependent and both
             // therefore undeclared. One unprotected read is only an rw edge; a
-            // cycle needs TWO, straddling another transaction's publish -- and
-            // that publish is not atomic (log.commit is a parTraverse over the
-            // entries). The pause between the reads is the straddle window.
+            // cycle needs TWO, straddling another transaction's publish — and that
+            // publish is not atomic (log.commit is a parTraverse over the entries).
+            // The pause between the reads is the straddle window. That is a
+            // G-single cycle, and it is exactly the shape of the H6 probe.
             for {
               v <- vars(src).get
               _ <- STM[IO].fromF(IO.sleep(2.millis))

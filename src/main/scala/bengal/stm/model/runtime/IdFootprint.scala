@@ -49,6 +49,14 @@ private[stm] case class IdFootprint(
   // copy isValidated through unchanged, so a validated footprint that is
   // subsequently mutated would skip re-validation (today's call sites never
   // do that — validation happens last, in the runtime).
+  //
+  // The copy below is also the only reason isUnderApproximated survives
+  // validation, and the runtime compares VALIDATED footprints everywhere. Build
+  // the result with a constructor call instead of a copy and the field defaults
+  // back to false, every under-approximated footprint silently regains the
+  // scheduler's trust, and the H3 fix is defeated without a single call site
+  // changing. LemmaValidatedPreservesUnderApproximation exists to catch exactly
+  // that.
   private[stm] lazy val getValidated =
     if (isValidated) {
       this
@@ -94,9 +102,9 @@ private[stm] case class IdFootprint(
   // conjunct); my ids — reads included — under a parent the other side
   // WRITES (second conjunct); and my WRITES under a parent the other side
   // READS (third conjunct). The third closes the H5 phantom-write-skew gap
-  // (whole-map read vs new-key insert; docs/plans/formal-specs.md §6):
-  // a structure read observes the key set, so any child-entry write must
-  // conflict with it. Parent-read vs child-read stays compatible.
+  // (whole-map read vs new-key insert; see specs/README.md): a structure read
+  // observes the key set, so any child-entry write must conflict with it.
+  // Parent-read vs child-read stays compatible.
   // ASSUMES a 2-level id hierarchy (parents are never themselves parented —
   // true by construction today): all parent checks here and in getValidated
   // are one-hop, and deeper nesting would need multi-hop coverage.
@@ -115,10 +123,17 @@ private[stm] case class IdFootprint(
   // "compatible" verdict would be an inference from absent evidence.
   //
   // The transaction is therefore serialized against all others and runs alone,
-  // which makes its unvalidated reads trivially safe. The dirty path then
-  // refines the footprint from the ACTUAL log (which is complete by
-  // construction, being built from real entries), so the retry runs at full
-  // concurrency.
+  // which makes its unvalidated reads trivially safe.
+  //
+  // It keeps running alone, on every attempt: this is a STEADY-STATE cost, not a
+  // first-attempt one that a refinement recovers. Coverage cannot force a
+  // refinement, because coversActualFootprint short-circuits to true on this
+  // flag (checking it would send every such transaction round again for no
+  // gain). The only other trigger is a dirty log — and having run alone, nothing
+  // changed underneath it, so it is not dirty. It commits under-approximated,
+  // and the same Txn under-approximates again on the next commit. The measured
+  // price of that is in the README; it is confined to this path, and it is what
+  // the path costs to be correct.
   private[stm] def isCompatibleWith(input: IdFootprint): Boolean =
     !isUnderApproximated && !input.isUnderApproximated &&
       asymmetricCompatibleWith(input) && input.asymmetricCompatibleWith(this)
@@ -126,9 +141,21 @@ private[stm] case class IdFootprint(
   // SPEC: CommitSnapshotValid — the H6 fix. TRUE iff declaring THIS footprint
   // excluded at least as much concurrency as declaring `actual` would have. If
   // so, Contract C on this footprint implies Contract C on what the transaction
-  // really touched, and its scheduling was sound after all
-  // (LemmaCoverageIsSound in specs/common/FootprintLemmas.tla checks that
-  // exhaustively over every ordered triple of footprints — it is not argued).
+  // really touched, and its scheduling was sound after all.
+  //
+  // SPEC: LemmaCoverageIsSound — and that implication is machine-checked rather
+  // than argued: specs/common/FootprintLemmas.tla quantifies over every ordered
+  // TRIPLE of complete footprints in the 4-id universe and confirms that if
+  // `declared` covers `actual`, then any peer compatible with `declared` is
+  // compatible with `actual` too. Two thirds of the soundness argument rest on
+  // that lemma. The third does not, and is worth stating plainly: it assumes
+  // `actual` is a LOG footprint and therefore complete by construction. Nothing
+  // in TLC checks that assumption — it is a claim about this Scala.
+  //
+  // Contract C — the property the scheduler owes the commit protocol: two
+  // transactions whose DECLARED footprints are incompatible never overlap in
+  // their execute windows. The commit protocol assumes it, the scheduler is
+  // checked against it, and specs/README.md documents both halves.
   //
   // NOT a subset test on raw ids. That would be unusable as well as wrong: a
   // whole-map READ legitimately expands, in the log, into a read-only entry for

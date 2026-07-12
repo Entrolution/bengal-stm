@@ -1,15 +1,25 @@
 #!/usr/bin/env bash
-# Verify that every TLA+ invariant listed in specs/README.md has a matching
-# `// SPEC: <InvariantName>` anchor in the declared source file.
+# Verify that specs/README.md's invariant tables and the `// SPEC: <Name>`
+# anchors in src/ agree with each other. TWO PASSES, because the correspondence
+# can rot from either end:
 #
-# Parses the Invariant Cross-Reference tables, extracts (invariant, file) pairs,
-# and greps for `SPEC: <invariant>` in the declared file.
+#   FORWARD — every invariant listed in a README cross-reference table has a
+#     matching `// SPEC: <InvariantName>` anchor in the source file the table
+#     names. Catches an invariant that was documented but never anchored, or
+#     whose code moved to a different file.
+#
+#   REVERSE — every `// SPEC: <Name>` anchor in src/ appears as a PARSED row in
+#     those tables. Catches an orphaned or renamed anchor, and also catches a
+#     README row that silently fell out of the awk parse through a malformed
+#     backtick or path: without this pass, a row that stopped parsing would take
+#     its invariant out of the forward check and NOTHING would notice.
+#
+# Both directions fail open without the other, which is why both exist. Exits
+# non-zero if either finds a mismatch. Run from the repository root.
 #
 # Ported from ../echidna/specs/verify_anchors.sh (identical mechanism; Scala
 # sources use the same `//` comment syntax and live under src/, so both the
 # anchor grep and the path regex carry over unchanged).
-#
-# Exits non-zero if any anchor is missing. Run from the repository root.
 
 set -euo pipefail
 

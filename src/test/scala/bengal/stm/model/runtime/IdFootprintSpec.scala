@@ -234,67 +234,72 @@ class IdFootprintSpec extends AnyFreeSpec with Matchers {
         unknown.mergeWith(known).isUnderApproximated shouldBe true
       }
     }
+  }
 
-    // The H6 fix. `covers` asks whether declaring THIS footprint excluded at
-    // least as much concurrency as declaring the actual one would have. It is
-    // deliberately NOT a subset test, and the asymmetry below is why.
-    "covers" - {
-      "an accurate footprint covers itself, so a static access set never trips the check" in {
-        val f = IdFootprint(readIds = Set(id1, parentId), updatedIds = Set(id2))
-        f.covers(f) shouldBe true
-      }
+  // The H6 fix, and a DIFFERENT RELATION from the one above — `isCompatibleWith`
+  // asks whether two transactions may overlap, `covers` asks whether one
+  // footprint's declaration subsumes another's. They were nested together once,
+  // which read as though coverage were a mode of compatibility. It is not.
+  //
+  // `covers` asks whether declaring THIS footprint excluded at least as much
+  // concurrency as declaring the actual one would have. It is deliberately NOT a
+  // subset test, and the asymmetry below is why.
+  "covers" - {
+    "an accurate footprint covers itself, so a static access set never trips the check" in {
+      val f = IdFootprint(readIds = Set(id1, parentId), updatedIds = Set(id2))
+      f.covers(f) shouldBe true
+    }
 
-      "a parent-structure READ covers a child-entry READ" in {
-        // The whole-map-read case: the log expands `getVarMap` into a read-only
-        // entry for EVERY existing key, so the actual footprint properly
-        // contains ids the static walker never named. A subset test would abort
-        // every whole-map read in the library; these ids are genuinely covered,
-        // because a parent read conflicts with any child write (the H5 conjunct).
-        val declared = IdFootprint(readIds = Set(parentId), updatedIds = Set.empty)
-        val actual   = IdFootprint(readIds = Set(parentId, childId), updatedIds = Set.empty)
-        declared.covers(actual) shouldBe true
-      }
+    "a parent-structure READ covers a child-entry READ" in {
+      // The whole-map-read case: the log expands `getVarMap` into a read-only
+      // entry for EVERY existing key, so the actual footprint properly
+      // contains ids the static walker never named. A subset test would abort
+      // every whole-map read in the library; these ids are genuinely covered,
+      // because a parent read conflicts with any child write (the H5 conjunct).
+      val declared = IdFootprint(readIds = Set(parentId), updatedIds = Set.empty)
+      val actual   = IdFootprint(readIds = Set(parentId, childId), updatedIds = Set.empty)
+      declared.covers(actual) shouldBe true
+    }
 
-      "a parent-structure READ does NOT cover a child-entry WRITE" in {
-        // Reading a map does not announce that you will write a key in it.
-        val declared = IdFootprint(readIds = Set(parentId), updatedIds = Set.empty)
-        val actual   = IdFootprint(readIds = Set.empty, updatedIds = Set(childId))
-        declared.covers(actual) shouldBe false
-      }
+    "a parent-structure READ does NOT cover a child-entry WRITE" in {
+      // Reading a map does not announce that you will write a key in it.
+      val declared = IdFootprint(readIds = Set(parentId), updatedIds = Set.empty)
+      val actual   = IdFootprint(readIds = Set.empty, updatedIds = Set(childId))
+      declared.covers(actual) shouldBe false
+    }
 
-      "a parent-structure WRITE covers child reads and writes alike" in {
-        // The setVarMap case: the log expands a structure write into a per-key
-        // update entry.
-        val declared = IdFootprint(readIds = Set.empty, updatedIds = Set(parentId))
-        declared.covers(IdFootprint(readIds = Set.empty, updatedIds = Set(childId))) shouldBe true
-        declared.covers(IdFootprint(readIds = Set(childId), updatedIds = Set.empty)) shouldBe true
-      }
+    "a parent-structure WRITE covers child reads and writes alike" in {
+      // The setVarMap case: the log expands a structure write into a per-key
+      // update entry.
+      val declared = IdFootprint(readIds = Set.empty, updatedIds = Set(parentId))
+      declared.covers(IdFootprint(readIds = Set.empty, updatedIds = Set(childId))) shouldBe true
+      declared.covers(IdFootprint(readIds = Set(childId), updatedIds = Set.empty)) shouldBe true
+    }
 
-      "declaring a write to one id does NOT cover writing a different one — this is H6" in {
-        // A data-dependent key: the walker read the key source before the
-        // transaction was scheduled, that source changed, and the run touched an
-        // entry nobody declared.
-        val declared = IdFootprint(readIds = Set.empty, updatedIds = Set(id1))
-        val actual   = IdFootprint(readIds = Set.empty, updatedIds = Set(id2))
-        declared.covers(actual) shouldBe false
-      }
+    "declaring a write to one id does NOT cover writing a different one — this is H6" in {
+      // A data-dependent key: the walker read the key source before the
+      // transaction was scheduled, that source changed, and the run touched an
+      // entry nobody declared.
+      val declared = IdFootprint(readIds = Set.empty, updatedIds = Set(id1))
+      val actual   = IdFootprint(readIds = Set.empty, updatedIds = Set(id2))
+      declared.covers(actual) shouldBe false
+    }
 
-      "nor does it cover a SIBLING entry of the same map — the map-key form of H6" in {
-        val sibling  = TxnVarRuntimeId(21, parent = Some(parentId))
-        val declared = IdFootprint(readIds = Set.empty, updatedIds = Set(childId))
-        declared.covers(IdFootprint(readIds = Set.empty, updatedIds = Set(sibling))) shouldBe false
-      }
+    "nor does it cover a SIBLING entry of the same map — the map-key form of H6" in {
+      val sibling  = TxnVarRuntimeId(21, parent = Some(parentId))
+      val declared = IdFootprint(readIds = Set.empty, updatedIds = Set(childId))
+      declared.covers(IdFootprint(readIds = Set.empty, updatedIds = Set(sibling))) shouldBe false
+    }
 
-      "declaring a READ does not cover a WRITE of the same id" in {
-        val declared = IdFootprint(readIds = Set(id1), updatedIds = Set.empty)
-        val actual   = IdFootprint(readIds = Set.empty, updatedIds = Set(id1))
-        declared.covers(actual) shouldBe false
-      }
+    "declaring a READ does not cover a WRITE of the same id" in {
+      val declared = IdFootprint(readIds = Set(id1), updatedIds = Set.empty)
+      val actual   = IdFootprint(readIds = Set.empty, updatedIds = Set(id1))
+      declared.covers(actual) shouldBe false
+    }
 
-      "an empty actual footprint is covered by anything" in {
-        IdFootprint.empty.covers(IdFootprint.empty) shouldBe true
-        IdFootprint(readIds = Set(id3), updatedIds = Set.empty).covers(IdFootprint.empty) shouldBe true
-      }
+    "an empty actual footprint is covered by anything" in {
+      IdFootprint.empty.covers(IdFootprint.empty) shouldBe true
+      IdFootprint(readIds = Set(id3), updatedIds = Set.empty).covers(IdFootprint.empty) shouldBe true
     }
   }
 }

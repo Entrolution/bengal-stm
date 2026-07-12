@@ -17,6 +17,8 @@
 package ai.entrolution
 package spec
 
+import java.util.concurrent.atomic.{ AtomicBoolean, AtomicInteger }
+
 import scala.concurrent.duration._
 
 import cats.effect.IO
@@ -30,22 +32,39 @@ import bengal.stm.STM
 import bengal.stm.model._
 import bengal.stm.syntax.all._
 
-/** H3 — the static-analysis fallback is a SOUNDNESS boundary, and it is reachable from ordinary code.
+/** H3 — the static-analysis fallback is a SOUNDNESS boundary, it is reachable from ordinary code, and the fix must keep
+  * being reached.
   *
-  * The TLA+ model (specs/commit/CommitH3.cfg, CommitH3Writer.cfg) shows that a transaction scheduled on an
-  * under-approximated footprint breaks serializability in both directions: it can read what a peer overwrites, and its
-  * own undeclared writes can invalidate a correctly-declared peer's reads. Neither is caught at commit — read-only log
-  * entries are never validated (isDirty = pure(false)) and hold no lock (lock = None), so the scheduler's footprint
-  * conflict-avoidance is the ONLY defence, and an under-approximated footprint switches it off.
+  * WHAT THE FALLBACK IS. `staticAnalysisCompiler` executes real READS but never applies WRITES — `TxnSetVarMapValue`
+  * merely records the id. So a transaction that writes a key and reads it back sees `None` during analysis while the
+  * real run sees `Some(v)` from its own log. A partial continuation on that value (`.get`, a pattern match, a `.head`)
+  * therefore throws during analysis and NOWHERE ELSE, `TxnRuntime.commit` catches it, and everything after the throw
+  * point goes UNDECLARED. Read-your-own-write followed by a partial operation is ordinary STM code.
   *
-  * This suite answers the question the model cannot: is that path REACHABLE without contrivance?
+  * WHY THAT IS A SOUNDNESS PROBLEM AND NOT A PRECISION ONE. Read-only log entries are never validated
+  * (`isDirty = pure(false)`) and hold no lock (`lock = None`), so the scheduler's footprint conflict-avoidance is the
+  * ONLY defence against a stale read. An under-approximated footprint used to switch it off — and the TLA+ model
+  * (specs/commit/CommitH3.cfg, CommitH3Writer.cfg) shows it breaks serializability in both directions: such a
+  * transaction can read what a peer overwrites, and its own undeclared writes can invalidate a correctly-declared
+  * peer's reads.
   *
-  * It is. staticAnalysisCompiler executes real READS but never applies WRITES — TxnSetVarMapValue merely records the
-  * id. So a transaction that writes a key and reads it back sees None during analysis while the real run sees Some(v)
-  * from its own log. A partial continuation on that value (`.get`, a pattern match, a `.head`) therefore throws during
-  * analysis and not at runtime, TxnRuntime.commit catches it, and everything after the throw point goes UNDECLARED.
+  * THE FIX flags the footprint (`IdFootprint.isUnderApproximated`) and the compatibility relation makes it incompatible
+  * with EVERYTHING, itself included. The transaction is therefore serialized against all others and RUNS ALONE, which
+  * is what makes its unvalidated reads trivially safe: nothing can change under it.
   *
-  * Read-your-own-write followed by a partial operation is ordinary STM code.
+  * ===========================================================================
+  * WHAT THIS SUITE HAS TO ASSERT NOW, AND WHY IT IS NOT THE OBVIOUS THING
+  * ===========================================================================
+  * Post-fix every arm here would assert `skews shouldBe 0`, and three identical greens do not discriminate. A suite in
+  * that state cannot tell "the fallback is working" from "the shape stopped reaching the fallback at all" — and if the
+  * library ever stopped throwing on read-your-own-write, this suite, `soak/SerializabilitySoakSpec`'s `UnderDeclare` op
+  * and the `underDeclaredConcurrent` benchmark would ALL go silently inert together, since all three are built on this
+  * one shape.
+  *
+  * So the last test asserts the shape still ARRIVES: an under-declaring transaction RUNS ALONE. That is the observable
+  * consequence of being incompatible with everything, and it is measurable without reaching into `private[stm]` — run
+  * one against peers on disjoint vars and watch whether their execute windows ever overlap. It goes red if the fix is
+  * reverted AND it goes red if the shape stops throwing, which is exactly the discrimination the skew counts lost.
   */
 class StaticAnalysisFallbackSpec extends AnyFreeSpec with Matchers {
 
@@ -81,15 +100,18 @@ class StaticAnalysisFallbackSpec extends AnyFreeSpec with Matchers {
 
   /** Control 2 — THE ISOLATING ARM, and the one that actually earns the verdict.
     *
-    * Byte-for-byte `skewTxn`, including the read-your-own-write on the scratch map, except that the continuation is
-    * TOTAL (`getOrElse` rather than `.get`). Nothing throws, so static analysis runs to completion and declares the
-    * whole footprint — `r x, w y, w scratch[k]` against `r y, w x, w scratch[k]` — whereupon raw-id overlap on x and y
-    * makes the pair incompatible and the scheduler serializes it.
+    * DO NOT DEDUPLICATE THIS AGAINST `skewTxn`. The near-clone is the instrument. The two bodies differ by ONE
+    * CHARACTER — `getOrElse` rather than `get` — and holding everything else byte-for-byte identical is the only thing
+    * that pins the THROW as the cause. Factor out the shared prelude and the isolating control is gone.
     *
-    * This is what pins the THROW as the cause. Control 1 alone cannot: it removes the prelude as well as the fallback,
-    * so it leaves open that the scratch map is somehow responsible — and that is not an idle worry, because both skew
-    * transactions insert a fresh key into the same map and therefore resolve that map's structural commitLock through
-    * the very fallback H2 is about. Hold the prelude fixed, remove only the throw, and the skew vanishes.
+    * Because the continuation is TOTAL, nothing throws, so static analysis runs to completion and declares the whole
+    * footprint — `r x, w y, w scratch[k]` against `r y, w x, w scratch[k]` — whereupon raw-id overlap on x and y makes
+    * the pair incompatible and the scheduler serializes it.
+    *
+    * Control 1 alone cannot pin the throw: it removes the prelude as well as the fallback, so it leaves open that the
+    * scratch map is somehow responsible — and that is not an idle worry, because both skew transactions insert a fresh
+    * key into the same map and therefore resolve that map's structural commitLock through the very fallback H2 is
+    * about. Hold the prelude fixed, remove only the throw, and the skew vanishes.
     */
   private def totalContinuationTxn(
     readVar: TxnVar[IO, Int],
@@ -159,7 +181,7 @@ class StaticAnalysisFallbackSpec extends AnyFreeSpec with Matchers {
       }
     }
     withClue(
-      "this pair differs from the pinned defect below by ONE character — getOrElse instead of get — " +
+      "this pair differs from the H3 regression below by ONE character — getOrElse instead of get — " +
         "so if it skews, the cause is NOT the static-analysis throw and the H3 diagnosis is wrong: "
     ) {
       skews shouldBe 0
@@ -167,7 +189,7 @@ class StaticAnalysisFallbackSpec extends AnyFreeSpec with Matchers {
   }
 
   // -------------------------------------------------------------------
-  // H3 regression (was a pinned defect until 2026-07-11)
+  // H3 regression
   // -------------------------------------------------------------------
 
   "H3 regression — read-your-own-write can no longer defeat footprint declaration" - {
@@ -245,6 +267,133 @@ class StaticAnalysisFallbackSpec extends AnyFreeSpec with Matchers {
       withClue(s"observed outcomes: ${results.distinct.mkString(", ")}: ") {
         results.foreach(r => Set((2, 1), (1, 2)) should contain(r))
       }
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // Reachability: the shape still arrives at the fallback
+  // -------------------------------------------------------------------
+
+  /** Did the under-declaring transaction and an ordinary peer ever hold overlapping execute windows?
+    *
+    * Both sides publish their presence and then read the other's. Atomics are sequentially consistent, so if the two
+    * windows genuinely overlap then at least one of the two reads must observe the other's flag — whichever entered
+    * second. Nothing here is sampled or polled, so there is no window for the measurement itself to miss.
+    */
+  private class OverlapMeter {
+    private val underDeclaredActive = new AtomicBoolean(false)
+    private val peersActive         = new AtomicInteger(0)
+    private val overlaps            = new AtomicInteger(0)
+
+    def underDeclaredEnter(): Unit = {
+      underDeclaredActive.set(true)
+      if (peersActive.get() > 0) {
+        overlaps.incrementAndGet()
+        () // incrementAndGet returns the new count; -Werror rejects discarding it
+      }
+    }
+
+    def underDeclaredExit(): Unit =
+      underDeclaredActive.set(false)
+
+    def peerEnter(): Unit = {
+      peersActive.incrementAndGet()
+      if (underDeclaredActive.get()) {
+        overlaps.incrementAndGet()
+        ()
+      }
+    }
+
+    def peerExit(): Unit = {
+      peersActive.decrementAndGet()
+      ()
+    }
+
+    def overlapCount: Int = overlaps.get()
+  }
+
+  /** Long enough that a scheduler willing to overlap these two would be caught doing it, short enough that 30 reps stay
+    * cheap. It is held open inside the transaction BODY, which is the window Contract C is about.
+    */
+  private val Hold: FiniteDuration = 25.millis
+
+  /** A value no peer's var starts at, so reading it back proves the read came from the transaction's own LOG. */
+  private val RanForReal = 7
+
+  /** The H3 shape with no skew attached: write a scratch key, read it back, apply a partial continuation. Its declared
+    * footprint is whatever the walker had before the throw — the scratch key, and nothing else.
+    *
+    * The meter sits AFTER the throw point, which is why it needs no pass discriminator: the analysis pass never reaches
+    * it, so every enter/exit it records belongs to a real, scheduled run.
+    */
+  private def underDeclaredTxn(
+    scratch: TxnVarMap[IO, String, Int],
+    key: String,
+    meter: OverlapMeter
+  )(implicit stm: STM[IO]): Txn[Unit] =
+    for {
+      _  <- scratch.set(key, 1)
+      ov <- scratch.get(key)
+      _  <- STM[IO].delay(ov.get) // analysis throws here; the real run gets Some(1)
+      _  <- STM[IO].delay(meter.underDeclaredEnter())
+      _  <- STM[IO].fromF(IO.sleep(Hold))
+      _  <- STM[IO].delay(meter.underDeclaredExit())
+    } yield ()
+
+  /** An ordinary, ACCURATELY DECLARED transaction on a var of its own. Nothing it touches is named in the
+    * under-declared transaction's footprint, so a scheduler that trusted that footprint would happily run the two
+    * together — which is the whole point of the peers.
+    *
+    * The read-back is a pass discriminator, and it is free: static analysis executes real reads but never applies
+    * writes, so `seen` is the var's LIVE value (0) in the analysis pass and the transaction's own logged write in the
+    * real run. Nothing throws, so the peer's footprint stays complete and unflagged.
+    */
+  private def peerTxn(
+    peerVar: TxnVar[IO, Int],
+    meter: OverlapMeter
+  )(implicit stm: STM[IO]): Txn[Unit] =
+    for {
+      _    <- peerVar.set(RanForReal)
+      seen <- peerVar.get
+      real = seen == RanForReal
+      _ <- STM[IO].delay(if (real) meter.peerEnter() else ())
+      _ <- STM[IO].fromF(IO.whenA(real)(IO.sleep(Hold)))
+      _ <- STM[IO].delay(if (real) meter.peerExit() else ())
+    } yield ()
+
+  private def overlapsInOneRun(peers: Int): Int = {
+    val meter = new OverlapMeter
+
+    STM
+      .runtime[IO]
+      .flatMap { implicit stm =>
+        for {
+          scratch  <- TxnVarMap.of[IO, String, Int](Map.empty)
+          peerVars <- (1 to peers).toList.traverse(_ => TxnVar.of[IO, Int](0))
+          _ <- (underDeclaredTxn(scratch, "u", meter).commit ::
+                 peerVars.map(v => peerTxn(v, meter).commit)).parSequence
+        } yield meter.overlapCount
+      }
+      .timeout(30.seconds)
+      .unsafeRunSync()
+  }
+
+  "an under-declaring transaction still reaches the fallback, and therefore runs ALONE" in {
+    val reps  = 30
+    val peers = 6
+
+    val overlaps = (1 to reps).map(_ => overlapsInOneRun(peers)).sum
+
+    withClue(
+      s"the under-declaring transaction shared an execute window with a peer in $overlaps case(s) across $reps reps. " +
+        "It is supposed to be incompatible with EVERYTHING and therefore to run alone. Two things produce this, and " +
+        "they are worth telling apart. Either the H3 fix stopped working — an under-approximated footprint is being " +
+        "trusted again — or the SHAPE stopped reaching it: if read-your-own-write no longer throws during static " +
+        "analysis, this transaction is now accurately declared, is genuinely compatible with the peers, and every " +
+        "test in this suite (plus SerializabilitySoakSpec's UnderDeclare op and the underDeclaredConcurrent " +
+        "benchmark) has quietly stopped testing anything. Check which before touching the assertion: "
+    ) {
+      overlaps shouldBe 0
     }
   }
 }

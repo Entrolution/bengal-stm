@@ -26,44 +26,38 @@ import bengal.stm.STM
 import bengal.stm.model._
 import bengal.stm.syntax.all._
 
-class StmApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
+class StmApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers with StmSuite {
 
   "delay" - {
     "yield argument value" in {
-      STM
-        .runtime[IO]
-        .flatMap { implicit stm =>
-          for {
-            result <- STM[IO].delay("foo").commit
-          } yield result
-        }
+      withRuntime { implicit stm =>
+        for {
+          result <- STM[IO].delay("foo").commit
+        } yield result
+      }
         .asserting(_ shouldBe "foo")
     }
   }
 
   "pure" - {
     "yield argument value" in {
-      STM
-        .runtime[IO]
-        .flatMap { implicit stm =>
-          for {
-            result <- STM[IO].pure("foo").commit
-          } yield result
-        }
+      withRuntime { implicit stm =>
+        for {
+          result <- STM[IO].pure("foo").commit
+        } yield result
+      }
         .asserting(_ shouldBe "foo")
     }
   }
 
   "raiseError" - {
     "throw an error when run" in {
-      STM
-        .runtime[IO]
-        .flatMap { implicit stm =>
-          for {
-            result <-
-              STM[IO].abort(new RuntimeException("test error")).commit.attempt
-          } yield result
-        }
+      withRuntime { implicit stm =>
+        for {
+          result <-
+            STM[IO].abort(new RuntimeException("test error")).commit.attempt
+        } yield result
+      }
         .asserting(_.left.map(_.getMessage()) shouldBe Left("test error"))
     }
   }
@@ -72,71 +66,63 @@ class StmApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
     "recover from an error" in {
       val mockError = new RuntimeException("mock error")
 
-      STM
-        .runtime[IO]
-        .flatMap { implicit stm =>
-          for {
-            result <- STM[IO]
-                        .abort(mockError)
-                        .flatMap(_ => STM[IO].delay("test"))
-                        .handleErrorWith(ex => STM[IO].delay(ex.getMessage))
-                        .commit
-          } yield result
-        }
+      withRuntime { implicit stm =>
+        for {
+          result <- STM[IO]
+                      .abort(mockError)
+                      .flatMap(_ => STM[IO].delay("test"))
+                      .handleErrorWith(ex => STM[IO].delay(ex.getMessage))
+                      .commit
+        } yield result
+      }
         .asserting(_ shouldBe mockError.getMessage)
     }
 
     "bypass mutations from the error transaction" in {
       val baseMap = Map("foo" -> 42, "bar" -> 27, "baz" -> 18)
 
-      STM
-        .runtime[IO]
-        .flatMap { implicit stm =>
-          for {
-            tVarMap <- TxnVarMap.of(baseMap)
-            result <- (for {
-                        innerResult <- tVarMap.get("foo")
-                        _           <- tVarMap.modify("foo", _ + 3)
-                        _           <- STM[IO].abort(new RuntimeException("fake exception"))
+      withRuntime { implicit stm =>
+        for {
+          tVarMap <- TxnVarMap.of(baseMap)
+          result <- (for {
+                      innerResult <- tVarMap.get("foo")
+                      _           <- tVarMap.modify("foo", _ + 3)
+                      _           <- STM[IO].abort(new RuntimeException("fake exception"))
+                      _           <- tVarMap.modify("foo", _ + 2)
+                    } yield innerResult).handleErrorWith { _ =>
+                      for {
                         _           <- tVarMap.modify("foo", _ + 2)
-                      } yield innerResult).handleErrorWith { _ =>
-                        for {
-                          _           <- tVarMap.modify("foo", _ + 2)
-                          innerResult <- tVarMap.get("foo")
-                        } yield innerResult
-                      }.commit
-          } yield result
-        }
+                        innerResult <- tVarMap.get("foo")
+                      } yield innerResult
+                    }.commit
+        } yield result
+      }
         .asserting(_ shouldBe Some(44))
     }
   }
 
   "fromF" - {
     "lift an effect into a transaction" in {
-      STM
-        .runtime[IO]
-        .flatMap { implicit stm =>
-          for {
-            result <- STM[IO].fromF(IO.pure(42)).commit
-          } yield result
-        }
+      withRuntime { implicit stm =>
+        for {
+          result <- STM[IO].fromF(IO.pure(42)).commit
+        } yield result
+      }
         .asserting(_ shouldBe 42)
     }
 
     "compose with other transaction operations" in {
-      STM
-        .runtime[IO]
-        .flatMap { implicit stm =>
-          for {
-            tVar <- TxnVar.of(10)
-            _ <- (for {
-                   extra <- STM[IO].fromF(IO.pure(5))
-                   v     <- tVar.get
-                   _     <- tVar.set(v + extra)
-                 } yield ()).commit
-            updated <- tVar.get.commit
-          } yield updated
-        }
+      withRuntime { implicit stm =>
+        for {
+          tVar <- TxnVar.of(10)
+          _ <- (for {
+                 extra <- STM[IO].fromF(IO.pure(5))
+                 v     <- tVar.get
+                 _     <- tVar.set(v + extra)
+               } yield ()).commit
+          updated <- tVar.get.commit
+        } yield updated
+      }
         .asserting(_ shouldBe 15)
     }
   }
@@ -152,18 +138,16 @@ class StmApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
       def program2(input: TxnVar[IO, Int])(implicit stm: STM[IO]): Txn[Unit] =
         input.set(5)
 
-      STM
-        .runtime[IO]
-        .flatMap { implicit stm =>
-          for {
-            tVar <- TxnVar.of(1)
-            result <- for {
-                        resFib      <- program1(tVar).commit.start
-                        _           <- program2(tVar).commit.start
-                        innerResult <- resFib.joinWithNever
-                      } yield innerResult
-          } yield result
-        }
+      withRuntime { implicit stm =>
+        for {
+          tVar <- TxnVar.of(1)
+          result <- for {
+                      resFib      <- program1(tVar).commit.start
+                      _           <- program2(tVar).commit.start
+                      innerResult <- resFib.joinWithNever
+                    } yield innerResult
+        } yield result
+      }
         .asserting(_ shouldBe 5)
     }
   }

@@ -39,7 +39,8 @@ import bengal.stm.syntax.all._
   * window. The lever is that `staticAnalysisCompiler` executes `TxnDelay` thunks — so `STM[F].fromF` lets the test
   * suspend the ANALYSIS pass itself, mid-flight, and act while it is parked.
   *
-  * The mechanism, step by step:
+  * The mechanism, step by step. Steps 1 to 5 STILL HAPPEN — the fix does not close the divergence, it catches it — and
+  * step 6 is what it catches:
   *
   *   1. `analysis` reads kv1/kv2 — the key SOURCES — and parks on `analysisGate`. It has already decided it will touch
   *      map entries "c" and "d".
@@ -52,9 +53,18 @@ import bengal.stm.syntax.all._
   *      knew about, and which it therefore never protected.
   *   5. A `transfer` transaction (which moves 1 from entry "a" to entry "b", so a+b is invariantly 0) is judged
   *      COMPATIBLE with the declared footprint, because that footprint mentions "c" and "d". It runs concurrently and
-  *      commits between the reader's two reads.
-  *   6. The reader observes a TORN transfer: entry "a" from before it, entry "b" from after. It sums to 1. No serial
-  *      order produces that, because a + b is 0 in every state.
+  *      commits between the reader's two reads. The reader's LOG now holds a torn view of the transfer: entry "a" from
+  *      before it, entry "b" from after, summing to 1 — an outcome no serial order produces, since a + b is 0 in every
+  *      committed state.
+  *   6. THE FIX. That torn view never reaches the caller. Before publishing, and UNDER THE COMMIT LOCKS,
+  *      `AnalysedTxn.commit` asks whether the DECLARED footprint COVERS the one the run actually built
+  *      (`IdFootprint.covers`). Declaring reads of "c" and "d" covers nothing about "a" and "b", so the answer is no,
+  *      the placement was unsound, and the transaction takes the same road as a dirty log: release the locks, refine
+  *      the footprint from the ACTUAL log, and re-run. The re-run is scheduled on a footprint that describes it, so the
+  *      transfer is now a conflict and cannot slip between its reads.
+  *
+  * Which is why the observable below is a sum of 0 and not an absence of tearing: the tear still happens, and is thrown
+  * away.
   */
 class DataDependentFootprintSpec extends AnyFreeSpec with Matchers {
 

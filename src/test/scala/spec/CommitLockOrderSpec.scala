@@ -47,6 +47,13 @@ import bengal.stm.syntax.all._
   * The fix carries each lock's OWNER id alongside it and sorts on that, which is a genuine total order over locks.
   * Modelled and verified in `specs/commit/CommitH2.cfg` (`NoWaitsForCycle`).
   *
+  * MAP KEYS ARE NOT AN ARBITRARY CHOICE HERE, and this suite does not overlap `runtime/TxnLockOrderingSpec` — do not
+  * merge them. That suite drives plain `TxnVar`s, where the log key and the lock owner are the SAME id, so the
+  * divergence H2 turns on cannot arise; and its transactions have incompatible footprints, so the scheduler serializes
+  * them and they never enter `withLock` together at all. Fresh map keys are the only shape that puts two
+  * footprint-COMPATIBLE transactions into overlapping commit windows while their locks resolve through a different id
+  * space. Nothing else in the library reaches H2.
+  *
   * FAILURE MODE, measured against the pre-fix tree: this test deadlocked and failed with `TimeoutException: 60 seconds`
   * rather than wedging the JVM — so a reintroduction is a red test, not a hung CI job. The deadlocked fibers themselves
   * cannot be cancelled (`AnalysedTxn.commit` wraps `withLock` in `Async[F].uncancelable` and discards the poll, so a

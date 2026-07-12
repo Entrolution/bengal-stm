@@ -15,8 +15,13 @@
  *   E1  : map entry, parent = S         (TxnVarMap.getRuntimeId)
  *   E2  : map entry, parent = S, E2 /= E1
  *
- * Quantified lemmas range over all 2^4 x 2^4 = 256 footprints on this
- * universe (65,536 ordered pairs) — exhaustive and fast.
+ * Quantified lemmas range over all 2^4 x 2^4 x 2 = 512 footprints on this
+ * universe, hence 262,144 ordered pairs. The trailing factor of 2 is the H3
+ * under-approximation flag, which doubled the space: every algebraic lemma
+ * below is now checked over untrustworthy footprints as well as trustworthy
+ * ones. The pair lemmas are near-instant; LemmaCoverageIsSound is a TRIPLE and
+ * dominates the runtime, which is why it is restricted to CompleteFootprints
+ * below.
  *
  * TWO KINDS OF LEMMA LIVE HERE — read the labels carefully:
  *
@@ -43,23 +48,21 @@ E2  == [val |-> 5, par |-> 3]
 
 Ids == {PV1, S, E1, E2}
 
-(* The full footprint universe now includes the UNDER-APPROXIMATION flag (the
-   H3 fix), so every algebraic lemma below is checked over both trustworthy and
-   untrustworthy footprints — 512 footprints, 262,144 ordered pairs. *)
+(* The full footprint universe: the H3 under-approximation flag is part of it,
+   so a footprint here can be untrustworthy as well as empty or full. *)
 Footprints == [reads : SUBSET Ids, updates : SUBSET Ids, under : BOOLEAN]
 
-(* The COMPLETE footprints — those the walker fully determined. The coverage
-   lemma quantifies `declared` and `actual` over these rather than over the whole
-   universe, and that is exact rather than a shortcut: an under-approximated
-   footprint is incompatible with everything
-   (LemmaUnderApproximatedIncompatibleWithAll), so a triple with an
-   under-approximated `declared` discharges vacuously, and `actual` is a log
-   footprint, which is complete by construction. `g` likewise: if it is
-   under-approximated then BOTH sides of the implication are false. So the
-   restriction is exact, not a shortcut -- every triple it drops is one that
-   discharges vacuously anyway -- and it cuts the check 8x. The negative control
-   in specs/README.md (break Covers, watch LemmaCoverageIsSound fail) confirms
-   the restricted lemma still has teeth. *)
+(* The COMPLETE footprints — those the walker fully determined. LemmaCoverageIsSound
+   quantifies over these rather than over the whole universe, and EVERY TRIPLE THE
+   RESTRICTION DROPS IS ONE THAT WOULD HAVE DISCHARGED VACUOUSLY. An
+   under-approximated footprint is incompatible with everything
+   (LemmaUnderApproximatedIncompatibleWithAll), so an under-approximated `declared`
+   or `g` falsifies both sides of the implication; and `actual` is a log footprint,
+   which is complete by construction, since no single log entry can be
+   under-approximated. The restriction is therefore exact, and it cuts the check
+   8x — which on a triple is the difference between 16.7M evaluations and 134M.
+   The negative control in specs/README.md (break Covers, watch
+   LemmaCoverageIsSound fail) confirms the restricted lemma still has teeth. *)
 CompleteFootprints == [reads : SUBSET Ids, updates : SUBSET Ids, under : {FALSE}]
 
 -------------------------------------------------------------------------------
@@ -207,7 +210,8 @@ ASSUME DocumentsParentWriteChildReadCaught ==
    conjunct (the H5 fix): a structure read observes the key set, so a
    new-key insert must conflict with it. Before the fix this pair was
    judged compatible — the phantom-write-skew hole confirmed behaviourally
-   at ~98% of contended whole-map-read + insert reps (plan §6, H5). *)
+   at ~98% of contended whole-map-read + insert reps — the SerializabilityOracleSpec
+   probe, now a regression test. *)
 ASSUME DocumentsParentReadChildWriteCaught ==
     ~IsCompatible(FP({S}, {}), FP({}, {E1}))
 
@@ -226,7 +230,7 @@ ASSUME DocumentsParentReadChildReadCompatible ==
  * what allows two such transactions to run concurrently and contend on the
  * map's structural commitLock via the new-key lock fallback
  * (TxnLogUpdateVarMapEntry.lock). With TWO maps this becomes H2's
- * accurate-mode deadlock candidate (plan §6). Compatibility here is
+ * accurate-mode deadlock candidate. Compatibility here is
  * correct (the writes genuinely don't conflict); the hazard lives in the
  * lock aliasing, which Spec A models.
  *)

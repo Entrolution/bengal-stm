@@ -6,15 +6,15 @@
  * line references rot on every comment edit and verify_anchors.sh cannot
  * guard them; symbol names it can grep.
  *
- * PHASE 1 SCOPE (docs/plans/formal-specs.md §5, §8): submission and graph
- * building, dependency tallies, execution statuses, unsubscribe cascades,
- * the dirty-resubmission path (submitTxnForImmediateRetry), and the error
- * recovery branches. The retry map / park / wake machinery (TxnResultRetry)
- * is Phase 2 and absent here; the commit is Spec B's atomic version-bump
- * abstraction (plan §3) — Spec A refines it.
+ * SCOPE: submission and graph building, dependency tallies, execution
+ * statuses, unsubscribe cascades, the dirty-resubmission path
+ * (submitTxnForImmediateRetry), the error recovery branches, and the retry
+ * map / park / wake machinery (TxnResultRetry — where H1 lived). The COMMIT
+ * itself is not modelled here: Spec B abstracts it to an atomic version bump,
+ * and specs/commit/CommitProtocol.tla is what discharges that abstraction.
  *
- * GRANULARITY (plan §5 atomicity mapping): one model step = one operation on
- * one shared mutable object (Ref get/set/update, TrieMap read/insert/remove).
+ * GRANULARITY: one model step = one operation on one shared mutable object
+ * (Ref get/set/update, TrieMap read/insert/remove).
  * Semaphore-guarded regions are NOT atomic — steps of detached fibers
  * (unsubscribe cascades) interleave with in-region steps. Deliberate
  * reductions, each argued in specs/README.md:
@@ -34,6 +34,12 @@
  *       remove).
  *   R4. Static analysis, AnalysedTxn construction, and Deferred creation
  *       collapse into Init.
+ *   R5. One submit workflow per txn, which serializes the inline `imm`
+ *       submissions two dirty fibers could in principle run at once. Argued
+ *       in full at ExecResubInit, because the argument is that the H4 fix
+ *       makes the concurrency it hides NON-EXISTENT — so R5 is vacuous, and
+ *       reading it anywhere but next to the admission gate invites the wrong
+ *       conclusion.
  *   R6. A cascade spawns with its edge set preloaded: the cascadeFired
  *       gate serializes cascades per incarnation and the drained map is
  *       frozen by spawn time, so the code's gate/nonEmpty/values steps
@@ -60,15 +66,18 @@
  * no-op, modelling decrements of dead refs); triggerUnsub fires exactly
  * once per incarnation (cascadeFired).
  *
- * Commit outcomes are truthful, not nondeterministic: dirty iff a written
- * var's version moved since this fiber's snapshot. A nondeterministic
+ * Commit outcomes are TRUTHFUL rather than nondeterministic: dirty iff a
+ * written var's version moved since this fiber's snapshot. A nondeterministic
  * failure can strike the commit (before publish — a mid-publish throw is
- * inside the atomic-commit abstraction and out of scope here) or the
- * dispatch of a dirty resubmission — modelling `execute`'s handleErrorWith,
- * which runs registerCompletion a SECOND time and starts a SECOND
- * unsubscribe cascade — and a plain submission can abort, modelling the
- * submit wrapper's handleErrorWith in TxnRuntime.commit, which completes
- * the signal and leaves the transaction wherever it was.
+ * inside the atomic-commit abstraction and out of scope here) or the dispatch
+ * of a dirty resubmission, modelling `execute`'s handleErrorWith: it runs
+ * registerCompletion a SECOND time — idempotent on activeTransactions — and
+ * re-enters triggerUnsub, where PRE-FIX it spawned a second cascade over the
+ * same shared unsubSpecs, racing the first one's clear(). The cascadeFired
+ * gate now closes that (ExecErrSpawnUnsub), so the second call finds the gate
+ * shut and does nothing. A plain submission can also abort, modelling the
+ * submit wrapper's handleErrorWith in TxnRuntime.commit, which completes the
+ * signal and leaves the transaction wherever it was.
  *)
 
 EXTENDS Footprint, Integers, FiniteSets, Sequences
@@ -151,11 +160,12 @@ LoggedFP(t) ==
    t1 therefore now models the OTHER way declared can differ from actual: a
    DATA-DEPENDENT footprint. The walker completed — nothing threw, so nothing is
    flagged and the scheduler trusts the result — but the access set was computed
-   from values read BEFORE submission, and they changed underneath it. This is
-   the gap recorded in docs/plans/formal-specs.md section 10, and post-H3-fix it
-   is the ONLY remaining source of declared/actual divergence: the only thing
-   that can still drive a transaction down the dirty-resubmission path, and the
-   only thing left that can still under-declare a READ. See
+   from values read BEFORE submission, and they changed underneath it. Post-H3-fix
+   this DATA-DEPENDENT divergence is the ONLY remaining source of declared/actual
+   disagreement: the only thing that can still drive a transaction down the
+   dirty-resubmission path, and the only thing left that can still under-declare a
+   READ. Spec A hunts its read-side consequence (H6) and fixes it with the
+   commit-time coverage check; see specs/commit/CommitH6.cfg and
    specs/commit/CommitDirty.cfg, which had to be rebuilt on the same realisation.
 
    The H4 machinery this config verifies is therefore still live and still
@@ -192,10 +202,12 @@ TxnRank(t) ==
 ---------------------------------------------------------------------------
 
 VARIABLES
-    \* --- per-txn protocol state (the AnalysedTxn refs; shared across
-    \*     the H4 fix gives every incarnation FRESH tally/unsubs/status/
-    \*     cascade refs — old cascades drain dead refs, modelled by
-    \*     incarnation-tagged edges whose drains no-op on a mismatch) ---
+    \* --- per-txn protocol state (the AnalysedTxn refs). PRE-H4-FIX these were
+    \*     SHARED across incarnations; the fix gives every incarnation FRESH
+    \*     tally/unsubs/status/cascade refs, so old cascades drain DEAD refs —
+    \*     modelled by incarnation-tagged edges whose drains no-op on a
+    \*     mismatch. completionSignal is the one that stays shared, and must:
+    \*     it has to complete the ORIGINAL caller. ---
     status,          \* executionStatus Ref — fresh per incarnation
     tally,           \* dependencyTally Ref (fresh per incarnation)
     unsubs,          \* unsubSpecs TrieMap: t |-> set of <<downstreamId, itsIncAtSubscribe>>
@@ -230,7 +242,7 @@ VARIABLES
     active,          \* activeTransactions keys
     graphSem,        \* graphBuilderSemaphore holder: txn id or "none"
     version,         \* var id -> commit counter (values abstracted away)
-    \* --- retry machinery (Phase 2) ---
+    \* --- retry machinery (park / wake — H1 territory) ---
     parked,          \* retryMap membership: txns parked awaiting a wake
                      \* (keyed by footprint in code; compat is computed from
                      \* declared[t], which is stable while parked)
@@ -548,7 +560,7 @@ SubmitAbort(t) ==
 
 ---------------------------------------------------------------------------
 (* Execute fibers — execute with the atomic-commit
-   abstraction (plan §3). *)
+   abstraction that specs/commit/CommitProtocol.tla refines. *)
 ---------------------------------------------------------------------------
 
 (* admitForExecution: semaphore-guarded admission gate (reduction R3 —
@@ -717,17 +729,22 @@ ExecResubInit(t, s) ==
                    scanPending, curTarget, curDir, curContained, unsubW,
                    schedVars, retryVars>>
 
-(* A fiber at the incarnation bound retires its slot: the code would
-   resubmit unboundedly; the model truncates the behaviour here, frees the
-   slot, and raises truncatedWake so the state counts as a legitimate
-   exploration horizon (Terminating stutters on it) rather than a protocol
-   deadlock. The retry/park scenarios NEED this: a retrier can consume an
-   incarnation per spin while its conflictor sits mid-submission, so every
-   finite MaxInc is exhaustible by adversarial scheduling — in the code the
-   spin is bounded by the conflictor's real progress (a fairness argument,
-   noted in the README). In the H4 safety scenario the clean run shows the
-   bound never binds (truncatedWake stays FALSE — checked by the
-   BoundsNeverBind invariant there). *)
+(* A fiber at the incarnation bound retires its slot: the code resubmits
+   without any bound, so the model truncates the behaviour here, frees the
+   slot, and raises truncatedWake — which makes the state a declared
+   exploration horizon (Terminating stutters on it) instead of a spurious
+   protocol deadlock.
+
+   IT DOES NOT FIRE ANYWHERE. The retry scenarios are the ones that would need
+   it: WITHOUT SweepWake's self-skip a retrier burns an incarnation per SPURIOUS
+   SELF-WAKE while its conflictor sits mid-submission, and any finite MaxInc is
+   then exhaustible by adversarial scheduling. With the skip in place this
+   action has ZERO action coverage in every organic config — Scheduler,
+   SchedulerRetry and SchedulerAbsentKey alike, all three of which assert
+   BoundsNeverBind and pass. It stays as the model's finiteness backstop,
+   because the code's resubmission really is unbounded and something has to
+   close that off. But no organic scenario reaches it, so if it starts firing,
+   something regressed. *)
 ExecResubTruncate(t, s) ==
     /\ exec[<<t, s>>].pc = "resubInit"
     /\ inc[t] >= MaxInc
@@ -747,9 +764,13 @@ ExecResubDone(t, s) ==
     /\ UNCHANGED <<txnVars, submitVars, unsubW, schedVars, retryVars>>
 
 (* An exception inside the imm submission propagates to execute's
-   handleErrorWith: registerCompletion runs a SECOND time
-   and a SECOND triggerUnsub cascade is spawned over the SAME shared
-   unsubSpecs. permit.use releases the semaphore on the way out. *)
+   handleErrorWith, which runs registerCompletion a SECOND time and re-enters
+   triggerUnsub. PRE-FIX that spawned a SECOND cascade over the SAME shared
+   unsubSpecs, racing the first one's clear() — one of H4's two double-execution
+   engines. Post-fix the fiber lands at "eRegComp" and the cascadeFired gate
+   turns the second cascade into a no-op (ExecErrSpawnUnsub). The path stays in
+   the model because the gate is exactly what needs checking.
+   permit.use releases the semaphore on the way out. *)
 ExecResubAbort(t, s) ==
     /\ AbortsEnabled
     /\ exec[<<t, s>>].pc = "resubWait"
@@ -760,8 +781,9 @@ ExecResubAbort(t, s) ==
     /\ UNCHANGED <<txnVars, submitMode, scanPending, curTarget, curDir,
                    curContained, unsubW, active, version, retryVars>>
 
-(* Error path: registerCompletion (possibly the second time — idempotent on
-   the active set, NOT on the unsub cascade), then complete(Left). *)
+(* Error path: registerCompletion (possibly the second time — idempotent on the
+   active set, and since the H4 fix idempotent on the unsub cascade too, via the
+   cascadeFired gate below), then complete(Left). *)
 ExecErrRegComplete(t, s) ==
     /\ exec[<<t, s>>].pc = "eRegComp"
     /\ graphSem = "none"
@@ -834,7 +856,7 @@ UnsubClear(o, u) ==
 ---------------------------------------------------------------------------
 
 ---------------------------------------------------------------------------
-(* Retry machinery (Phase 2): submitTxnForRetry parks under the retry
+(* Retry machinery — H1 territory: submitTxnForRetry parks under the retry
    semaphore; checkRetryQueue sweeps run fire-and-forget after every
    submission's release and wake parked txns whose footprints conflict
    with the submitted one — wakes fire ONLY from these sweeps. The H1
@@ -868,9 +890,12 @@ ExecParkAcq(t, s) ==
                      sweep still blocked on the retry semaphore we hold —
                      which will find us parked and wake us.
 
-   The reverse order (stale, then scan) LOSES WAKEUPS: a conflictor can
-   commit after the stale read and leave activeTransactions before the
-   scan, escaping both — TLC finds that deadlock at depth 55. *)
+   The reverse order (stale, then scan) LOSES WAKEUPS: a conflictor can commit
+   after the stale read and leave activeTransactions before the scan, escaping
+   both. That is not a hypothetical — reverse the two actions' pc transitions
+   on a scratch copy and SchedulerRetry.cfg deadlocks in a 36-state trace, with
+   tw's ExecCommit and ExecRegComplete landing in exactly the gap between tr's
+   stale read and tr's scan. *)
 ExecParkStale(t, s) ==
     /\ exec[<<t, s>>].pc = "parkStale"
     /\ retrySem = [kind |-> "park", t |-> t]
@@ -1002,16 +1027,30 @@ Next ==
 Spec == Init /\ [][Next]_vars
 
 ---------------------------------------------------------------------------
-(* State constraint (finiteness backstop; plan §5) *)
+(* State constraint — a finiteness backstop, and deliberately nothing more.
+
+   THE TALLY'S LOWER BOUND SITS BELOW TallyNonNegative'S FLOOR, and the gap is
+   load-bearing. A state constraint must never be tight enough to IMPLY an
+   invariant. TLC prunes a constraint-violating state from the QUEUE, so with a
+   floor of 0 here, every state TLC went on to EXPLORE would satisfy
+   TallyNonNegative by construction, and any behaviour reachable only THROUGH a
+   negative tally would be quietly unreachable — the bound would be enforcing
+   the very property the invariant is there to test. (TLC does evaluate
+   invariants on a state before pruning it, so the boundary violation itself
+   would still be reported; what would be lost is everything beyond it.)
+   Leaving the floor at -2 keeps TallyNonNegative falsifiable INSIDE the
+   explored space, which is the only place its verdict means anything.
+
+   inc needs no clause: ExecResubTruncate caps it at the action level. *)
 ---------------------------------------------------------------------------
 
 StateConstraint ==
-    \* inc needs no clause: ExecResubTruncate caps it at the action level.
     /\ \A t \in Txns : tally[t] >= -2 /\ tally[t] <= 4
     /\ \A v \in VarIds : version[v] <= MaxVer
 
 ---------------------------------------------------------------------------
-(* Invariants (plan §5 property table) *)
+(* Invariants — the property table, each one's verdict and each one's
+   negative control all live in specs/README.md. *)
 ---------------------------------------------------------------------------
 
 TypeOK ==
@@ -1023,7 +1062,7 @@ TypeOK ==
    was delivered for an edge the tally no longer counts (H4 family). *)
 TallyNonNegative == \A t \in Txns : tally[t] >= 0
 
-(* Contract C — the interface property Spec A assumes (plan §3): no two
+(* Contract C — the interface property Spec A assumes: no two
    transactions in their execute/commit window with incompatible DECLARED
    footprints (current incarnations). The code's window is
    [admitForExecution succeeded, registerCompletion fired] — completion
@@ -1066,11 +1105,18 @@ CompletionAtMostOnce == \A t \in Txns : completedCount[t] <= 1
 (* A transaction's writes are published at most once per incarnation *)
 NoDoublePublish == \A t \in Txns : ~doublePub[t]
 
-(* For scenarios whose behaviour fits inside the exploration bounds (the
-   H4 safety scenario does), no truncation and no dropped sweep occurred —
-   the verdicts are exhaustive, not horizon-clipped. Retry scenarios omit
-   this: a retrier can legitimately spin to the incarnation bound while
-   its conflictor is mid-submission. *)
+(* No truncation and no dropped sweep occurred: the verdict is exhaustive
+   within the bounds rather than clipped by them.
+
+   EVERY ORGANIC CONFIG ASSERTS THIS, retry ones included — which is worth
+   saying, because the retry scenarios look like the ones that should need an
+   escape. Without SweepWake's self-skip a parked retrier is woken by its OWN
+   in-flight submission sweep, re-runs, re-parks and is woken again, burning an
+   incarnation per cycle, and no finite MaxInc survives that. The self-skip
+   removes the spin, and with it gone ExecResubTruncate has ZERO action coverage
+   in Scheduler, SchedulerRetry and SchedulerAbsentKey alike. Only
+   SchedulerAborts omits this invariant, and it omits most of the table besides:
+   an aborted zombie legitimately strands its dependents. *)
 BoundsNeverBind == ~truncatedWake /\ ~droppedSweep
 
 
