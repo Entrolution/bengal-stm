@@ -374,12 +374,19 @@ private[stm] trait TxnRuntimeContext[F[_]] {
         )
       )
 
+    // Some, NOT Option. `Option(x)` maps a null x to None — and None is ALSO
+    // how the commit path below signals "refine and re-run". Overloading the
+    // two made a transaction that legitimately yielded null read as a
+    // refinement request: it published its write set, yielded None, was
+    // re-dispatched as TxnResultLogDirty, and ran again — publishing again,
+    // without bound. Wrapping with Some keeps null a legitimate VALUE, so a
+    // None here can only ever mean refine (spec/NullResultSpec.scala).
     private[stm] def getTxnLogResult: F[(TxnLog, Option[V])] =
       txn
         .foldMap[TxnLogStore](txnLogCompiler)
         .run(TxnLogValid.empty)
         .map { res =>
-          (res._1, Option(res._2))
+          (res._1, Some(res._2): Option[V])
         }
         .handleErrorWith {
           case TxnRetryException(log) =>

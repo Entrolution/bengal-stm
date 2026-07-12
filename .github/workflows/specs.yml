@@ -82,6 +82,23 @@ jobs:
             specs/scheduler/Scheduler.tla \
             NONE
 
+      # PINNED RED, and it must stay red. tm is SchedulerRetry's tr with one
+      # difference: its read records no log entry, which is what a waitFor on an
+      # ABSENT MAP KEY does. That makes anyReadChangedSinceRead — the SECOND of
+      # H1's two park guards — structurally blind, and the parker sleeps forever.
+      #
+      # This is the negative control for the guard: if it ever stops deadlocking,
+      # either the model stopped modelling the unlogged read or the park protocol
+      # changed shape. Both need a human. The FIX (logging the absent-key read,
+      # TxnLogContext.getVarMapValue) is what makes the real system the tr case,
+      # and SchedulerRetry.cfg — clean — is that pin.
+      - name: Check park guard against an unlogged read (pinned RED — negative control)
+        run: |
+          ./specs/check_expected.sh \
+            specs/scheduler/SchedulerAbsentKey.cfg \
+            specs/scheduler/Scheduler.tla \
+            DEADLOCK
+
       - name: Check Scheduler robustness (pinned, dispatch only)
         if: github.event_name == 'workflow_dispatch'
         run: |

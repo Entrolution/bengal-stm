@@ -90,23 +90,51 @@ CONSTANTS
      tr         : a waitFor transaction — reads V1, retries until
                   version[V1] >= 1, then writes V2 (retry/park configs)
      tw         : the writer whose commit satisfies tr's predicate
+     tm         : tr, with its read UNLOGGED — a waitFor on an ABSENT map
+                  key. Identical to tr in every other respect. See LoggedFP.
    *)
 ---------------------------------------------------------------------------
 
-AllTxns == {"t1", "t2", "t3", "tr", "tw"}
+AllTxns == {"t1", "t2", "t3", "tr", "tw", "tm"}
 ASSUME Txns \subseteq AllTxns
 
 V1 == [val |-> 1, par |-> NoParent]
 V2 == [val |-> 2, par |-> NoParent]
 VarIds == {V1, V2}
 
-(* Actual access sets: what the transaction's log will really touch. *)
+(* Actual access sets: what the transaction TOUCHES. *)
 ActualFP(t) ==
     CASE t = "t1" -> FP({}, {V1})
       [] t = "t2" -> FP({}, {V1})
       [] t = "t3" -> FP({V1}, {V2})
       [] t = "tr" -> FP({V1}, {V2})
       [] t = "tw" -> FP({}, {V1})
+      [] t = "tm" -> FP({V1}, {V2})
+
+(* What the transaction's LOG RECORDS — which is NOT the same thing, and the
+   model conflated the two until now.
+
+   Reading a map key that is ABSENT records no log entry at all: the
+   key-absent branch of TxnLogContext.getVarMapValue returns the log
+   UNCHANGED. The read is still in the DECLARED footprint — the static
+   analysis walker registers the key's existential id unconditionally — so
+   Contract C still keeps conflicting writers out of the execute window, and
+   checkRetryQueue's sweep still matches on it. But every fold over the LOG
+   is blind to it, and there are two:
+
+     TxnLogValid.anyReadChangedSinceRead  — the H1 park-time staleness check
+     TxnLogValid.idFootprint              — the dirty path's refinement source
+
+   Modelling the staleness check over ActualFP therefore checked a STRONGER
+   guard than the code implements, which is why this spec did not catch it.
+
+   tm differs from tr in exactly one respect: its read of V1 is not logged.
+   Everything else — declared footprint, retry predicate, write set — is
+   identical, so anything TLC finds here is caused by the missing log entry
+   and by nothing else. *)
+LoggedFP(t) ==
+    CASE t = "tm" -> FP({}, {V2})
+      [] OTHER    -> ActualFP(t)
 
 (* Declared base footprints. t1's declared footprint is EMPTY while it really
    writes V1, so t1 and t2 are judged compatible, run concurrently, collide on
@@ -140,20 +168,24 @@ DeclaredBase(t) ==
       [] t = "t3" -> FP({V1}, {V2})
       [] t = "tr" -> FP({V1}, {V2})
       [] t = "tw" -> FP({}, {V1})
+      \* tm DECLARES the absent key's read accurately — the walker registers
+      \* its existential id whether or not the key exists. Only the log misses it.
+      [] t = "tm" -> FP({V1}, {V2})
 
 (* Retry transactions and their predicates over versions. A non-retry
    transaction's predicate is vacuously TRUE. The predicate is evaluated
    against the fiber's SNAPSHOT (the log's read values), exactly as the
    code's log run decides TxnLogRetry — a write committed after the
    snapshot does not rescue a stale decision (that gap is H1's home). *)
-IsRetryTxn(t) == t = "tr"
+IsRetryTxn(t) == t \in {"tr", "tm"}
 RetryPred(t, versionsFn) ==
-    IF t = "tr" THEN versionsFn[V1] >= 1 ELSE TRUE
+    IF t \in {"tr", "tm"} THEN versionsFn[V1] >= 1 ELSE TRUE
 
+\* Writes always record a log entry, so ActualFP and LoggedFP agree on updates.
 Writes(t) == ActualFP(t).updates
 TxnRank(t) ==
     CASE t = "t1" -> 1 [] t = "t2" -> 2 [] t = "t3" -> 3
-      [] t = "tr" -> 4 [] t = "tw" -> 5
+      [] t = "tr" -> 4 [] t = "tw" -> 5 [] t = "tm" -> 6
 
 ---------------------------------------------------------------------------
 (* State *)
@@ -658,9 +690,12 @@ ExecResubInit(t, s) ==
     \* dirty refines the declared footprint from the log and resubmits via
     \* submitTxnForImmediateRetry; a retry-with-downstream keeps its
     \* footprint and resubmits via plain submitTxn (both freshIncarnation).
+    \* LoggedFP, not ActualFP: the refinement source is TxnLogValid.idFootprint,
+    \* another fold over log.values — so an unlogged read is dropped from the
+    \* declared footprint on refinement, not merely missed by the stale check.
     /\ declared'     = [declared EXCEPT ![t] =
                            IF exec[<<t, s>>].out = "dirty"
-                           THEN Validated(ActualFP(t)) ELSE @]
+                           THEN Validated(LoggedFP(t)) ELSE @]
     /\ inc'          = [inc EXCEPT ![t] = @ + 1]
     /\ publishedInc' = [publishedInc EXCEPT ![t] = FALSE]
     \* freshIncarnation: brand-new tally / unsub-edge map / status /
@@ -839,8 +874,10 @@ ExecParkAcq(t, s) ==
 ExecParkStale(t, s) ==
     /\ exec[<<t, s>>].pc = "parkStale"
     /\ retrySem = [kind |-> "park", t |-> t]
+    \* LoggedFP, not ActualFP: anyReadChangedSinceRead folds over log.values,
+    \* so a read that recorded no entry is INVISIBLE to this check.
     /\ parkChk' = [parkChk EXCEPT ![<<t, s>>].st =
-                      \E v \in CombinedIds(ActualFP(t)) : version[v] /= snap[<<t, s>>][v]]
+                      \E v \in CombinedIds(LoggedFP(t)) : version[v] /= snap[<<t, s>>][v]]
     /\ exec' = [exec EXCEPT ![<<t, s>>].pc = "parkInsert"]
     /\ UNCHANGED <<txnVars, submitVars, unsubW, active, graphSem, version,
                    parked, retrySem, sweep, droppedSweep, truncatedWake>>

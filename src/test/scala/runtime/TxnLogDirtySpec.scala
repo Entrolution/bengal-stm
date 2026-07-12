@@ -21,7 +21,6 @@ import scala.concurrent.duration._
 
 import cats.effect.IO
 import cats.effect.testing.scalatest.AsyncIOSpec
-import org.scalatest.Tag
 import org.scalatest.freespec.AsyncFreeSpec
 import org.scalatest.matchers.should.Matchers
 
@@ -29,10 +28,23 @@ import bengal.stm.STM
 import bengal.stm.model._
 import bengal.stm.syntax.all._
 
+/** THE TWO PARK/WAKE TESTS HERE WERE DISABLED FOR FOUR MONTHS, AND THEY WERE RIGHT.
+  *
+  * They were tagged Flaky and ignored in v0.12.0 because they "intermittently time out under CI load". A timeout is not
+  * a flake here — a lost wakeup does not corrupt anything, it HANGS, so a timeout is the only symptom it can have. They
+  * were reporting H1, and "under CI load" is the preemption H1 needs to open its window.
+  *
+  * H1 was fixed four months later (submitTxnForRetry re-checks the read set and scans activeTransactions inside the
+  * retry-semaphore region before parking). Re-enabled after 80/80 clean reps of each body — 40 idle, 40 under heavy
+  * scheduling pressure — with no hang and no wrong value.
+  *
+  * The lesson worth keeping: an intermittently-timing-out concurrency test is evidence, not noise. Disabling one throws
+  * away the only signal the defect was ever going to produce.
+  */
 class TxnLogDirtySpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
 
   "dirty detection" - {
-    "transaction retries and sees updated value when variable is modified externally" taggedAs Tag("Flaky") ignore {
+    "transaction retries and sees updated value when variable is modified externally" in {
       STM
         .runtime[IO]
         .flatMap { implicit stm =>
@@ -80,7 +92,7 @@ class TxnLogDirtySpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
         .asserting(_ shouldBe 999)
     }
 
-    "concurrent modification forces retry and transaction sees final value" taggedAs Tag("Flaky") ignore {
+    "concurrent modification forces retry and transaction sees final value" in {
       STM
         .runtime[IO]
         .flatMap { implicit stm =>
