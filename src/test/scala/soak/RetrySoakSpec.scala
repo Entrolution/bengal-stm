@@ -86,11 +86,11 @@ import bengal.stm.syntax.all._
   */
 class RetrySoakSpec extends AnyFreeSpec with Matchers {
 
-  private val Capacity  = 4
-  private val Producers = 12
-  private val Consumers = 8
+  private val Capacity    = 4
+  private val Producers   = 12
+  private val Consumers   = 8
   private val PerProducer = 6
-  private val Total     = Producers * PerProducer
+  private val Total       = Producers * PerProducer
 
   /** Generous, because parking is expected and a woken transaction legitimately re-runs. This exists to catch a SPIN —
     * unbounded churn — not to pin a tight number.
@@ -174,7 +174,7 @@ class RetrySoakSpec extends AnyFreeSpec with Matchers {
      * in the class comment: this catches a GROSS wake failure, not H1 itself.
      */
     "every transaction completes, and every item is consumed exactly once" in {
-      val rounds = 8
+      val rounds   = 8
       val allExecs = Vector.newBuilder[Int]
 
       (1 to rounds).foreach { round =>
