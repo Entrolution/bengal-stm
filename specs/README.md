@@ -101,106 +101,63 @@ rot on every edit and `verify_anchors.sh` cannot guard them.
 
 ## Running the Model Checker
 
-From the repository root. Every result below is asserted by
-`specs/check_expected.sh`, which encodes whether a run is expected clean or
-expected to reproduce a **pinned counterexample** (an EXPECTED-RED verdict):
+From the repository root:
 
 ```bash
-# Footprint lemmas — expected clean, 38.7s (the coverage lemma quantifies over
-# ordered TRIPLES; it dominates the run)
-./specs/check_expected.sh specs/common/FootprintLemmas.cfg \
-    specs/common/FootprintLemmas.tla NONE
-
-# Scheduler safety — expected CLEAN since the H4 fix (exhaustive,
-# deadlock detection on), 36.1s
-./specs/check_expected.sh specs/scheduler/Scheduler.cfg \
-    specs/scheduler/Scheduler.tla NONE
-
-# Retry / park / wake — expected CLEAN since the H1 fix. A lost wakeup shows
-# up here as a deadlock, so no invariant names it. 1.7s
-./specs/check_expected.sh specs/scheduler/SchedulerRetry.cfg \
-    specs/scheduler/Scheduler.tla NONE
-
-# The park guard's negative control — expected RED (pinned DEADLOCK). This is
-# SchedulerRetry with ONE change: the parker's read records no log entry, which
-# is what a `waitFor` on an ABSENT MAP KEY did before the fix. ~30s
-./specs/check_expected.sh specs/scheduler/SchedulerAbsentKey.cfg \
-    specs/scheduler/Scheduler.tla DEADLOCK
-
-# Robustness config — expected RED (pinned CompletionAtMostOnce);
-# ALLOW_DEADLOCK suppresses deadlock detection for aborted-zombie states
-./specs/check_expected.sh specs/scheduler/SchedulerAborts.cfg \
-    specs/scheduler/Scheduler.tla CompletionAtMostOnce ALLOW_DEADLOCK
-
-# --- Commit protocol (Spec A) ---
-
-# H2 — lock ordering across two maps, plus the lock-aliasing (`dbl`) case.
-# EXPECTED CLEAN since the H2 fix.
-./specs/check_expected.sh specs/commit/CommitH2.cfg \
-    specs/commit/CommitProtocol.tla NONE
-
-# H3 — the static-analysis fallback. EXPECTED CLEAN since the H3 fix, in all
-# three directions the defect had:
-#   CommitH3        the EMPTY-footprint extreme (case _ => IdFootprint.empty)
-#   CommitH3Partial the PARTIAL footprint ordinary code actually produces
-#                   (StaticAnalysisShortCircuitException)
-#   CommitH3Writer  an under-declared WRITER breaking a correctly-declared
-#                   peer's reads (it has no reads of its own at all)
-./specs/check_expected.sh specs/commit/CommitH3.cfg \
-    specs/commit/CommitProtocol.tla NONE
-./specs/check_expected.sh specs/commit/CommitH3Partial.cfg \
-    specs/commit/CommitProtocol.tla NONE
-./specs/check_expected.sh specs/commit/CommitH3Writer.cfg \
-    specs/commit/CommitProtocol.tla NONE
-
-# H6 — data-dependent footprint divergence. The declared footprint names the
-# WRONG ids because the walker computed them from a value that changed before
-# the transaction was scheduled. EXPECTED CLEAN since the H6 fix.
-./specs/check_expected.sh specs/commit/CommitH6.cfg \
-    specs/commit/CommitProtocol.tla NONE
-
-# The dirty-refinement path. EXPECTED CLEAN.
-./specs/check_expected.sh specs/commit/CommitDirty.cfg \
-    specs/commit/CommitProtocol.tla NONE
-
-# Accurate footprints, including the H5 idiom. EXPECTED CLEAN — the H5 fix,
-# confirmed from the commit-protocol side. The largest Spec A config, at 3.4s.
-./specs/check_expected.sh specs/commit/CommitAccurate.cfg \
-    specs/commit/CommitProtocol.tla NONE
-
-# Raw TLC invocation (traces print to stdout; TTrace files are gitignored):
-java -XX:+UseParallelGC -cp specs/tla2tools.jar tlc2.TLC \
-    -config specs/scheduler/Scheduler.cfg specs/scheduler/Scheduler.tla \
-    -workers auto
+./specs/expectations.sh --list          # what is registered, and validate it. No TLC.
+./specs/expectations.sh                 # model-check every push-gated expectation
+./specs/expectations.sh --all           # ...including the dispatch-gated ones
+./specs/expectations.sh --measure       # regenerate specs/measured.tsv
+./specs/expectations.sh --check-readme  # the table below vs the measurement
+./specs/verify_anchors.sh               # every // SPEC: anchor maps to a row here
 ```
 
-Deadlock detection is ENABLED for organic Scheduler runs (no `-deadlock`
-flag): legitimate terminals — every completion signal fired — stutter via
-the explicit `Terminating` action, so any reported deadlock is a real
-protocol deadlock. That is what makes `DEADLOCK` a usable pinned expectation
-in its own right, and it is how `SchedulerAbsentKey` is pinned. The
-failure-injection config passes `ALLOW_DEADLOCK` (the script's 4th argument
-adds `-deadlock`) because aborted zombies legitimately strand their
-dependents.
+**Each config declares its own expectation, and that is the only place it is
+stated.** The directives live at the top of every `.cfg`:
 
-CI (`.github/workflows/specs.yml`) encodes **twelve** model-checking
-expectations: **ten expected clean** (the lemma check, `Scheduler`,
-`SchedulerRetry`, and all **seven** commit-protocol configs) and **two pinned
-red** — `SchedulerAbsentKey` (pinned `DEADLOCK`, the park guard's negative
-control) and `SchedulerAborts` (pinned `CompletionAtMostOnce`). Eleven of them
-run with `verify_anchors.sh` on every change to `specs/**` or the in-scope
-runtime sources; `SchedulerAborts` alone is `workflow_dispatch`-gated. That
-always-on set costs about 115 s of TLC, of which the lemma check and the two
-large Scheduler runs are nearly all — every config's measured time is in the
-state-space table below.
+```
+\* @spec    specs/scheduler/Scheduler.tla
+\* @expect  NONE | DEADLOCK | <InvariantName>
+\* @flags   ALLOW_DEADLOCK        (optional)
+\* @run     push | dispatch       (optional; default push)
+\* @measure no                    (optional; opt out of state-space measurement)
+```
 
-Expectations bind in **both** directions. A clean spec going red means a
-protocol regression (or rolling-TLC drift — the `v1.8.0` tag is a nightly;
-investigate which). A pinned counterexample that stops reproducing means the
-modelled defect changed shape — for `SchedulerAbsentKey` that would mean the
-model stopped modelling the unlogged read, or the park protocol was
-restructured; either needs a human before the pin is touched. Fix and spec
-move together (this verdict table, the cfg, and the plan's hypothesis rows).
+CI globs the directory and derives its steps from those. That arrangement is
+deliberate, and it is a response to how this suite actually failed.
+
+The expectation used to live in **two** places — prose in the cfg header
+("EXPECTED RED: `CommitSnapshotValid`") and an argument in
+`.github/workflows/specs.yml` — with nothing tying them together. They drifted.
+**Four cfg headers read EXPECTED RED for months while CI asserted `NONE`**, and
+`check_expected.sh` could not see it, because all it ever does is compare TLC's
+*output* to the argument it was handed. A cfg could also ship with no stated
+verdict at all (`CommitH6` did), or exist and be run by nothing.
+
+So three failure modes are now impossible rather than merely discouraged:
+
+| Failure | Why it cannot happen |
+|---|---|
+| a config with no stated verdict | `--list` fails |
+| a config that no CI step runs | CI globs `specs/*/*.cfg`; there is no list to forget |
+| a header that disagrees with CI | there is only **one** declaration to disagree with |
+
+`--list` also **rejects a config that states a verdict in prose**. Explain *why*
+a config verifies as it does at any length you like; just do not restate *what*
+it verifies as, because a restatement is a thing that can rot.
+
+**State counts are regenerated, not remembered.** `specs/measured.tsv` is
+produced by an actual run and committed; CI re-measures and fails on a diff, then
+checks the table below against it. Nothing else would catch that class of rot —
+the Scheduler config advertised "~24k distinct states" against a real **846,000**,
+and the lemma check was documented at "~1s" against a real **39s**. Both sat there
+for months, and both were eventually chased out of one file and left in another.
+
+Only exhaustive (`@expect NONE`) configs are measured. A run that **halts on a
+violation** explores a scheduling-dependent prefix, so its counts do not
+reproduce — consecutive `-workers auto` runs of `SchedulerAbsentKey` gave 9,201
+and 8,843. Pinning a number like that yields a guard that fails at random, which
+is worse than no guard.
 
 ## Verdict Table (source of truth)
 

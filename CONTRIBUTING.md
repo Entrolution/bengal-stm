@@ -132,15 +132,32 @@ The scheduler and commit protocols carry TLA+ specifications under `specs/`
 (see `specs/README.md`). PRs touching `TxnRuntimeContext.scala`,
 `TxnLogContext.scala`, `IdFootprint.scala`, or `TxnVarRuntimeId.scala` must
 update the specs to match — or state in the PR description why no protocol
-behaviour changed. CI enforces two things on these paths: `// SPEC:` anchors
-listed in `specs/README.md` must exist, and pinned model-checking
-expectations must reproduce (a pinned counterexample that stops reproducing
-means the protocol changed — update the spec and `specs/README.md`'s verdict
-table together).
+behaviour changed.
 
-`specs/README.md` is the **single source of truth for verdicts**. Do not record a
-verdict anywhere else; two copies of a verdict is how the last set of them drifted
-apart.
+```bash
+./specs/expectations.sh --list          # validate the registry (no TLC; instant)
+./specs/expectations.sh                 # model-check everything CI checks
+./specs/verify_anchors.sh               # every // SPEC: anchor maps to a row
+```
+
+**Every config declares its own expected verdict**, in a `\* @expect` directive at
+the top of the `.cfg`. That is the only place a verdict is stated — CI derives its
+steps from the directory rather than from a hand-maintained list, so a config with
+no verdict, or a config nothing runs, both fail the build.
+
+Do **not** restate the verdict in the config's prose. `--list` rejects it. Explain
+*why* a config verifies as it does at any length; just do not say *what* it
+verifies as in a second place. Two copies of a verdict is exactly how the last set
+drifted: four headers read "EXPECTED RED" for months while CI asserted clean, and
+nothing could see the contradiction because one was a sentence and the other was a
+command-line argument.
+
+State counts are **generated, not remembered** (`specs/measured.tsv`). If a spec
+change moves the state space, CI regenerates the file, the diff fails the build,
+and you update `specs/README.md`'s table to match. Do not hand-edit either.
+
+If a pinned counterexample stops reproducing, the protocol changed. Update the
+spec, the config's `@expect`, and the verdict table in `specs/README.md`.
 
 ## License
 
