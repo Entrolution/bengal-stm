@@ -156,6 +156,80 @@ object BankTransfer extends IOApp.Simple {
 }
 ```
 
+## Static analysis and transaction footprints
+
+Bengal's scheduler is what makes it different from a blindly optimistic STM: before a
+transaction runs, it works out that transaction's **footprint** — the set of variables and
+map keys it will touch — and uses it to run only transactions that cannot conflict at the
+same time. That is where the concurrency comes from.
+
+To do that, Bengal runs your transaction through a static-analysis pass. It is a real
+execution: reads happen, so values that later steps depend on are available. But **writes
+are not applied**, because the transaction has not been scheduled yet.
+
+That last point has a consequence worth knowing about.
+
+### Reading back a value you just wrote
+
+During the analysis pass, a read of something the transaction itself wrote earlier returns
+the **pre-transaction** value, not the written one. If the next step cannot cope with that,
+it throws — during analysis only, never at run time:
+
+```scala
+for {
+  _   <- inventory.set(sku, 10)
+  qty <- inventory.get(sku)      // analysis sees None; the real run sees Some(10)
+  _   <- restock.set(sku, qty.get + 1)  // `.get` on None throws — but only during analysis
+} yield ()
+```
+
+Bengal handles this safely, and the safe answer costs throughput. When analysis cannot
+determine the whole footprint, the transaction is marked as **under-approximated**, and an
+under-approximated footprint is treated as conflicting with *everything*. The transaction
+runs **alone**.
+
+That is deliberate, and it is not conservatism for its own sake. Reads are not validated at
+commit time and take no locks, so the scheduler's footprint check is the *only* thing
+standing between a transaction and a stale read. A footprint that is missing entries does
+not make the scheduler slightly less precise — it switches its protection off. Running such
+a transaction on its own is what keeps it correct. (Before this was fixed, the transaction
+above could produce non-serializable results in ~99% of contended runs.)
+
+Measured cost: such a transaction commits at roughly **half** the throughput of one whose
+footprint is fully known. Everything else is unaffected.
+
+### Avoiding it
+
+Write the step so it does not depend on reading back your own write, or make it total:
+
+```scala
+// Keep the value you are about to write, instead of reading it back:
+val qty = 10
+for {
+  _ <- inventory.set(sku, qty)
+  _ <- restock.set(sku, qty + 1)
+} yield ()
+
+// Or make the continuation total, so nothing throws during analysis:
+for {
+  _   <- inventory.set(sku, 10)
+  qty <- inventory.get(sku)
+  _   <- restock.set(sku, qty.getOrElse(0) + 1)   // `.getOrElse`, not `.get`
+} yield ()
+```
+
+The same applies to anything else that can throw inside a transaction's *analysis* —
+partial pattern matches, `.head` on a possibly-empty collection, and so on. If it throws
+only because a write has not been applied yet, it costs you concurrency rather than
+correctness.
+
+### Footprints computed from values you read
+
+A related case: if a map key is computed from a value the transaction reads, the footprint
+depends on that value — and the analysis pass runs *before* the transaction is scheduled, so
+the value can change in between. Bengal detects this at commit time, discards the run before
+it publishes anything, and re-runs with the correct footprint. It is safe; it costs a retry.
+
 ## Background
 
 For an introduction to STM concepts, see [Beautiful Concurrency](https://www.microsoft.com/en-us/research/wp-content/uploads/2016/02/beautiful.pdf) by Simon Peyton Jones.
