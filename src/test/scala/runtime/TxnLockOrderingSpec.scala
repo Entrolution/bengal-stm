@@ -40,7 +40,7 @@ import bengal.stm.syntax.all._
   * The deeper reason is the one H2 turns on. For a plain `TxnVar` the id the log keys an entry by and the id that OWNS
   * the lock that entry takes are THE SAME id — the var's `runtimeId`. Sorting by either orders the same acquisitions.
   * H2 lives in the one configuration where those two diverge: a map key that does not yet exist is LOGGED under the
-  * existential id hashed from `(mapId, key)` but LOCKS the MAP's structural `commitLock`. Two unrelated id spaces. That
+  * existential id allocated for `(map, key)` but LOCKS the MAP's structural `commitLock`. Two unrelated id spaces. That
   * shape cannot be built out of `TxnVar`s at all, which is why `spec/CommitLockOrderSpec` exists and uses map keys with
   * COMPATIBLE footprints — the only arrangement in which the scheduler deliberately lets two transactions into
   * `withLock` at the same time. The two suites are not duplicates and must not be merged.

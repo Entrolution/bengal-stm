@@ -36,13 +36,15 @@ import bengal.stm.syntax.all._
   * cannot form a circular wait. For that to work, the sort must order the LOCKS. It used to sort the LOG ENTRIES, which
   * is not the same thing:
   *
-  *   - a map entry for a key that does NOT yet exist is logged under the EXISTENTIAL id, hashed from `(mapId, key)`
+  *   - a map entry for a key that does NOT yet exist is logged under the EXISTENTIAL id, allocated for `(map, key)` on
+  *     the key's first reference
   *   - but its lock resolves to the MAP's structural `commitLock` (`TxnLogUpdateVarMapEntry.lock`)
   *
-  * Two unrelated id spaces. Sorting by the log key therefore ordered the acquisitions by a hash of the KEY while the
-  * locks acquired belonged to the MAPS — so two transactions inserting fresh keys into the same two maps could take
-  * `{m1.lock, m2.lock}` in opposite orders and deadlock. Their footprints are compatible (disjoint entry ids, no
-  * structure id on either side), so the scheduler deliberately runs them concurrently: nothing upstream prevents it.
+  * Two unrelated id spaces. Sorting by the log key therefore ordered the acquisitions by the KEYS' existential ids
+  * while the locks acquired belonged to the MAPS — so two transactions inserting fresh keys into the same two maps
+  * could take `{m1.lock, m2.lock}` in opposite orders and deadlock. Their footprints are compatible (disjoint entry
+  * ids, no structure id on either side), so the scheduler deliberately runs them concurrently: nothing upstream
+  * prevents it.
   *
   * The fix carries each lock's OWNER id alongside it and sorts on that, which is a genuine total order over locks.
   * Modelled and verified in `specs/commit/CommitH2.cfg` (`NoWaitsForCycle`).
@@ -54,19 +56,31 @@ import bengal.stm.syntax.all._
   * footprint-COMPATIBLE transactions into overlapping commit windows while their locks resolve through a different id
   * space. Nothing else in the library reaches H2.
   *
-  * FAILURE MODE, measured against the pre-fix tree: this test deadlocked and failed with `TimeoutException: 60 seconds`
-  * rather than wedging the JVM — so a reintroduction is a red test, not a hung CI job. The deadlocked fibers themselves
-  * cannot be cancelled (`AnalysedTxn.commit` wraps `withLock` in `Async[F].uncancelable` and discards the poll, so a
-  * fiber blocked on `Semaphore.permit` is uninterruptible); they simply leak until the run ends. Hence the generous
-  * timeout: it must be long enough not to fire spuriously under load, because the cost of it firing is a leaked fiber.
+  * FAILURE MODE, re-measured with a locally reverted sort (log-key order restored in `withLock`, under allocator-issued
+  * ids and the pre-touch below): this test deadlocked and failed with `TimeoutException: 60 seconds` rather than
+  * wedging the JVM — so a reintroduction is a red test, not a hung CI job. The deadlocked fibers themselves cannot be
+  * cancelled (`AnalysedTxn.commit` wraps `withLock` in `Async[F].uncancelable` and discards the poll, so a fiber
+  * blocked on `Semaphore.permit` is uninterruptible); they simply leak until the run ends. Hence the generous timeout:
+  * it must be long enough not to fire spuriously under load, because the cost of it firing is a leaked fiber.
+  * `KeyIdentitySpec` pins the first-touch allocation-order property the pre-touch relies on.
   */
 class CommitLockOrderSpec extends AnyFreeSpec with Matchers {
 
-  /** Enough distinct keys that both acquisition orders are near-certain to occur. Each key's order is decided by
-    * whether `hash(m1, key) < hash(m2, key)` — a coin flip per key — so the chance that all 24 land on the same side,
-    * and the pre-fix defect stays hidden, is about 2^-23.
+  /** 24 keys give the racing transactions plenty of overlapping commit windows. Which acquisition ORDER a key produces
+    * under the pre-fix sort is not left to chance, though: existential ids are allocated in first-touch order, and a
+    * transaction touches `m1` before `m2`, so without intervention EVERY key's ids would sort m1-before-m2 and a revert
+    * of the H2 fix could never invert and deadlock. The setup phase below pre-touches ODD keys through `m2` first,
+    * deterministically giving half the keys the opposite id order.
     */
   private val Keys: List[String] = (1 to 24).map(i => s"k$i").toList
+
+  /** Odd keys get their `(m2, key)` existential id allocated BEFORE their `(m1, key)` one — an absent-key read through
+    * `m2` in the setup phase is enough, since ids are issued on first reference and are stable thereafter. Under the
+    * pre-fix sort (by LOG KEY, i.e. by these existential ids) odd-key transactions then acquire `m2.lock` before
+    * `m1.lock` while even-key transactions acquire m1-before-m2 — the circular-wait shape the fix exists to prevent.
+    * Under the fixed sort (by lock OWNER id) the pre-touch is inert: every transaction orders by the maps' own ids.
+    */
+  private val PreTouchViaM2: List[String] = Keys.zipWithIndex.collect { case (k, i) if i % 2 == 0 => k }
 
   /** The same 24 keys, pre-paired. Built directly rather than by `grouped(2)` so the match stays total — CI compiles
     * with `-Werror`.
@@ -127,6 +141,9 @@ class CommitLockOrderSpec extends AnyFreeSpec with Matchers {
         for {
           m1 <- TxnVarMap.of[IO, String, Int](Map.empty)
           m2 <- TxnVarMap.of[IO, String, Int](Map.empty)
+          // Sequential, before the race: allocate odd keys' (m2, key) ids first so the
+          // pre-fix log-key sort would order their lock acquisitions m2-before-m1.
+          _  <- PreTouchViaM2.traverse(k => m2.get(k).commit)
           _  <- Keys.parTraverse(k => insertIntoBoth(m1, m2, k).commit)
           r1 <- m1.get.commit
           r2 <- m2.get.commit

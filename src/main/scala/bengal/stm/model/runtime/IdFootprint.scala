@@ -70,11 +70,11 @@ private[stm] case class IdFootprint(
   private[stm] lazy val combinedIds: Set[TxnVarRuntimeId] =
     readIds ++ updatedIds
 
-  private[stm] lazy val combinedRawIds: Set[Int] = combinedIds.map(_.value)
+  private[stm] lazy val combinedRawIds: Set[Long] = combinedIds.map(_.value)
 
-  private[stm] lazy val updateRawIds: Set[Int] = updatedIds.map(_.value)
+  private[stm] lazy val updateRawIds: Set[Long] = updatedIds.map(_.value)
 
-  private[stm] lazy val readRawIds: Set[Int] = readIds.map(_.value)
+  private[stm] lazy val readRawIds: Set[Long] = readIds.map(_.value)
 
   private[stm] def addReadId(id: TxnVarRuntimeId): IdFootprint =
     this.copy(readIds = readIds + id)

@@ -52,14 +52,16 @@
  * A map entry has TWO distinct runtime ids, and the code uses different ones
  * for different purposes:
  *
- *   - The EXISTENTIAL id, TxnVarMap.getRuntimeId(key) — hashed from
- *     (mapId, key), carrying the map's structure id as its PARENT. This is
- *     the id the FOOTPRINT always uses (both TxnLogEntry.idFootprint and the
- *     static-analysis walker), for present and absent keys alike.
+ *   - The EXISTENTIAL id, TxnVarMap.getRuntimeId(key) — allocated from the
+ *     global counter on the key's first reference, carrying the map's
+ *     structure id as its PARENT. This is the id the FOOTPRINT always uses
+ *     (both TxnLogEntry.idFootprint and the static-analysis walker), for
+ *     present and absent keys alike.
  *
- *   - The ENTRY VAR's OWN id, txnVar.runtimeId — hashed from a fresh
- *     sequential TxnVarId minted at insert time (TxnVarMap.addOrUpdate ->
- *     TxnVar.of). It has NO parent and is unrelated to the existential id.
+ *   - The ENTRY VAR's OWN id, txnVar.runtimeId — the fresh sequential
+ *     TxnVarId minted at insert time (TxnVarMap.addOrUpdate -> TxnVar.of),
+ *     used directly. It has NO parent and is distinct from the existential
+ *     id (both draw from the one allocator).
  *
  * The LOG is keyed by whichever one the entry resolved to when it was built:
  * the entry var's own id if the key EXISTED, the existential id if it did
@@ -278,8 +280,9 @@
  *     model that "helpfully" re-validated reads before parking would mask
  *     the very gap that forced hasChangedSinceRead into existence.
  *   - TxnVarMap.internalStructureLock (a leaf lock strictly below every
- *     commitLock modelled here) and runtime-id hash collisions (assumed
- *     distinct — see specs/README.md).
+ *     commitLock modelled here). (Runtime-id distinctness is not an
+ *     assumption to scope out: ids are allocator-issued and unique by
+ *     construction — see Footprint.tla and specs/README.md.)
  *)
 
 EXTENDS Footprint, Integers, FiniteSets, Sequences
@@ -296,11 +299,12 @@ CONSTANTS
 ---------------------------------------------------------------------------
 (* Entities and their runtime ids.
 
-   Runtime ids are UUID-hash-derived Ints (TxnStateEntity.runtimeId,
-   TxnVarMap.getRuntimeExistentialId), so their order is pseudorandom
-   relative to creation order and EVERY ordering class is realised by some
-   program. The values below pin one such class adversarially — which is
-   legitimate precisely because nothing in the code constrains the order.
+   Runtime ids are Longs issued by one global allocator in creation /
+   first-touch order (TxnStateEntity.runtimeId, TxnVarMap.getRuntimeId), so
+   any relative order of two ids is realised by some program — arrange the
+   creations and first touches accordingly. The values below pin one such
+   class adversarially, which is legitimate precisely because the code
+   guarantees distinctness but no particular relative order.
 
    Ids are [val |-> Nat, par |-> Nat or NoParent], per common/Footprint.tla.
    Map-entry ids are the EXISTENTIAL ids (parent = the map's structure id):
@@ -314,7 +318,8 @@ M2  == [val |-> 40, par |-> NoParent]   \* map 2, structure id
 
 (* Existential entry ids. The four values are chosen so that the two H2
    transactions sort their entries into OPPOSITE map-lock orders — the
-   adversarial hash ordering. Nothing else depends on them. *)
+   adversarial ordering (reachable in code by arranging first touches).
+   Nothing else depends on them. *)
 M1a == [val |-> 11, par |-> 30]   \* key "a" of map 1
 M2a == [val |-> 12, par |-> 40]   \* key "a" of map 2
 M2b == [val |-> 13, par |-> 40]   \* key "b" of map 2
@@ -327,11 +332,12 @@ MapStructs == {M1, M2}
 MapEntries == {M1a, M1b, M1c, M1d, M2a, M2b}
 Entities   == PlainVars \cup MapStructs \cup MapEntries
 
-(* The entry TxnVar's OWN runtimeId value — hashed from a fresh sequential
-   TxnVarId, hence unrelated to the existential id above. This is the log key
-   for an entry whose key ALREADY EXISTS. Offsetting by 100 keeps it distinct
-   from every existential id; any values would do, since the code constrains
-   neither space nor their relation. *)
+(* The entry TxnVar's OWN runtimeId value — its fresh sequential TxnVarId,
+   distinct from the existential id above (one allocator issues both). This
+   is the log key for an entry whose key ALREADY EXISTS. Offsetting by 100
+   keeps the model values distinct, matching the code's by-construction
+   distinctness; any distinct values would do, since the code guarantees no
+   particular relative order between the two. *)
 EntryVarVal(e) == e.val + 100
 
 (* The map structure an entry belongs to. *)

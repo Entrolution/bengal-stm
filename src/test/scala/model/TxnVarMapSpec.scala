@@ -19,6 +19,7 @@ package model
 
 import cats.effect.implicits._
 import cats.effect.testing.scalatest.AsyncIOSpec
+import cats.syntax.all._
 import org.scalatest.EitherValues
 import org.scalatest.freespec.AsyncFreeSpec
 import org.scalatest.matchers.should.Matchers
@@ -234,6 +235,55 @@ class TxnVarMapSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers with Ei
         } yield result
       }
         .asserting(_ shouldBe empty)
+    }
+  }
+
+  "key identity is the key's own equality" - {
+    // scala.math.BigDecimal("1.0") == BigDecimal("1.00") with equal hashCodes is a SCALA
+    // property (scale-insensitive equality); java.math.BigDecimal differs. The two literals
+    // therefore name ONE map slot while rendering differently — conflict detection must
+    // treat them as the same slot, or concurrent read-modify-writes through the two
+    // spellings race each other and lose updates.
+    "concurrent modifies through equal-but-differently-rendered keys lose no updates" in {
+      val k1 = BigDecimal("1.0")
+      val k2 = BigDecimal("1.00")
+
+      withRuntime { implicit stm =>
+        for {
+          tVarMap <- TxnVarMap.of(Map(k1 -> 0))
+          _ <- (1 to 100).toList.parTraverse { i =>
+                 val key = if (i % 2 == 0) k1 else k2
+                 tVarMap.modify(key, (v: Int) => v + 1).commit
+               }
+          result <- tVarMap.get(k1).commit
+        } yield result
+      }
+        .asserting(_ shouldBe Some(100))
+    }
+
+    "one transaction inserting two distinct keys with identical renderings lands both" in {
+      // Distinct by reference equality, identical by toString: under a rendering-based
+      // identity the second insert silently overwrote the first's log entry.
+      final class SameString {
+        override def toString: String = "same"
+      }
+      val k1 = new SameString
+      val k2 = new SameString
+
+      withRuntime { implicit stm =>
+        for {
+          tVarMap <- TxnVarMap.of(Map.empty[SameString, Int])
+          _ <- (for {
+                 _ <- tVarMap.set(k1, 1)
+                 _ <- tVarMap.set(k2, 2)
+               } yield ()).commit
+          result <- tVarMap.get.commit
+        } yield result
+      }
+        .asserting { result =>
+          result.size shouldBe 2
+          result.values.toSet shouldBe Set(1, 2)
+        }
     }
   }
 }

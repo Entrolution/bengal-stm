@@ -91,8 +91,9 @@ CONSTANTS
 
 ---------------------------------------------------------------------------
 (* Scenario catalogue — each cfg picks its Txns subset. Runtime ids are
-   arbitrary distinct naturals; hash-derived order in the real system makes
-   every ordering class reachable (TxnStateEntity.runtimeId).
+   arbitrary distinct naturals; allocator-issued ids in the real system follow
+   creation/first-touch order, so every ordering class is reachable by some
+   program (TxnStateEntity.runtimeId).
 
      t1, t2, t3 : the H4 scenario (t1 under-declared, t2 conflicting
                   writer, t3 reader-writer bystander) — safety configs

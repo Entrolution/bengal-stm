@@ -42,7 +42,7 @@ class IdFootprintPropertySpec extends AnyFreeSpec with ScalaCheckPropertyChecks 
   implicit override val generatorDrivenConfig: PropertyCheckConfiguration =
     PropertyCheckConfiguration(minSuccessful = 200)
 
-  private val genRawId: Gen[Int] = Gen.choose(0, 20)
+  private val genRawId: Gen[Long] = Gen.choose(0L, 20L)
 
   private val genTxnVarRuntimeId: Gen[TxnVarRuntimeId] = for {
     value     <- genRawId

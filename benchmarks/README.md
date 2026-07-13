@@ -130,10 +130,12 @@ they are printed only so nobody re-derives them and believes them.
 ## The optimisation that came out of this
 
 `TxnLogValid.idFootprint` used `parTraverse`, spawning a fiber per log entry. Every entry's
-footprint is a **pure computation** (a cached `runtimeId` for a var, a UUID hash for a map entry),
-so there was nothing to overlap and the fibers were pure overhead — and a whole-map read expands
-into one log entry *per key*, so the fiber count tracked the map size. Switching to `traverse` is
-part of why `wholeMapReadPlusInsert` is now faster than the baseline rather than 21% slower.
+footprint is trivial — a cached `runtimeId` for a var; at the time these figures were taken, a
+UUID hash for a map entry (since replaced by a registry lookup that allocates only on a key's
+first touch, which lowers the per-entry cost further) — so there was nothing to overlap and the
+fibers were pure overhead. A whole-map read expands into one log entry *per key*, so the fiber
+count tracked the map size. Switching to `traverse` is part of why `wholeMapReadPlusInsert` is
+now faster than the baseline rather than 21% slower.
 
 The laptop measured that same change as making things *worse across the board*. It was throttling.
 

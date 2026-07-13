@@ -327,7 +327,7 @@ private[stm] trait TxnLogContext[F[_]] {
 
     // The map-lock fallback: a key that does not yet exist has no TxnVar, so this
     // entry locks the MAP's structural commitLock while being logged under the
-    // existential id hashed from (mapId, key). Owner and log key are different
+    // existential id allocated for (map, key). Owner and log key are different
     // entities — the id-space split withLock's ordering turns on.
     override private[stm] lazy val lock: F[Option[(TxnVarRuntimeId, Semaphore[F])]] =
       for {
@@ -441,7 +441,7 @@ private[stm] trait TxnLogContext[F[_]] {
     // TWO UNRELATED ID SPACES, and every keyed operation has to choose between them
     // identically. A key that EXISTS has a TxnVar, and its log entry is keyed by that
     // VAR's own runtimeId. A key that does NOT exist yet has no TxnVar, and its entry is
-    // keyed by the EXISTENTIAL id hashed from (mapId, key) — the same id the static
+    // keyed by the EXISTENTIAL id allocated for (map, key) — the same id the static
     // analysis walker puts in the footprint, which is why the scheduler can protect a read
     // of a key that is not there. (Which LOCK it takes is a third question again: a new-key
     // entry locks the MAP's structural commitLock. That was H2.)
@@ -965,18 +965,21 @@ private[stm] trait TxnLogContext[F[_]] {
     // bug was latent while this was only forced on the dirty path (where the log
     // is non-empty by construction); the H6 coverage check forces it on every
     // commit, which is what brought it out.
-    // `traverse`, NOT `parTraverse`. Every entry's idFootprint is a pure
-    // computation — a cached runtimeId for a var, a UUID hash for a map entry —
-    // so there is nothing to overlap and a fiber per entry is pure overhead.
-    // That did not matter while this was forced only on the dirty path; the H6
-    // coverage check forces it on EVERY commit, and a whole-map read expands
-    // into a log entry per key, so the fiber count tracked the map size.
+    // `traverse`, NOT `parTraverse`. Every entry's idFootprint is trivial — a
+    // cached runtimeId for a var, a registry lookup (one-time allocation on
+    // first touch) for a map entry — so there is nothing to overlap and a fiber
+    // per entry is pure overhead. That did not matter while this was forced only
+    // on the dirty path; the H6 coverage check forces it on EVERY commit, and a
+    // whole-map read expands into a log entry per key, so the fiber count
+    // tracked the map size.
     //
     // The switch was measured on dedicated hardware and it is worth real
     // percentage points on the whole-map-read workload; benchmarks/README.md
     // carries the figures, and its header explains why the hardware matters —
     // the first attempt at this measurement ran on a thermally throttling laptop
-    // and reported the exact opposite.
+    // and reported the exact opposite. (Those figures predate the removal of the
+    // per-entry UUID/MD5 hash from this fold, which only lowers the per-entry
+    // cost further and strengthens the same conclusion.)
     override private[stm] lazy val idFootprint: F[IdFootprint] =
       log.values.toList
         .traverse { entry =>
@@ -992,21 +995,22 @@ private[stm] trait TxnLogContext[F[_]] {
     //
     // This used to sort the LOG ENTRIES by their log key, which is NOT the same
     // thing and did not order the locks at all: a map entry for a key that does
-    // not yet exist is logged under the existential id hashed from (mapId, key)
+    // not yet exist is logged under the existential id allocated for (map, key)
     // but locks the MAP's structural commitLock. Sorting by the log key
-    // therefore ordered acquisitions by a hash of the KEY while the locks
-    // acquired belonged to the MAPS — two unrelated id spaces. Two transactions
-    // inserting fresh keys into two maps have COMPATIBLE footprints, so the
-    // scheduler runs them concurrently by design; both then hold
-    // {M1.lock, M2.lock}, and hash-derived key order could invert their
-    // acquisition order into a deadlock. specs/commit/CommitH2.cfg pins it.
+    // therefore ordered acquisitions by the KEYS' ids (hashes, at the time)
+    // while the locks acquired belonged to the MAPS — two unrelated id spaces.
+    // Two transactions inserting fresh keys into two maps have COMPATIBLE
+    // footprints, so the scheduler runs them concurrently by design; both then
+    // hold {M1.lock, M2.lock}, and key-id order could invert their acquisition
+    // order into a deadlock. specs/commit/CommitH2.cfg pins it.
     //
     // .distinct dedupes on the (owner id, Semaphore) pair, so the two entries
     // of a double insert into ONE map — which alias to that map's single lock —
     // collapse to one acquisition rather than self-deadlocking a 1-permit
-    // Semaphore. It compares the Semaphore by reference, so distinct locks that
-    // suffered a runtime-id hash collision are both still acquired (id
-    // collisions are assumed away — see specs/README.md).
+    // Semaphore. Owner ids are unique by construction (every id comes from the
+    // one global allocator), so equal ids imply the same entity and the sort
+    // below can never tie between distinct locks; comparing the Semaphore by
+    // reference in the dedup is belt and braces, not a collision hedge.
     override private[stm] def withLock[A](fa: F[A]): F[A] =
       for {
         locks <- log.values.toList.traverse(_.lock)

@@ -1,5 +1,47 @@
 # Quality Cycles
 
+## Cycle 2 — 2026-07-13 (bug hunt)
+
+**Scope**: correctness, concurrency, and API-contract bugs. Full main source (runtime, compiler,
+model), the serializability oracle and soak harness, both TLA+ specs (spec↔code parity), and the
+throughput benchmark. 15 specialist agents over 2 batches, ~7,150 lines. Cycle artifacts:
+`.claude/reviews/bug-hunt-cycle-2/` (findings JSONL, manifest, structural risks, execution checklist).
+
+- **Modules reviewed**: 6 covering ~7,150 lines
+- **Specialist agents**: 15 (across 2 batches; 0 rate-limited)
+- **Findings**: 38 total (0 critical, 7 high, 15 medium, 16 low)
+- **By category**: 0 security / 19 correctness / 15 quality / 4 architecture
+- **OWASP distribution**: n/a (no security-category findings)
+- **Crown-jewel overrides**: 0
+- **Cross-validated**: 6 findings independently confirmed by 2–3 agents (the TxnVarMap index race by three)
+- **Contradictions**: 1 (null map values) — resolved as a false positive caused by a stale comment, which became a finding itself
+- **Structural risks identified**: 8
+- **False positives retracted**: 1
+- **Rate-limited agents**: 0
+
+The five main-source High findings: whole-map `set` corrupts the transaction log (proven by
+executed repro — unchanged keys vanish from read-your-writes, and a following whole-map `set`
+durably leaks deleted keys); cancelling `commit` neither cancels nor rolls back (writes publish
+after timeout, parked `waitFor` transactions resurrect later); TxnVarMap's mutable index is read
+unlocked against in-place structural writes (three vectors, one of which escapes Contract C
+entirely); map-key conflict identity derives from `toString` while storage identity is `equals`
+(lost updates for `BigDecimal`-like keys); and all runtime ids collapse to 32 bits, putting
+birthday collisions in range of the advertised database-index scale. The two benchmark-scoped
+Highs: the H3-cliff scenario confounds itself with unbounded allocation, and no scenario in the
+suite ever executes H2's multi-lock ordering.
+
+Two meta-results. The conflict-detection *algebra* is sound — every agent that checked
+`IdFootprint`, the lock ordering, the park protocol, or the commit gates verified them clean, and
+the TLA+ footprint model mirrors the code exactly — but its identity *inputs* (toString, 32-bit
+ids, the unlocked index) are where the correctness holes live. And stale prose is an active bug
+vector: one stale comment produced two false bug reports inside this very hunt, and both specs
+carry narration describing deleted code (Scheduler.tla's commit action still models the removed
+dirty check).
+
+- **Trend**: first full-scope bug hunt (Cycle 1 was prose-scoped: 2 live defects found).
+  Critical: flat (0 → 0). The live-defect count (7 High) reflects scope expansion, not
+  regression — none of the 7 were reachable by Cycle 1's methods.
+
 ## Cycle 1 — 2026-07-12
 
 **Scope**: comments, documentation, duplication. Architecture and general hygiene were out of
