@@ -18,7 +18,6 @@ package ai.entrolution
 package bengal.stm.model
 
 import scala.collection.concurrent.TrieMap
-import scala.collection.mutable.{ Map => MutableMap }
 
 import cats.effect.Ref
 import cats.effect.kernel.Async
@@ -156,7 +155,7 @@ case class TxnVarMap[F[_]: STM: Async, K, V](
                case None =>
                  for {
                    newTxnVar <- TxnVar.of(newValue)
-                   _         <- value.update(_ += (key -> newTxnVar))
+                   _         <- value.update(_ + (key -> newTxnVar))
                  } yield ()
              }
       } yield ()
@@ -168,7 +167,7 @@ case class TxnVarMap[F[_]: STM: Async, K, V](
         txnVarMap <- value.get
         _ <- txnVarMap.get(key) match {
                case Some(_) =>
-                 value.update(_ -= key)
+                 value.update(_ - key)
                case None =>
                  Async[F].unit
              }
@@ -185,7 +184,7 @@ object TxnVarMap {
       values <- valueMap.toList.traverse { kv =>
                   TxnVar.of(kv._2).map(txv => kv._1 -> txv)
                 }
-      valuesRef             <- Async[F].ref(MutableMap(values: _*))
+      valuesRef             <- Async[F].ref(values.toMap: VarIndex[F, K, V])
       lock                  <- Semaphore[F](1)
       internalStructureLock <- Semaphore[F](1)
     } yield TxnVarMap(id, valuesRef, lock, internalStructureLock)
