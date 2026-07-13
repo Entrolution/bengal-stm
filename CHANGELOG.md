@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.14.0] - 2026-07-12
+## [0.14.0] - 2026-07-13
 
 ### Fixed
 - Commit-lock ordering across transactional maps (H2): `withLock` acquired the write set's `commitLock`s in a sorted order to prevent circular waits, but it sorted the LOG ENTRIES rather than the LOCKS, and those are not the same thing. A map entry has two unrelated runtime ids — the existential id hashed from `(mapId, key)`, which the footprint always uses and which the log keys an absent key by, and the entry `TxnVar`'s own id, which the log keys it by once the key exists — while a new-key entry's lock resolves to the MAP's structural `commitLock`. So a new-key insert took the map's lock at a sort position derived from a hash of the key: the sort ordered one id space while the locks acquired lived in another. Two transactions inserting fresh keys into two maps have compatible footprints, so the scheduler runs them concurrently by design; both then hold `{M1.lock, M2.lock}` and hash-derived order could invert their acquisition order, deadlocking both fibers forever on `Semaphore.permit` with their callers hung on `completionSignal.get`. **This needed no fallback, no under-declaration and no scheduler bug — it was reachable on entirely accurate footprints.** `TxnLogEntry.lock` now returns each lock paired with the runtime id of the entity that OWNS it, and `withLock` sorts on that owner; owner → lock is injective, so a single ascending order is a global total order over locks and no circular wait can form. Found by TLC (`specs/commit/CommitH2.cfg`) and regression-pinned by `CommitLockOrderSpec`, which deadlocked and timed out against the unfixed code.
