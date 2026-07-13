@@ -307,26 +307,37 @@ private[stm] trait TxnCompilerContext[F[_]] {
                   s.deleteVarMapValue(adt.key, adt.txnVarMap)
                     .map((_, ()))
                 }
+              // Recovery is EXCEPTION-based: errors short-circuit the fold as a
+              // raised TxnErrorException (TxnLogContext.raiseError and
+              // TxnLogValid.delay's handler), so the guarded block's failure
+              // arrives here as a raised F, never as a threaded TxnLogError
+              // state. Recovery runs against the PRE-BLOCK state `s` — every
+              // write the failed block staged is rolled back by construction.
+              //
+              // The last arm catches raw throwables too (a `map` function
+              // throwing mid-glue, a by-name Txn constructor throwing): the
+              // IMMEDIATE handler recovers them, where the state-threaded
+              // design routed them past its own recovery dispatch and only a
+              // second, enclosing handler could catch them. A retry is the one
+              // signal deliberately NOT absorbable — a blocked transaction
+              // stays blocked (re-raised, as before).
+              //
+              // An error raised by the RECOVERY branch itself is not re-caught
+              // here — it propagates to the next enclosing handler, or to the
+              // caller. That matches the state-threaded behaviour.
               case adt: TxnHandleError[_] =>
                 StateT[F, TxnLog, V] { s =>
                   (for {
                     materializedF <- adt.fa
                     originalResult <-
                       materializedF.foldMap(txnLogCompiler).run(s)
-                    finalResult <- originalResult._1 match {
-                                     case TxnLogError(ex) =>
-                                       adt
-                                         .f(ex)
-                                         .flatMap {
-                                           _.foldMap(txnLogCompiler)
-                                             .run(s)
-                                         }
-                                     case _ =>
-                                       Async[F].pure(originalResult)
-                                   }
-                  } yield (finalResult._1, finalResult._2)).handleErrorWith {
-                    case ex: TxnRetryException => Async[F].raiseError(ex)
-                    case ex => s.raiseError(ex).map((_, ().asInstanceOf[V]))
+                  } yield originalResult).handleErrorWith {
+                    case ex: TxnRetryException =>
+                      Async[F].raiseError(ex)
+                    case TxnErrorException(originalEx) =>
+                      adt.f(originalEx).flatMap(_.foldMap(txnLogCompiler).run(s))
+                    case ex =>
+                      adt.f(ex).flatMap(_.foldMap(txnLogCompiler).run(s))
                   }
                 }
               case _ =>

@@ -18,6 +18,7 @@ package ai.entrolution
 package bengal.stm.runtime
 
 import scala.annotation.nowarn
+import scala.util.control.NoStackTrace
 
 import cats.effect.implicits._
 import cats.effect.kernel.{ Async, Resource }
@@ -351,18 +352,23 @@ private[stm] trait TxnLogContext[F[_]] {
 
     private[stm] def getVar[V](txnVar: TxnVar[F, V]): F[(TxnLog, V)]
 
-    // @nowarn on base TxnLog methods: These are no-op defaults that intentionally ignore
-    // their parameters (returning Unit cast to V, empty maps, or self unchanged). They exist
-    // so that terminal log states (TxnLogRetry, TxnLogError) inherit safe defaults without
-    // reimplementing every method. TxnLogValid overrides all of these with real logic.
-    // The compiler warns about unused parameters, which is expected and correct here.
+    // Base TxnLog methods: DEFENSIVE TOTALITY ONLY. Terminal log states
+    // (TxnLogRetry, TxnLogError) inherit these defaults, but an intact
+    // interpreter can no longer reach them mid-fold: a retry THROWS
+    // TxnRetryException (scheduleRetry) and an error THROWS TxnErrorException
+    // (raiseError, TxnLogValid.delay's handler), so the fold stops at the
+    // first terminal event and no continuation ever runs against a terminal
+    // state. TxnLogValid overrides all of these with real logic.
+    //
+    // @nowarn where a default still ignores its parameter; `delay` keeps the
+    // Unit cast because it must not run the effect and has no value to give —
+    // acceptable only BECAUSE the arm is unreachable.
     @nowarn
     private[stm] def delay[V](value: F[V]): F[(TxnLog, V)] =
       Async[F].delay(self, ().asInstanceOf[V])
 
-    @nowarn
     private[stm] def pure[V](value: V): F[(TxnLog, V)] =
-      Async[F].pure(self, ().asInstanceOf[V])
+      Async[F].pure((self, value))
 
     @nowarn
     private[stm] def setVar[V](
@@ -414,9 +420,16 @@ private[stm] trait TxnLogContext[F[_]] {
     ): F[TxnLog] =
       Async[F].pure(self)
 
-    @nowarn
+    // The one base default whose no-op form would be actively unsafe if the
+    // mid-fold invariant (state is always TxnLogValid) were ever broken:
+    // swallowing an error silently. Raise instead — unreachable today, loud if
+    // that ever changes.
     private[stm] def raiseError(ex: Throwable): F[TxnLog] =
-      Async[F].pure(self)
+      ex match {
+        case e: TxnRetryException => Async[F].raiseError(e)
+        case e: TxnErrorException => Async[F].raiseError(e)
+        case e => Async[F].raiseError(TxnErrorException(e))
+      }
 
     private[stm] def scheduleRetry: F[TxnLog]
 
@@ -466,17 +479,22 @@ private[stm] trait TxnLogContext[F[_]] {
         entry <- getLogEntry[Option[V]](rid)
       } yield (rid, oTxnVar, entry)
 
-    // @nowarn: the error branch has no V to hand back — the log is now a
-    // TxnLogError and the fold is running only to reach a handleError — so it
-    // returns ().asInstanceOf[V], which Scala 2.13 flags as a dubious Unit cast.
-    @nowarn
+    // A failed effect SHORT-CIRCUITS the fold: there is no V to hand a
+    // continuation, so none may run. The carrier makes the failure catchable
+    // by TxnHandleError (which recovers with the ORIGINAL exception) and
+    // unwrappable by getTxnLogResult; threading a TxnLogError state instead —
+    // the old design — forced a bogus unit into the value channel, which a
+    // typed continuation then cast (ClassCastException masking the user's
+    // real error).
     override private[stm] def delay[V](
       value: F[V]
     ): F[(TxnLog, V)] =
       value
         .map((this.asInstanceOf[TxnLog], _))
-        .handleErrorWith { ex =>
-          Async[F].delay((TxnLogError(ex), ().asInstanceOf[V]))
+        .handleErrorWith {
+          case e: TxnRetryException => Async[F].raiseError(e)
+          case e: TxnErrorException => Async[F].raiseError(e)
+          case ex => Async[F].raiseError(TxnErrorException(ex))
         }
 
     override private[stm] def pure[V](value: V): F[(TxnLog, V)] =
@@ -863,13 +881,16 @@ private[stm] trait TxnLogContext[F[_]] {
                                 ): TxnLog
                               )
 
-                            // Remove of a key that is not there. Fails the transaction.
+                            // Remove of a key that is not there. Fails the transaction —
+                            // raised (not state-threaded) so the trailing
+                            // handleErrorWith(raiseError) wraps it and an enclosing
+                            // TxnHandleError can recover it like any other error.
                             case None =>
-                              Async[F].delay(TxnLogError {
+                              Async[F].raiseError[TxnLog](
                                 new RuntimeException(
                                   s"Tried to remove non-existent key $materializedKey in transactional map"
                                 )
-                              }: TxnLog)
+                              )
                           }
                       }
                   }
@@ -908,12 +929,10 @@ private[stm] trait TxnLogContext[F[_]] {
                             TxnLogValid(log + (rid -> entry.set(Some(evaluation)))): TxnLog
                           }
                         case None =>
-                          Async[F].delay(
-                            TxnLogError(
-                              new RuntimeException(
-                                s"Key $materializedKey not found for modification"
-                              )
-                            ): TxnLog
+                          Async[F].raiseError[TxnLog](
+                            new RuntimeException(
+                              s"Key $materializedKey not found for modification"
+                            )
                           )
                       }
 
@@ -935,12 +954,10 @@ private[stm] trait TxnLogContext[F[_]] {
                           ): TxnLog
 
                         case None =>
-                          Async[F].delay(
-                            TxnLogError(
-                              new RuntimeException(
-                                s"Key $materializedKey not found for modification"
-                              )
-                            ): TxnLog
+                          Async[F].raiseError[TxnLog](
+                            new RuntimeException(
+                              s"Key $materializedKey not found for modification"
+                            )
                           )
                       }
                   }
@@ -955,16 +972,25 @@ private[stm] trait TxnLogContext[F[_]] {
     ): F[TxnLog] =
       writeVarMapValue[K, V](key, None, txnVarMap)
 
+    // Errors SHORT-CIRCUIT the fold, exactly as retries do below: past the
+    // first error there is no value to hand any continuation, so none may
+    // run. TxnHandleError catches the carrier and runs its recovery branch
+    // against the PRE-BLOCK state (rollback of everything the failed block
+    // staged), and getTxnLogResult unwraps it at the boundary, so the user
+    // always sees the ORIGINAL exception. Already-wrapped carriers pass
+    // through untouched — a re-wrap would bury the original one level deeper
+    // at every enclosing handler.
     override private[stm] def raiseError(ex: Throwable): F[TxnLog] =
-      Async[F].delay(TxnLogError(ex))
+      ex match {
+        case e: TxnRetryException => Async[F].raiseError(e)
+        case e: TxnErrorException => Async[F].raiseError(e)
+        case e => Async[F].raiseError(TxnErrorException(e))
+      }
 
     // We throw here to short-circuit the Free compiler recursion.
     // There is no point in processing anything else beyond the retry,
     // which could lead to impossible casts being attempted, which would
     // just throw anyway.
-    // Note that we do not throw on `raiseError` as the Txn may contain
-    // a handleError entry; i.e. we can not simply short-circuit the
-    // recursion.
     override private[stm] def scheduleRetry: F[TxnLog] =
       throw TxnRetryException(this)
 
@@ -1119,5 +1145,14 @@ private[stm] trait TxnLogContext[F[_]] {
   }
 
   private[stm] case class TxnRetryException(validLog: TxnLogValid) extends RuntimeException
+
+  // The error twin of TxnRetryException: raised to short-circuit the free
+  // compiler recursion at the first transaction error, carrying the USER'S
+  // exception. TxnHandleError catches it and runs recovery against the
+  // pre-block state; getTxnLogResult unwraps it, so the original exception —
+  // never this carrier — is what reaches a caller. NoStackTrace because the
+  // carrier's own trace is noise: the wrapped exception keeps its trace, and
+  // the carrier is allocated on every abort/failed-effect, handled or not.
+  private[stm] case class TxnErrorException(ex: Throwable) extends RuntimeException with NoStackTrace
 
 }

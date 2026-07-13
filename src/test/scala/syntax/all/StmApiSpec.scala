@@ -101,6 +101,146 @@ class StmApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers with StmSu
     }
   }
 
+  "error identity" - {
+    // These assert on the EXACT exception instance. Weaker assertions
+    // (`a[RuntimeException]`) would also pass for the internal error carrier or
+    // for a masking ClassCastException, which is precisely the failure mode
+    // they pin against.
+
+    "abort followed by a typed bind surfaces the abort's own exception" in {
+      val boom = new RuntimeException("abort-then-bind")
+
+      withRuntime { implicit stm =>
+        (for {
+          _ <- STM[IO].abort(boom)
+          v <- STM[IO].pure("x")
+        } yield v).commit.attempt
+      }
+        .asserting(_.left.toOption.get shouldBe theSameInstanceAs(boom))
+    }
+
+    "a failing fromF followed by a typed map surfaces the effect's own exception" in {
+      val boom = new RuntimeException("fromF-then-map")
+
+      withRuntime { implicit stm =>
+        STM[IO].fromF(IO.raiseError[String](boom)).map(_.length).commit.attempt
+      }
+        .asserting(_.left.toOption.get shouldBe theSameInstanceAs(boom))
+    }
+
+    "handleErrorWith recovers a failing fromF even through an intervening map" in {
+      val boom = new RuntimeException("fromF-map-handle")
+
+      withRuntime { implicit stm =>
+        STM[IO]
+          .fromF(IO.raiseError[String](boom))
+          .map(_.length)
+          .handleErrorWith(ex => STM[IO].pure(ex.getMessage.length))
+          .commit
+      }
+        .asserting(_ shouldBe boom.getMessage.length)
+    }
+
+    "handleErrorWith recovers a remove of an absent key" in {
+      withRuntime { implicit stm =>
+        for {
+          tVarMap <- TxnVarMap.of(Map.empty[String, Int])
+          result <- tVarMap
+                      .remove("missing")
+                      .map(_ => "not-recovered")
+                      .handleErrorWith(ex => STM[IO].pure(ex.getMessage))
+                      .commit
+        } yield result
+      }
+        .asserting(_ should include("missing"))
+    }
+
+    "handleErrorWith recovers a modify of an absent key" in {
+      withRuntime { implicit stm =>
+        for {
+          tVarMap <- TxnVarMap.of(Map.empty[String, Int])
+          result <- tVarMap
+                      .modify("missing", (v: Int) => v + 1)
+                      .map(_ => "not-recovered")
+                      .handleErrorWith(ex => STM[IO].pure(ex.getMessage))
+                      .commit
+        } yield result
+      }
+        .asserting(_ should include("missing"))
+    }
+
+    "a modify of an absent key followed by a typed fromF surfaces the original message" in {
+      withRuntime { implicit stm =>
+        for {
+          tVarMap <- TxnVarMap.of(Map.empty[String, Int])
+          result <- (for {
+                      _ <- tVarMap.modify("missing", (v: Int) => v + 1)
+                      v <- STM[IO].fromF(IO.pure("x"))
+                      n <- STM[IO].pure(v.length)
+                    } yield n).commit.attempt
+        } yield result
+      }
+        .asserting(_.left.toOption.get.getMessage should include("missing"))
+    }
+
+    "a remove of an absent key followed by a typed fromF surfaces the original message" in {
+      withRuntime { implicit stm =>
+        for {
+          tVarMap <- TxnVarMap.of(Map.empty[String, Int])
+          result <- (for {
+                      _ <- tVarMap.remove("missing")
+                      v <- STM[IO].fromF(IO.pure("x"))
+                      n <- STM[IO].pure(v.length)
+                    } yield n).commit.attempt
+        } yield result
+      }
+        .asserting(_.left.toOption.get.getMessage should include("missing"))
+    }
+
+    "a throwing map function is caught by the immediate handleErrorWith" in {
+      val boom = new RuntimeException("map-throw")
+
+      withRuntime { implicit stm =>
+        STM[IO]
+          .pure(1)
+          .map[Int](_ => throw boom)
+          .handleErrorWith(ex => STM[IO].pure(if (ex eq boom) 99 else -1))
+          .commit
+      }
+        .asserting(_ shouldBe 99)
+    }
+
+    "an abort inside a recovery branch is caught by the next outer handler" in {
+      val first  = new RuntimeException("first")
+      val second = new RuntimeException("second")
+
+      withRuntime { implicit stm =>
+        STM[IO]
+          .abort(first)
+          .map(_ => 0)
+          .handleErrorWith(_ => STM[IO].abort(second).map(_ => 0))
+          .handleErrorWith(ex => STM[IO].pure(if (ex eq second) 42 else -1))
+          .commit
+      }
+        .asserting(_ shouldBe 42)
+    }
+
+    "a failing recovery with no outer handler surfaces the recovery's error" in {
+      val first  = new RuntimeException("first")
+      val second = new RuntimeException("second")
+
+      withRuntime { implicit stm =>
+        STM[IO]
+          .abort(first)
+          .map(_ => 0)
+          .handleErrorWith(_ => STM[IO].abort(second).map(_ => 0))
+          .commit
+          .attempt
+      }
+        .asserting(_.left.toOption.get shouldBe theSameInstanceAs(second))
+    }
+  }
+
   "fromF" - {
     "lift an effect into a transaction" in {
       withRuntime { implicit stm =>

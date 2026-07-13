@@ -439,6 +439,11 @@ private[stm] trait TxnRuntimeContext[F[_]] {
         .handleErrorWith {
           case TxnRetryException(log) =>
             Async[F].delay((TxnLogRetry(log), None))
+          // Unwrap the carrier: the ORIGINAL exception is what dispatch turns
+          // into TxnResultFailure and what the caller's F fails with. The
+          // carrier itself must never surface.
+          case TxnErrorException(ex) =>
+            Async[F].delay((TxnLogError(ex), None))
           case ex =>
             Async[F].delay((TxnLogError(ex), None))
         }
