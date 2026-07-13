@@ -274,57 +274,68 @@ line of Scala moved. The Scala has since shipped, so both now read as
 | NC-1 | **Revert the H2 fix**: sort by the **log key** again instead of the lock's owner id | `CommitH2.cfg` goes **red** (`NoWaitsForCycle`) — the model still detects H2, so the post-fix clean verdict means the fix works rather than that the model stopped looking |
 | NC-6 | Remove the commit-time coverage check | `CommitH6.cfg` goes **red** (`CommitSnapshotValid`) — the model still detects H6 |
 | NC-7 | Break `Covers` so a declared write "covers" a **sibling** entry of the same map (H6's exact mechanism) | `LemmaCoverageIsSound` **fails** — the lemma specifically rejects H6, rather than being satisfiable by any plausible-looking definition |
-| **NC-8** | **Delete the commit-time dirty check entirely** (`IsDirty(t) == FALSE`) | **NOTHING HAPPENS. All seven commit configs still verify CLEAN.** This control is here precisely *because* it does not fire — see below. |
+| **NC-8** | **Delete the commit-time dirty check** | It was deleted. It could never fire. See below. |
 
-**NC-8 is the one to read.** Every other control above turns a green run red, which is what makes the greens worth
-having. This one does not, and that is a fact about the suite rather than about the fix.
+**NC-8 is the one to read, and it ended in a deletion.** Every other control above turns a green
+run red, which is what makes the greens worth having. This one never could — and a control that
+cannot fire is usually a hole in the suite. Here it was a result about the protocol.
 
-Since the H6 fix, `DirtyRestart` fires **0:0** in six of the seven commit configs, and `0:1` in `CommitDirty` — across
-the whole of Spec A the commit-time dirty check causes one transition and produces no new states. Deleting it changes
-no verdict. The refinement action is now [split on disjoint guards](commit/CommitProtocol.tla) (`DirtyRestart` on
-`IsDirty`, `CoverageRestart` on `~IsDirty /\ ~CoverageOk`) purely so that this is *visible* — before the split the two
-triggers shared one action and TLC's action coverage could not tell them apart, so "`DirtyRestart` fires" was
-`CommitDirty`'s stated non-vacuity evidence while proving nothing about the dirty check.
+Since the H6 fix, `DirtyRestart` fired **0:0** in six of the seven commit configs and `0:1` in
+`CommitDirty`. Across the whole of Spec A the commit-time dirty check caused one transition and
+produced no new states, and deleting it changed no verdict. But staying green cannot distinguish
+*"redundant"* from *"never exercised"*, so instead of sampling, the strong claim was asserted:
 
-There is a reading in which the result is **correct rather than a gap**: Contract C keeps footprint-incompatible peers
-out of overlapping windows, so an accurately-declared transaction can never have its write set moved underneath it —
-and the only transaction that *can* is one whose footprint diverged, which coverage now catches and aborts **before the
-publish**, so the publish that would have made a peer dirty never happens. On that reading H6 subsumed the dirty check.
-The alternative reading is that a catalogue of two entities and five transactions is simply too small to isolate it.
+> **`CoverageSubsumesDirty`** (`CommitProtocol.tla`, asserted by all seven configs)
+> **If the declared footprint covers the actual one, the write set cannot have moved underneath us.**
 
-**The model cannot distinguish those two, and we are not going to pretend otherwise.** Resolving it needs either a
-scenario that drives the dirty path with coverage satisfied, or an argument that no such scenario exists. Until one
-lands, this is a documented gap, not a verified redundancy, and the check stays in the code.
-| NC-5 | Remove `withLock`'s `.distinct` | `CommitH2.cfg` **deadlocks** — `dbl`'s two fresh keys in one map alias to that map's single lock, and taking a 1-permit `Semaphore` twice self-deadlocks. Pins the dedup, which the H2 fix changed |
-| NC-2 | **Revert the H3 fix**: drop the `~f.under /\ ~g.under` clause from `IsCompatible` | All three H3 configs go **red** again (`CommitSnapshotValid`). This control also predicted, *before the fix existed*, that the fix would make `CommitDirty`'s refinement path unreachable — which is why that config was rebuilt around `ddw` |
-| NC-3 | Remove the relation's **third conjunct** (the pre-H5-fix relation) | `CommitAccurate.cfg` goes **red** (`CommitSnapshotValid`) — the H5 fix is load-bearing here, confirmed from the commit-protocol side |
-| NC-4 | Remove the **Contract C guard** — accurate footprints, locks and dirty check intact | `CommitAccurate.cfg` goes **red** (`CommitSnapshotValid`) — the commit protocol alone is NOT safe; the scheduler is doing real work. (Checking `ContractCHolds` as well would be circular — it restates the guard — so it is dropped for this control) |
+It holds, and the argument it encodes is:
 
-**Reproducing the historical RED verdicts:** check out a pre-fix revision
-(any tree before the H4 fix landed), copy that revision's `Scheduler.cfg`,
-list the invariant of interest, and run TLC — each halts within seconds at
-its quoted depth. On the fixed protocol the full invariant set verifies
-clean.
+1. For my write set to move, some peer must **publish** to an entity `e` that I write.
+2. Since the H6 fix, a peer publishes only if **its** coverage holds — so `e`, or `e`'s parent,
+   is in **its** declared updates.
+3. If **my** coverage holds, `e` or its parent is in **my** declared updates.
+4. Two footprints that both declare a write to the same entity are **incompatible** —
+   `LemmaCoWriteImpliesIncompatible`, checked **exhaustively over every complete footprint pair**
+   in `FootprintLemmas.tla`.
+5. Contract C therefore keeps that peer out of my execute window entirely. It cannot have
+   published during it. **My write set cannot have moved.**
 
-**Robustness config** (`scheduler/SchedulerAborts.cfg`, run manually or via
-the `workflow_dispatch`-gated CI step): enables nondeterministic failure
-injection at every point a `handleErrorWith` can observe (`execute`'s
-handler and the submit wrapper in `TxnRuntime.commit`). Measured and pinned:
-`CompletionAtMostOnce` violated (**15-state counterexample**) — a submit-wrapper abort
-landing after the readiness check completes the caller's signal with an
-error while the already-spawned execute commits and completes again: a
-spurious failure report on a transaction that published. The
-double-`registerCompletion` path (second unsubscribe cascade) is also in
-scope here. These runs assert protocol *robustness to* exceptions, not that
-any particular throw is organically reachable; mid-publish throws are inside
-the atomic-commit abstraction and out of scope (Spec A territory).
+Step 4 is the load-bearing one and it is a claim about the *relation*, so it is settled
+exhaustively rather than argued. Steps 1–3 are the H6 fix and the definition of `Covers`. Step 5
+is Contract C.
 
-Both organic Scheduler configs verify clean now, which changes what this pin
-is for. It used to corroborate a protocol that was red anyway. Today
-`CompletionAtMostOnce` here is the **only invariant violation left anywhere in
-Spec B** — the absent-key pin beside it is a deadlock, and no invariant names
-it — so this config is the sole thing standing between the abort paths and no
-coverage at all. It carries its own weight.
+**The invariant is neither vacuous nor trivial**, and both were checked. `Publish` fired 10× in
+`CommitDirty`, so states satisfying the antecedent were reached. And `DirtyRestart` fired — a
+state where `IsDirty` was **true** at `validate` genuinely existed — in which the invariant
+*required* that coverage had also failed. It had. **The dirty check never once caught anything
+the coverage check did not.**
+
+So it is gone, from the model and from the code. `NeedsRefinement` is now just `~CoverageOk`, and
+`IsDirty` survives in the spec **only as a ghost**, so that `CoverageSubsumesDirty` can keep
+asserting the property that licenses its absence. Every push re-checks it. If it ever breaks, the
+check was not redundant after all and the code needs it back.
+
+**What the deletion costs, and what pays for it.** The dirty check was the last thing standing
+between a Contract-C violation and a silently lost update. That is a real backstop to give up,
+and the proof above only licenses it *because Contract C holds* — which is the scheduler's
+obligation, discharged in a model at bounds. A model can hold while code drifts; this project has
+had to write that sentence about six separate defects.
+
+So Contract C is now pinned in **three** places, and all three are load-bearing:
+
+| | |
+|---|---|
+| `specs/scheduler/Scheduler.tla` | checks `ContractC` exhaustively |
+| `// SPEC: ContractC` | anchors it to the submit scan and the admission gate |
+| **`src/test/scala/spec/ContractCSpec.scala`** | **checks the RUNNING code upholds it** |
+
+The last of those is new, and it is what made the deletion safe rather than brave. It runs eight
+transactions whose declared footprints are pairwise incompatible and asserts that **no two are
+ever in their bodies at once**, with an anti-vacuity arm proving the same meter *does* see
+compatible transactions overlapping. Disable `isCompatibleWith` and it fails, reporting peaks of
+2–4. That is the backstop the dirty check used to be, moved from the commit path — where it cost
+every transaction a fiber fork, a `Deferred` and a cancel — into a test, where it costs nothing
+and says what it means.
 
 ## Anchor Cross-Reference
 

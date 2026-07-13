@@ -19,7 +19,6 @@ package bengal.stm.runtime
 
 import scala.annotation.nowarn
 
-import cats.effect.Deferred
 import cats.effect.implicits._
 import cats.effect.kernel.{ Async, Resource }
 import cats.effect.std.Semaphore
@@ -64,17 +63,22 @@ private[stm] trait TxnLogContext[F[_]] {
   //
   // SPEC: NoLocksWithoutWrites — every read-only entry returns lock = None and
   // isDirty = pure(false). Two consequences, and both are load-bearing:
-  //   1. Commit-time validation and commit locks cover the WRITE SET ONLY.
-  //      Serializability therefore rests ENTIRELY on the scheduler's
-  //      footprint conflict-avoidance, which is why footprint accuracy is a
-  //      safety precondition (H3) and why a gap in the compatibility relation
-  //      is a direct hole (H5). Removing the Contract C guard from Spec A
-  //      breaks CommitSnapshotValid even with accurate footprints and every
-  //      lock intact — negative control NC-4 in specs/README.md.
-  //   2. A pure reader's log acquires NO locks and can NEVER report dirty, so
-  //      the TxnLogRetry re-validation before a park is vacuous. That is why
-  //      the H1 fix needed hasChangedSinceRead (below) — a real comparison
-  //      that includes read-only entries — rather than leaning on isDirty.
+  //   1. Commit locks cover the WRITE SET ONLY, and reads are never validated at
+  //      commit time at all. Serializability therefore rests ENTIRELY on the
+  //      scheduler's footprint conflict-avoidance — which is why footprint
+  //      accuracy is a safety precondition (H3) and why a gap in the
+  //      compatibility relation is a direct hole (H5). Removing the Contract C
+  //      guard from Spec A breaks CommitSnapshotValid even with accurate
+  //      footprints and every lock intact — negative control NC-4.
+  //
+  //      That was always true, and it is now the WHOLE truth: the commit-time
+  //      dirty check is gone. It could never fire (CoverageSubsumesDirty), so
+  //      Contract C is not merely the main defence, it is the only one — and
+  //      spec/ContractCSpec exists to check the running code still provides it.
+  //   2. A pure reader's log acquires NO locks and can never report dirty, so a
+  //      re-validation of it before a park would be vacuous. That is why the H1
+  //      fix needed hasChangedSinceRead (below) — a real comparison against live
+  //      state that INCLUDES read-only entries — rather than a write-set check.
   private[stm] case class TxnLogReadOnlyVarEntry[V](
     initial: V,
     txnVar: TxnVar[F, V]
@@ -415,8 +419,6 @@ private[stm] trait TxnLogContext[F[_]] {
       Async[F].pure(self)
 
     private[stm] def scheduleRetry: F[TxnLog]
-
-    private[stm] def isDirty: F[Boolean]
 
     private[stm] def commit: F[Unit]
 
@@ -947,47 +949,6 @@ private[stm] trait TxnLogContext[F[_]] {
     override private[stm] def scheduleRetry: F[TxnLog] =
       throw TxnRetryException(this)
 
-    // A hand-rolled short-circuiting existsM: the first entry to find itself
-    // dirty completes the Deferred, and the caller returns on that rather than
-    // waiting out the parTraverse. It computes exactly `exists(_.isDirty)` — the
-    // Deferred is first-wins, and the fold at the end publishes false only if no
-    // entry raised.
-    //
-    // The early return buys nothing, though, and this is worth knowing before
-    // copying the pattern. Every entry's isDirty is a single Ref read against
-    // live state, and read-only entries do not even do that (they hardcode
-    // false), so there is no slow check here to escape — while the fiber, the
-    // Deferred and the cancel/join are all real cost. That is why
-    // anyReadChangedSinceRead below, which is the same walk over the same log,
-    // is a plain parTraverse instead. The machinery is vestigial rather than
-    // load-bearing; it is left alone because it sits on the commit path under the
-    // locks, where a rewrite deserves its own measurement rather than a
-    // confident guess (see benchmarks/README.md on that point).
-    override private[stm] lazy val isDirty: F[Boolean] = {
-      def setDeferred(container: Deferred[F, Boolean]): F[Unit] = {
-        for {
-          dirtyIndicators <- log.values.toList.parTraverse { lv =>
-                               Async[F].ifM(lv.isDirty)(
-                                 container.complete(true) >> Async[F].pure(true),
-                                 Async[F].pure(false)
-                               )
-                             }
-          _ <- Async[F].ifM(Async[F].delay(dirtyIndicators.exists(b => b)))(
-                 Async[F].unit,
-                 container.complete(false).void
-               )
-        } yield ()
-      }
-
-      for {
-        gotDirt <- Deferred[F, Boolean]
-        logFib  <- setDeferred(gotDirt).start
-        result  <- gotDirt.get
-        _       <- logFib.cancel
-        _       <- logFib.join
-      } yield result
-    }
-
     // The park path's read-inclusive staleness check (H1 fix): TRUE iff any
     // entry — read-only entries included — no longer matches the live value
     // it was built from. Contrast isDirty, which validates the write set
@@ -1107,9 +1068,6 @@ private[stm] trait TxnLogContext[F[_]] {
           } yield (this, v)
       }
 
-    override private[stm] lazy val isDirty: F[Boolean] =
-      validLog.isDirty
-
     override private[stm] lazy val scheduleRetry =
       Async[F].pure(this)
 
@@ -1129,9 +1087,6 @@ private[stm] trait TxnLogContext[F[_]] {
 
     override private[stm] lazy val scheduleRetry =
       Async[F].pure(this)
-
-    override private[stm] lazy val isDirty =
-      Async[F].pure(false)
 
     override private[stm] lazy val commit: F[Unit] =
       Async[F].unit

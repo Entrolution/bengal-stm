@@ -1,4 +1,4 @@
-ThisBuild / tlBaseVersion := "0.13"
+ThisBuild / tlBaseVersion := "0.14"
 
 ThisBuild / tlVersionIntroduced := Map("3" -> "0.12.0")
 
@@ -85,5 +85,11 @@ lazy val benchmarks = (project in file("benchmarks"))
   .enablePlugins(JmhPlugin, NoPublishPlugin)
   .settings(
     commonSettings,
-    name := "bengal-stm-benchmarks"
+    name := "bengal-stm-benchmarks",
+    // JMH GENERATES Java, and its generated code trips -Werror on javac. sbt-typelevel
+    // keys fatal warnings off GITHUB_ACTIONS, so running the CI-parity gate locally
+    // (GITHUB_ACTIONS=true sbt benchmarks/Jmh/compile) fails on code nobody here wrote.
+    // CI never builds this module -- it is not aggregated -- so the trap only springs on
+    // a contributor doing the right thing.
+    Jmh / javacOptions ~= (_.filterNot(_ == "-Werror"))
   )

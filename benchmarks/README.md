@@ -1,115 +1,143 @@
 # Throughput benchmarks
 
-What did the H1–H6 correctness fixes cost?
+What did the correctness fixes cost?
 
 ```bash
-sbt 'benchmarks/Jmh/run -f1 -wi 8 -i 12 .*StmThroughputBench.*'
+sbt 'benchmarks/Jmh/run .*StmThroughputBench.*'
 ```
 
-The benchmarks module is **not aggregated** into the root project, so `sbt test` and
-CI never build it.
+The defaults in `StmThroughputBench` **are** the protocol used below (`-f5 -wi 5 -i 10`), so a
+bare run reproduces this table. The benchmarks module is **not aggregated** into the root
+project, so `sbt test` and CI never build it.
 
 ## Read this before trusting any number you produce here
 
-**Do not run these on a laptop.** The first attempt at this measurement was taken on a
-MacBook and produced confident, precise-looking numbers that were **entirely wrong** —
-it reported the uncontended commit path had regressed **-27%**, and that a candidate
-optimisation made things *worse*. Both conclusions were artifacts of thermal
-throttling.
+**Two separate mistakes have been made measuring this, and both produced numbers that looked
+fine.**
 
-The tell was a control that should have been run first: re-running **identical code**
-twenty minutes later scored **16,400 → 7,236 ops/s**. A 2.3× swing from machine state
-alone, which is larger than any effect being measured.
+**Do not run these on a laptop.** The first attempt was taken on a MacBook and was *entirely
+wrong* — it reported the uncontended commit path had regressed **−27%**, and that a candidate
+optimisation made things *worse*. Both were thermal throttling. The tell was a control that
+should have been run first: re-running **identical code** twenty minutes later scored
+**16,400 → 7,236 ops/s**. A 2.3× swing from machine state alone, larger than any effect being
+measured.
 
-So the protocol is **A → B → A**, and the first thing to look at is not the result but
-whether the two A runs agree:
+**And a stable machine is not enough — the instrument also has to resolve the effect you are
+claiming.** The second attempt ran on a dedicated box and drifted ~7% between identical runs,
+which felt trustworthy. It was then used to publish differences of **−1%, −4%, −6%**. Those were
+*below the noise floor of the instrument that produced them*. Three of the seven published
+figures were never resolvable at all, and were reported as findings anyway.
 
-| | worst drift between identical runs |
-|---|---|
-| MacBook (thermal throttling) | **130%** — unusable |
-| vast.ai, dedicated Ryzen 9 5900X, 24 cores | **6.9%** — usable |
+So the protocol is **A → B → A**, and the first thing to look at is not the result but the
+**drift between the two A runs**. Every row below carries its own drift, and an effect is only
+reported as real if it clears **twice** that.
 
-A dedicated box costs about $0.07/hr and forty minutes. There is no version of this
-measurement that is worth doing on hardware that throttles.
+**Forks, not iterations, are the lever.** A single fork measures one JVM's JIT and allocation
+luck; more iterations just measure that same luck more precisely. Going `-f1 → -f5` cut the drift
+from 6.5% to ~3%. And `uncontendedCommit` — the fastest benchmark here, so the most
+JIT-sensitive — still drifted **6.0%** at `-f5`, which cannot support a claim under 12%. It was
+re-run at **`-f20`**, where it drifts **1.6%**. That is the only reason its number below is
+believable.
+
+A dedicated box costs about $0.13 and an hour.
 
 ## Method
 
-`before` is `4b0638d` — the tree with H4/H5/H1 already fixed, but **not** H2, H3 or H6.
-`after` is the fixed library, with one caveat recorded under the table: it is not quite a
-single revision. Every fix in the workstream was `private[stm]`, so the same benchmark
-compiles unchanged against both:
+Three trees, four phases, one box: **A → B → C → A**.
 
-```bash
-mkdir -p /tmp/before   # tar -C does not create its target; without this the next line fails
-git archive 4b0638d src/main/scala | tar -x -C /tmp/before
-# swap /tmp/before/src/main over src/main, sbt clean, re-run, swap back
-```
+| | |
+|---|---|
+| **A** | the current library |
+| **B** | `4b0638d` — H4/H5/H1 fixed, but **not** H2, H3, H6, the absent-key lost wakeup, or the null fixes |
+| **C** | identical to A **except** the commit-time dirty check is still there |
 
-`@OperationsPerInvocation(32)` makes JMH divide through by the batch and report
-per-**transaction** throughput on the six batched benchmarks, so all seven are directly
-comparable. `uncontendedCommit` carries no such annotation and needs none — it commits
-exactly one transaction per invocation.
+**A vs B** is what the correctness work cost. **A vs C** is what deleting the dirty check bought.
+**A vs A** is the control: if the two A runs disagree, nothing else here means anything.
 
-**That `32` is a literal in six places, and `Batch` is a separate `final val 32`. The two
-must track each other.** Change `Batch` to 64 without changing the annotations and every
-number below is silently wrong by 2×, with nothing anywhere to say so.
+Every fix was `private[stm]`, so the same benchmark compiles unchanged against all three, and
+only `src/main` is swapped.
+
+`@OperationsPerInvocation(32)` on the six batched benchmarks makes JMH report per-**transaction**
+throughput, so all seven are comparable. (`uncontendedCommit` runs one transaction per invocation
+and needs no annotation.) That `32` is written literally and must track `Batch`; change one
+without the other and every number here is silently wrong by the ratio.
 
 ## Results
 
-Dedicated Ryzen 9 5900X (24 cores), JDK 21, `-f1 -wi 8 -i 12`. Per-transaction ops/s.
+Dedicated AMD Ryzen 9 5950X (16 cores), JDK 21.0.11. `-f5 -wi 5 -i 10`, except
+`uncontendedCommit` at `-f20`. Per-transaction ops/s, ± the 99.9% CI. `after` is the mean of the
+two A runs.
 
-| benchmark | before | after | change | what it measures |
-|---|---:|---:|---:|---|
-| `uncontendedCommit` | 14,178 | 13,207 | **−7%** | pure per-commit overhead |
-| `disjointConcurrent` | 6,951 | 6,694 | **−4%** | max concurrency, no conflicts |
-| `contendedConcurrent` | 4,482 | 4,440 | **−1%** | full conflict, scheduler hand-off |
-| `mapWriteConcurrent` | 6,814 | 6,771 | **−1%** | map writes on distinct keys |
-| `wholeMapReadPlusInsert` | 716 | 676 | **−6%** | the H5 idiom (large logs) |
-| `dataDependentKey` | 3,653 | 3,223 | **−12%** | H6 coverage check + refinement |
-| `underDeclaredConcurrent` | 6,332 | 3,756 | **−41%** | **the H3 cliff** |
+### What the correctness fixes cost
 
-**The `after` column is not one revision, and this is the weakest thing on this page.**
-Three of the seven `after` numbers were taken before the `traverse` change below landed,
-and *which* three was never written down. Only one can be recovered from what is here:
-`wholeMapReadPlusInsert` is **not** among them, since its 676 *is* the post-`traverse`
-number by construction (see the section below). That leaves three of the other six
-unidentified.
+| benchmark | before (`4b0638d`) | after | change | | drift |
+|---|---:|---:|---:|:-:|---:|
+| `underDeclaredConcurrent` | 7,244 ± 363 | 4,759 ± 233 | **−34%** | ● | 3.1% |
+| `dataDependentKey` | 4,444 ± 217 | 3,983 ± 193 | **−10%** | ● | 0.3% |
+| `wholeMapReadPlusInsert` | 905 ± 50 | 1,020 ± 49 | **+13%** | ● | 0.6% |
+| `uncontendedCommit` | 17,356 ± 587 | 18,415 ± 660 | **+6%** | ● | 1.6% |
+| `contendedConcurrent` | 5,254 ± 253 | 5,517 ± 274 | **+5%** | ● | 1.3% |
+| `disjointConcurrent` | 8,031 ± 418 | 8,209 ± 445 | +2% | ○ | 1.1% |
+| `mapWriteConcurrent` | 8,153 ± 422 | 7,948 ± 411 | −3% | ○ | 4.4% |
 
-The reason to think it does not matter is that `traverse` only removes one fiber spawn per
-log entry, and those three have small logs. That is an argument, not a measurement — and by
-this page's own opening rule, an argument is not what belongs in a results table. The A→A
-drift on this box is **6.9%**, so an effect below that would be invisible in these runs
-regardless, which makes the claim **untested rather than confirmed**. Re-run all seven on
-one tree before treating this table as a clean two-revision comparison.
+● resolved · ○ **within this row's noise — no change detected, and none is claimed**
+
+### What deleting the commit-time dirty check bought
+
+Same code either way; the *only* difference is the check. It was removed because it could never
+fire — see `CoverageSubsumesDirty` in `specs/README.md`.
+
+| benchmark | with the check | without | gain | |
+|---|---:|---:|---:|:-:|
+| `wholeMapReadPlusInsert` | 837 ± 39 | 1,020 | **+22.0%** | ● |
+| `uncontendedCommit` | 16,292 ± 498 | 18,415 | **+13.0%** | ● |
+| `underDeclaredConcurrent` | 4,424 ± 182 | 4,759 | **+7.6%** | ● |
+| `dataDependentKey` | 3,800 ± 252 | 3,983 | **+4.8%** | ● |
+| `contendedConcurrent` | 5,398 ± 291 | 5,517 | +2.2% | ○ |
+| `mapWriteConcurrent` | 7,814 ± 334 | 7,948 | +1.7% | ○ |
+| `disjointConcurrent` | 8,161 ± 458 | 8,209 | +0.6% | ○ |
 
 ## What the numbers say
 
-**Ordinary workloads pay 1–7%.** The H6 coverage check computes the log's footprint on
-every commit — it used to be forced only on the dirty path — and that is genuinely cheap
-when the log is small. The laptop's claim of −27% here was noise.
+**The one real cost is `underDeclaredConcurrent`, at −34%, and that is the H3 fix working as
+designed.** A transaction whose static analysis threw now carries a footprint flagged as
+incompatible with everything, so it runs alone. That path used to be *silently unsound* — it
+skewed 198 of 200 contended reps. Serialising it is the price of correctness, it is confined to
+that path, and it is **steady-state, not a one-off a retry recovers**: such a transaction runs
+alone every time, so nothing moves underneath it and nothing refines it. The README's "Static
+analysis and transaction footprints" explains how to avoid triggering it at all.
 
-**`underDeclaredConcurrent` pays −41%, and that is the fix working as designed.** A
-transaction whose static analysis threw now has a footprint flagged as incompatible with
-everything, so it runs alone. That path used to be *silently unsound* — it skewed 198/200
-contended reps. Serialising it is the price of correctness, it is confined to that path,
-and it is worth paying.
+**`dataDependentKey` pays −10%** for the coverage check plus the re-runs it triggers when the
+declared footprint does not describe the transaction. The soak reports around 80% of
+data-dependent operations diverging, so this path really is doing that work.
 
-**`dataDependentKey` pays −12%** for the coverage check plus the re-runs it triggers when
-the declared footprint does not describe the transaction. The soak reports that around
-80% of data-dependent operations diverge, so this path really is doing work.
+**Everything else got FASTER, including the commit path itself.** That is not a rounding error
+and it deserves stating plainly: the library now commits a simple transaction **6% faster than
+it did before any of this correctness work**, and a whole-map read plus insert **13% faster** —
+while carrying H6's coverage check on every commit and H5's whole-map/insert conflict, neither of
+which it had before.
 
-## One optimisation this measurement bought
+The reason is the second table. **The check that H6 made redundant cost more than H6 does.** The
+commit-time dirty check forked a fiber, allocated a `Deferred`, and cancelled and joined it on
+*every commit* — and a whole-map read expands into one log entry **per key**, so that fan-out
+scaled with the size of the map. Removing it is worth **+13% on the commit path and +22% on
+whole-map reads**, and it more than pays for what the coverage check costs.
 
-`TxnLogValid.idFootprint` used `parTraverse`, spawning a fiber per log entry. Every
-entry's footprint is a **pure computation** (a cached `runtimeId` for a var, a UUID hash
-for a map entry), so there is nothing to overlap and the fibers were pure overhead — and
-a whole-map read expands into one log entry *per key*, so the fiber count tracked the map
-size.
+**Three workloads show no measurable change at all.** Not "a small change" — *nothing detectable*
+at their own resolution. Do not read the +2% and −3% as findings; they are the noise floor, and
+they are printed only so nobody re-derives them and believes them.
 
-Switching to `traverse` took `wholeMapReadPlusInsert` from **566 → 676 ops/s** (+19%),
-turning that workload's cost from **−21% into −6%**. Nothing else moved outside noise.
+## The optimisation that came out of this
 
-Note that the laptop measured this same change as making things *worse across the board*.
-It was throttling. The instrument has to be verified before the result means anything —
-the same discipline the TLA+ negative controls and the soak's fix-reversion checks apply
-everywhere else in this project.
+`TxnLogValid.idFootprint` used `parTraverse`, spawning a fiber per log entry. Every entry's
+footprint is a **pure computation** (a cached `runtimeId` for a var, a UUID hash for a map entry),
+so there was nothing to overlap and the fibers were pure overhead — and a whole-map read expands
+into one log entry *per key*, so the fiber count tracked the map size. Switching to `traverse` is
+part of why `wholeMapReadPlusInsert` is now faster than the baseline rather than 21% slower.
+
+The laptop measured that same change as making things *worse across the board*. It was throttling.
+
+**The instrument has to be verified before its output means anything** — and "verified" means both
+that it is stable *and* that it can resolve the effect you intend to report. That is the same
+discipline the TLA+ negative controls and the soaks' fix-reversion checks apply everywhere else in
+this project, and it is the reason two of the three tables above have a drift column.

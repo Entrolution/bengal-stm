@@ -488,11 +488,25 @@ private[stm] trait TxnRuntimeContext[F[_]] {
                           log.withLock {
                             for {
                               actual <- log.idFootprint
-                              sound  <- Async[F].delay(coversActualFootprint(actual))
-                              // An unsound placement is treated exactly like a
-                              // dirty log: release, refine, re-run. isDirty is
-                              // skipped when we already know we must refine.
-                              refine <- if (sound) log.isDirty else Async[F].pure(true)
+                              // COVERAGE IS THE ONLY CHECK HERE. There used to be a
+                              // commit-time DIRTY check beside it — "did my write set
+                              // move underneath me?" — and it is gone, because it could
+                              // never fire. If the declared footprint covers the actual
+                              // one, the write set CANNOT have moved: a peer that
+                              // publishes to something I write must have declared that
+                              // write too (it only publishes if its own coverage holds),
+                              // and two footprints that both declare a write to the same
+                              // entity are incompatible, so Contract C kept it out of my
+                              // execute window entirely.
+                              //
+                              // That is asserted, not asserted-at: CoverageSubsumesDirty
+                              // in specs/commit/CommitProtocol.tla, checked by all seven
+                              // configs on every push, on top of LemmaCoWriteImpliesIncompatible
+                              // (exhaustive over every complete footprint pair). It rests on
+                              // Contract C, which spec/ContractCSpec checks against the
+                              // RUNNING code — the dirty check used to be the backstop for a
+                              // scheduler bug, and that test is what replaces it.
+                              refine <- Async[F].delay(!coversActualFootprint(actual))
                               result <- Async[F].ifM[Option[V]](Async[F].pure(refine))(
                                           Async[F].delay(None),
                                           log.commit.as(logValue)
@@ -524,8 +538,7 @@ private[stm] trait TxnRuntimeContext[F[_]] {
                         retry.validLog.withLock {
                           for {
                             actual <- retry.validLog.idFootprint
-                            sound  <- Async[F].delay(coversActualFootprint(actual))
-                            refine <- if (sound) log.isDirty else Async[F].pure(true)
+                            refine <- Async[F].delay(!coversActualFootprint(actual))
                             result <- Async[F].ifM[TxnResult](Async[F].pure(refine))(
                                         Async[F].delay(
                                           TxnResultLogDirty(actual).asInstanceOf[TxnResult]

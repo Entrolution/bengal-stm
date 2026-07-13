@@ -651,7 +651,39 @@ CoverageOk(t) ==
 
 (* Either failure sends the transaction down the same road: release, refine from
    the actual log, re-run. *)
-NeedsRefinement(t) == IsDirty(t) \/ ~CoverageOk(t)
+(* THE DIRTY CHECK IS GONE, and CoverageSubsumesDirty below is why.
+   It used to be NeedsRefinement(t) == IsDirty(t) \/ ~CoverageOk(t). *)
+NeedsRefinement(t) == ~CoverageOk(t)
+
+(* WHY THERE IS NO DIRTY CHECK, AND WHAT KEEPS ITS ABSENCE HONEST.
+   IsDirty is now a GHOST: nothing in the protocol reads it. It survives solely so
+   that this invariant can assert the property that licenses its removal.
+
+     IF THE DECLARED FOOTPRINT COVERS THE ACTUAL ONE, THE WRITE SET CANNOT HAVE
+     MOVED UNDERNEATH US.
+
+   For my write set to move, a peer must PUBLISH to an entity I write. Since the H6
+   fix a peer only publishes if ITS coverage holds, so that entity (or its parent)
+   is in its declared updates; if MY coverage holds it is in mine too; and two
+   footprints that both declare a write to the same entity are INCOMPATIBLE
+   (LemmaCoWriteImpliesIncompatible, checked exhaustively over every complete
+   footprint pair in FootprintLemmas.tla). Contract C then keeps that peer out of my
+   execute window entirely, so it cannot have published during it.
+
+   A flagged transaction satisfies CoverageOk vacuously, and it runs alone, so
+   nothing moves underneath it either.
+
+   THIS INVARIANT IS THE SAFETY ARGUMENT FOR THE REMOVAL, and it is checked on every
+   push by all seven configs. If it ever breaks, the dirty check was not redundant
+   after all and the code needs it back. It rests on CONTRACT C, which is the
+   scheduler's obligation -- discharged in Scheduler.tla, anchored in the Scala at
+   the submit scan and the admission gate, and checked against the RUNNING code by
+   spec/ContractCSpec, which fails if two footprint-incompatible transactions are
+   ever in their execute windows together. Three legs, and all three are load-bearing
+   now that there is no dirty check behind them. *)
+CoverageSubsumesDirty ==
+    \A t \in Txns :
+        (pc[t] = "validate" /\ CoverageOk(t)) => ~IsDirty(t)
 
 (* A structure read observes the whole K -> V map (TxnVarMap.get), so any
    write to any child bumps the structure's version. *)
@@ -913,20 +945,11 @@ RefineAndRestart(t) ==
     /\ snapEx'     = [snapEx   EXCEPT ![t] = [e \in Entities |-> FALSE]]
     /\ UNCHANGED <<readPend, version, keyExists, readValid, pubCount, truncated>>
 
-(* The write set moved under us: the commit-time dirty check. *)
-DirtyRestart(t) ==
-    /\ pc[t] = "validate"
-    /\ inc[t] < MaxInc
-    /\ IsDirty(t)
-    /\ RefineAndRestart(t)
-
-(* The write set is intact, but the DECLARED footprint does not describe the run:
-   the H6 coverage check. Guarded on ~IsDirty so the two are mutually exclusive
-   and each transition is attributed to one cause. *)
+(* The DECLARED footprint does not describe the run: the H6 coverage check. This
+   is now the ONLY way to reach a refinement. *)
 CoverageRestart(t) ==
     /\ pc[t] = "validate"
     /\ inc[t] < MaxInc
-    /\ ~IsDirty(t)
     /\ ~CoverageOk(t)
     /\ RefineAndRestart(t)
 
@@ -978,7 +1001,7 @@ Next ==
         \/ ReadDone(t)
         \/ ResolveOne(t)  \/ ResolveDone(t)
         \/ AcquireOne(t)  \/ AcquireDone(t)
-        \/ Publish(t)     \/ DirtyRestart(t) \/ CoverageRestart(t) \/ DirtyTruncate(t)
+        \/ Publish(t)     \/ CoverageRestart(t) \/ DirtyTruncate(t)
         \/ Release(t)
     \/ \E t \in Txns, e \in Entities : ReadOne(t, e)
     \/ Terminating
