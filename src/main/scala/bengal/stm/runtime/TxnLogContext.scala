@@ -671,20 +671,34 @@ private[stm] trait TxnLogContext[F[_]] {
       }
     }
 
-    // Computes the log entry a write WOULD need, or None if it needs none. Used by
-    // setVarMap to diff a whole-map replacement into per-key entries.
+    // Computes the log entry a write needs. Used by setVarMap to diff a whole-map
+    // replacement into per-key entries.
     //
-    // ONE RULE, and the two id spaces do not change it: if the new value differs from what
-    // was there, record an update; if it does not, nothing changed and no entry is needed.
-    // A live key's "what was there" is its value; an ABSENT key's is None. So inserting
-    // into an absent key records an entry (None -> Some), and "deleting" an absent key
-    // records nothing (None -> None) because nothing changed.
+    // ONE RULE, and the two id spaces do not change it: if the new value differs from
+    // what was there, record an update; if it does not, record a READ-ONLY entry for the
+    // unchanged key. A live key's "what was there" is its value; an ABSENT key's is None.
     //
-    // That last case reads like a silent no-op next to removeTxnVarMapValue, which FAILS
-    // the transaction on an absent key. They are not in conflict: this is setVarMap's
-    // internal diff, where a key absent from both the old and new map is simply not a
-    // change, and `remove` is a user asking to delete something that is not there. The two
-    // used to be written far apart and it was easy to read them as contradicting.
+    // The read-only entry for an unchanged key is not optional bookkeeping. setVarMap
+    // logs the map's STRUCTURE entry, and extractMap reconstructs a whole-map view from
+    // the per-key entries ALONE whenever the structure entry is present — its invariant
+    // is "structure entry present => every live key has a per-key entry". getVarMap
+    // establishes that invariant when reading; this diff must establish it when writing,
+    // or unchanged keys vanish from same-transaction whole-map reads and a LATER
+    // whole-map set diffs against the truncated view and never records its deletions —
+    // leaked keys that survive the commit. An unchanged key already IN the log was never
+    // the gap (entry.set collapses an equal-valued update to a read-only entry itself);
+    // only the never-logged unchanged key was. Footprint-wise the new read entries are
+    // free: their parent is the map, and the structure WRITE setVarMap declares covers
+    // parent-child reads and writes alike.
+    //
+    // A key absent from both the old and new map records an absence read (None -> None)
+    // — defensively uniform, though setVarMap's deletion diff cannot produce it (it
+    // draws deletions from the current view, whose keys exist). That arm reads like a
+    // silent no-op next to removeTxnVarMapValue, which FAILS the transaction on an
+    // absent key. They are not in conflict: this is setVarMap's internal diff, where a
+    // key absent from both sides is not a change, and `remove` is a user asking to
+    // delete something that is not there. The two used to be written far apart and it
+    // was easy to read them as contradicting.
     private def writeVarMapValueEntry[K, V](
       key: K,
       newOpt: Option[V],
@@ -702,7 +716,13 @@ private[stm] trait TxnLogContext[F[_]] {
                        }
           } yield
             if (initial == newOpt) {
-              None
+              Some(
+                (
+                  rid,
+                  TxnLogReadOnlyVarMapEntry(key, initial, txnVarMap)
+                    .asInstanceOf[TxnLogEntry[Option[V]]]
+                )
+              )
             } else {
               Some(
                 (
@@ -785,12 +805,11 @@ private[stm] trait TxnLogContext[F[_]] {
     // where a key absent from both the old and the new map is simply not a change. The two
     // used to be written far apart, and it was easy to read them as opposite policies.
     //
-    // NOTE ON NULL. `initial` is built with Some(...) here and Option(...) in the read
-    // paths, and for a null value those disagree. It is not observable today, because a null
-    // map value is invisible on the way back out: Option(null) is None, so get(key) reports
-    // the key as ABSENT and extractMap drops it from a whole-map read. Storing null in a
-    // TxnVarMap silently loses the key. That is a real defect and it is tracked separately;
-    // preserving behaviour exactly is the whole point of a collapse, so it is not fixed here.
+    // NULL VALUES are preserved end to end: a stored null reads back as Some(null) — the
+    // key is present, its value is null — and only a genuinely absent key reads as None.
+    // Every path builds `initial` and reads with Some(...), never Option(...), which would
+    // collapse null to None and conflate "value is null" with "key is absent".
+    // NullResultSpec pins both the keyed read and the whole-map extraction.
     private def writeVarMapValue[K, V](
       key: F[K],
       newOpt: Option[F[V]],

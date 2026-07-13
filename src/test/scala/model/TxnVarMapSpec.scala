@@ -238,6 +238,71 @@ class TxnVarMapSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers with Ei
     }
   }
 
+  "whole-map set completeness" - {
+    // A whole-map set logs the map's structure entry, and whole-map reads then
+    // reconstruct the map from per-key log entries alone — so the set must log an
+    // entry for EVERY key it keeps, unchanged ones included. These pin the two
+    // user-visible failures of a diff that skips unchanged keys: keys vanishing
+    // from read-your-writes, and a later set diffing against the truncated view
+    // and never deleting what it should.
+    "a set keeping some keys unchanged returns the full map to a same-transaction read" in {
+      withRuntime { implicit stm =>
+        for {
+          tVarMap <- TxnVarMap.of(Map("a" -> 1, "b" -> 2))
+          result <- (for {
+                      _ <- tVarMap.set(Map("a" -> 1, "b" -> 99))
+                      m <- tVarMap.get
+                    } yield m).commit
+        } yield result
+      }
+        .asserting(_ shouldBe Map("a" -> 1, "b" -> 99))
+    }
+
+    "a no-op set followed by a shrinking set deletes the removed keys durably" in {
+      withRuntime { implicit stm =>
+        for {
+          tVarMap <- TxnVarMap.of(Map("a" -> 1, "b" -> 2))
+          _ <- (for {
+                 _ <- tVarMap.set(Map("a" -> 1, "b" -> 2))
+                 _ <- tVarMap.set(Map("a" -> 1))
+               } yield ()).commit
+          result <- tVarMap.get.commit
+        } yield result
+      }
+        .asserting(_ shouldBe Map("a" -> 1))
+    }
+
+    "an unchanged null value survives a whole-map set" in {
+      // The read must be the WHOLE-map view: that is the path that reconstructs from
+      // per-key log entries and would drop an unlogged unchanged key. A single-key
+      // get reads live state and cannot observe the invariant this pins.
+      withRuntime { implicit stm =>
+        for {
+          tVarMap <- TxnVarMap.of(Map[String, String]("k" -> null))
+          result <- (for {
+                      _ <- tVarMap.set(Map[String, String]("k" -> null))
+                      m <- tVarMap.get
+                    } yield m).commit
+        } yield result
+      }
+        .asserting(_ shouldBe Map[String, String]("k" -> null))
+    }
+
+    "an unchanged key can still be removed later in the same transaction" in {
+      withRuntime { implicit stm =>
+        for {
+          tVarMap <- TxnVarMap.of(Map("a" -> 1, "b" -> 2))
+          _ <- (for {
+                 _ <- tVarMap.set(Map("a" -> 1, "b" -> 2))
+                 _ <- tVarMap.remove("a")
+               } yield ()).commit
+          result <- tVarMap.get.commit
+        } yield result
+      }
+        .asserting(_ shouldBe Map("b" -> 2))
+    }
+  }
+
   "key identity is the key's own equality" - {
     // scala.math.BigDecimal("1.0") == BigDecimal("1.00") with equal hashCodes is a SCALA
     // property (scale-insensitive equality); java.math.BigDecimal differs. The two literals
