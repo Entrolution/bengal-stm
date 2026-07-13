@@ -119,7 +119,12 @@ enough on its own; you need the import.
 
 **On effectful arguments.** The `F`-variants (`setF`, `modifyF`, `handleErrorWithF`, and the
 `F[_]` overloads of `set`) and the `delay`/`fromF` combinators **must not encapsulate side
-effects**: they are evaluated at least twice per commit attempt, and again on every retry.
+effects** — but their evaluation frequencies differ. `delay`/`fromF` thunks run in **both**
+passes of every executed attempt that reaches them (the analysis pass and the log run), and
+again on every retry; a flow already terminated at a `waitFor` retry or `abort` reaches them in
+neither pass. The `F`-variant setter values are **not** forced during analysis: they run once
+per executed attempt, plus once per retry. `handleErrorWithF`'s handler runs only on an error.
+The common rule stands for all of them — a re-run must be harmless.
 
 **On by-name arguments.** Every `=>` above is load-bearing rather than cosmetic. Whether an
 expression is evaluated during the analysis pass — and can therefore throw there — depends on

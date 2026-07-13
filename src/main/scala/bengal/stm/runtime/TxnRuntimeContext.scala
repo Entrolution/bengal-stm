@@ -54,6 +54,67 @@ private[stm] trait TxnRuntimeContext[F[_]] {
       TxnResultFailure(logFailure.ex)
   }
 
+  // THE one entry point to the static-analysis pass, used by TxnRuntime.commit.
+  // The wake closure deliberately does NOT re-analyse — a wake fires from the
+  // conflictor's pre-publish submission sweep, so a wake-time analysis would
+  // read the unpublished world and learn nothing; see submitTxnForRetry.
+  //
+  // SPEC: CommitSnapshotValid — the H3 fix, producer side. The static analysis
+  // can throw, and the two UNDER-APPROXIMATING branches below then yield a
+  // flagged footprint: the ShortCircuit carries whatever partial footprint the
+  // walker had reached when it threw, the generic arm has nothing at all.
+  // Neither is a statement about what the transaction touches — both are an
+  // admission that we do not know.
+  //
+  // That is not a weaker hint — it is UNSOUND. Reads are never commit-validated
+  // and take no lock (see TxnLogReadOnlyVarEntry), so the scheduler is the only
+  // thing standing between a transaction and a stale read; an empty or partial
+  // footprint switches it off. Unsound in BOTH directions: an under-declared
+  // transaction reads what a peer overwrites (specs/commit/CommitH3.cfg), AND
+  // its undeclared writes invalidate a correctly-declared peer's reads
+  // (CommitH3Writer.cfg).
+  //
+  // Reachable from ORDINARY code, and the reachable path takes the ShortCircuit
+  // branch — the partial footprint — not the empty one. staticAnalysisCompiler
+  // executes real reads but never applies writes, so reading back a key this
+  // transaction just wrote yields None during analysis and Some(v) at run time;
+  // a partial continuation on that value throws during analysis and nowhere
+  // else, the walker converts it to StaticAnalysisShortCircuitException carrying
+  // whatever it had accumulated, and everything past the throw point goes
+  // undeclared. 198 of 200 contended reps skewed pre-fix; 0 in 1000 post-fix
+  // (StaticAnalysisFallbackSpec, controls 1 and 2). Both branches are FLAGGED,
+  // and the compatibility relation treats a flagged footprint as incompatible
+  // with everything: the transaction runs alone, which makes its unvalidated
+  // reads trivially safe. Reverting just the flag is negative control NC-2.
+  //
+  // The ERRATUM-STOP arm is different in kind: the walk reached a waitFor retry
+  // or an abort and stopped, and the carried footprint is COMPLETE for this
+  // attempt — the run pass terminates at the same node (divergence between the
+  // passes is caught by the commit-time coverage gate, which refines from the
+  // actual log). It is deliberately NOT flagged: flagging it would make every
+  // blocked transaction incompatible with everything, which is the wake-storm
+  // disease, not a safety feature.
+  //
+  // Not taken, and deliberately: shadowing writes during analysis so that
+  // read-your-own-write stops throwing at all. Every write op carries its value
+  // as an F[V] which the walker never runs; a shadow log would have to execute
+  // those effects in the analysis pass and would double-run effectful setters —
+  // a user-visible semantic change, and a throughput fix rather than a
+  // soundness one. Flagging alone is sound; see specs/README.md.
+  private[stm] def analyseFootprint(txn: Txn[_]): F[IdFootprint] =
+    txn
+      .foldMap[IdFootprintStore](staticAnalysisCompiler)
+      .run(IdFootprint.empty)
+      .map(_._1)
+      .handleErrorWith {
+        case StaticAnalysisErratumStopException(idFootprint, _) =>
+          Async[F].pure(idFootprint)
+        case StaticAnalysisShortCircuitException(idFootprint) =>
+          Async[F].delay(idFootprint.markUnderApproximated)
+        case _ =>
+          Async[F].pure(IdFootprint.empty.markUnderApproximated)
+      }
+
   private[stm] case class TxnScheduler(
     graphBuilderSemaphore: Semaphore[F],
     activeTransactions: MutableMap[TxnId, AnalysedTxn[_]],
@@ -187,7 +248,19 @@ private[stm] trait TxnRuntimeContext[F[_]] {
             _ <- Async[F].whenA(park) {
                    // The wake action builds a fresh incarnation AT WAKE TIME
                    // so a parked transaction never re-enters the scheduler
-                   // with stale bookkeeping from its previous run.
+                   // with stale bookkeeping from its previous run. It reuses
+                   // the parked FOOTPRINT deliberately: a wake fires from the
+                   // conflictor's SUBMISSION sweep, before that conflictor
+                   // publishes (the H1 design), so any wake-time re-analysis
+                   // would read the pre-publish world, stop at the same
+                   // still-false waitFor, and declare the same footprint —
+                   // pure cost, no information. The woken run that finally
+                   // sees the satisfied predicate touches state the parked
+                   // footprint never declared; the commit-time coverage gate
+                   // refines from its actual log and re-runs. One refinement
+                   // lap per wake whose continuation writes is the structural
+                   // price of parking on the predicate's exact dependency set
+                   // rather than a walk-past over-approximation.
                    val wake = analysedTxn
                      .freshIncarnation(analysedTxn.idFootprint)
                      .flatMap(submitTxn)
@@ -624,12 +697,26 @@ private[stm] trait TxnRuntimeContext[F[_]] {
                     // real reads can be left asleep by a conflictor the
                     // scheduler never matched it against. Refine and re-run
                     // instead, and it parks with a footprint that describes it.
+                    //
+                    // UNLIKE the valid-log arm, an under-approximated footprint
+                    // is refined here rather than short-circuited past. On the
+                    // publish path refining a flagged footprint gains nothing
+                    // (the transaction ran alone; its reads are valid; it
+                    // commits). On the PARK path it gains everything: a flagged
+                    // footprint is incompatible with every peer, so a
+                    // transaction parked on one is woken by every commit in the
+                    // system and wakes every other parked transaction each time
+                    // it resubmits. The actual log footprint is complete by
+                    // construction, so one refinement lap buys a quiet park on
+                    // the true dependency set.
                     case retry @ TxnLogRetry(_) =>
                       Async[F].uncancelable { _ =>
                         retry.validLog.withLock {
                           for {
                             actual <- retry.validLog.idFootprint
-                            refine <- Async[F].delay(!coversActualFootprint(actual))
+                            refine <- Async[F].delay(
+                                        idFootprint.isUnderApproximated || !idFootprint.covers(actual.getValidated)
+                                      )
                             result <- Async[F].ifM[TxnResult](Async[F].pure(refine))(
                                         Async[F].delay(
                                           TxnResultLogDirty(actual).asInstanceOf[TxnResult]
@@ -641,6 +728,16 @@ private[stm] trait TxnRuntimeContext[F[_]] {
                           } yield result
                         }
                       }
+                    // NO coverage gate on the failure path: writes never
+                    // publish from a TxnLogError, so write-soundness needs
+                    // nothing here. What CAN escape is information — an abort
+                    // payload computed from reads a divergent lap never
+                    // declared may carry a torn view to the caller. That
+                    // exposure predates the erratum-stop analysis (it needs
+                    // the same analysis-to-run divergence H6 exists for) and
+                    // is unchanged by it; the principled fix — carry the log
+                    // in the error result and refine instead of failing when
+                    // coverage does not hold — is deliberately not taken here.
                     case err @ TxnLogError(_) =>
                       Async[F].delay(TxnResultFailure(err))
                   }
@@ -743,78 +840,22 @@ private[stm] trait TxnRuntimeContext[F[_]] {
 
     private[stm] def commit[V](txn: Txn[V]): F[V] =
       for {
-        staticAnalysisResult <-
-          txn
-            .foldMap[IdFootprintStore](staticAnalysisCompiler)
-            .run(IdFootprint.empty)
-            .map { res =>
-              (res._1, Option(res._2))
-            }
-            // SPEC: CommitSnapshotValid — the H3 fix, producer side. The static
-            // analysis can throw, and both branches below then yield an
-            // UNDER-APPROXIMATED footprint: the first carries whatever partial
-            // footprint the walker had reached when it threw, the second has
-            // nothing at all. Neither is a statement about what the transaction
-            // touches. Both are an admission that we do not know.
-            //
-            // That is not a weaker hint — it is UNSOUND. Reads are never
-            // commit-validated and take no lock (see TxnLogReadOnlyVarEntry), so
-            // the scheduler is the only thing standing between a transaction and
-            // a stale read; an empty or partial footprint switches it off.
-            // Unsound in BOTH directions: an under-declared transaction reads
-            // what a peer overwrites (specs/commit/CommitH3.cfg), AND its
-            // undeclared writes invalidate a correctly-declared peer's reads
-            // (CommitH3Writer.cfg). Only a pure write-write collision is caught,
-            // by the commit locks and the dirty check (CommitDirty.cfg).
-            //
-            // Reachable from ORDINARY code, and the reachable path takes the
-            // FIRST branch — the partial footprint — not the empty one.
-            // staticAnalysisCompiler executes real reads but never applies
-            // writes, so reading back a key this transaction just wrote yields
-            // None during analysis and Some(v) at run time; a partial
-            // continuation on that value throws during analysis and nowhere
-            // else, the walker converts it to StaticAnalysisShortCircuitException
-            // carrying whatever it had accumulated, and everything past the
-            // throw point goes undeclared. 198 of 200 contended reps skewed, and
-            // holding the whole transaction fixed while making the continuation
-            // TOTAL removed the skew — so the throw was the cause, not the shape
-            // of the transaction. Post-fix: 0 skews in 1000 reps
-            // (StaticAnalysisFallbackSpec, controls 1 and 2).
-            //
-            // So BOTH branches are FLAGGED, and the compatibility relation then
-            // treats the footprint as incompatible with everything: the
-            // transaction is serialized against all peers and runs alone, which
-            // makes its unvalidated reads trivially safe. Reverting just this
-            // flag is negative control NC-2, and it turns the H3 configs red
-            // again. Before the fix the partial footprint was used as though it
-            // were complete, which is what let the skew through.
-            //
-            // Not taken, and deliberately: shadowing the writes during analysis
-            // so that read-your-own-write stops throwing at all. Every write op
-            // carries its value as an F[V] which the walker never runs, so a
-            // shadow log would have to execute those effects in the analysis
-            // pass and would double-run effectful setters — a user-visible
-            // semantic change, and a throughput fix rather than a soundness one.
-            // Flagging alone is sound; see specs/README.md.
-            .handleErrorWith {
-              case StaticAnalysisShortCircuitException(idFootprint) =>
-                Async[F].delay((idFootprint.markUnderApproximated, None))
-              case _ =>
-                Async[F].pure((IdFootprint.empty.markUnderApproximated, None))
-            }
-        completionSignal <- Deferred[F, Either[Throwable, V]]
-        dependencyTally  <- Ref[F].of(0)
-        hasDownstream    <- Ref[F].of(false)
-        executionStatus  <- Ref[F].of(NotScheduled.asInstanceOf[ExecutionStatus])
-        cascadeFired     <- Ref[F].of(false)
-        abandoned        <- Ref[F].of(false)
-        id               <- txnIdGen.getAndUpdate(_ + 1)
+        // See analyseFootprint for the full producer-side H3 narrative and the
+        // erratum-stop semantics.
+        declaredFootprint <- analyseFootprint(txn)
+        completionSignal  <- Deferred[F, Either[Throwable, V]]
+        dependencyTally   <- Ref[F].of(0)
+        hasDownstream     <- Ref[F].of(false)
+        executionStatus   <- Ref[F].of(NotScheduled.asInstanceOf[ExecutionStatus])
+        cascadeFired      <- Ref[F].of(false)
+        abandoned         <- Ref[F].of(false)
+        id                <- txnIdGen.getAndUpdate(_ + 1)
         analysedTxn <-
           Async[F].delay(
             AnalysedTxn(
               id               = id,
               txn              = txn,
-              idFootprint      = staticAnalysisResult._1.getValidated,
+              idFootprint      = declaredFootprint.getValidated,
               completionSignal = completionSignal,
               dependencyTally  = dependencyTally,
               unsubSpecs       = TrieMap(),

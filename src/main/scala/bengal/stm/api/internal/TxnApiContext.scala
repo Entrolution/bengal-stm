@@ -41,10 +41,12 @@ private[stm] trait TxnApiContext[F[_]] {
 
   /** Lifts an `F[V]` into a transaction.
     *
-    * THE EFFECT RUNS AT LEAST TWICE PER COMMIT ATTEMPT, and again on every retry. `TxnDelay` is interpreted by BOTH
-    * compilers — once by the static-analysis pass that computes the footprint, once by the log run that actually
-    * commits — so `spec` must be idempotent and free of observable side effects. This is the only way to lift an
-    * arbitrary effect into a `Txn`, which makes it the sharpest edge in the public API.
+    * THE EFFECT RUNS TWICE PER EXECUTED COMMIT ATTEMPT that reaches it, and again on every retry. `TxnDelay` is
+    * interpreted by BOTH compilers — once by the static-analysis pass that computes the footprint, once by the log run
+    * that actually commits — so `spec` must be idempotent and free of observable side effects. A flow that has already
+    * terminated earlier — at a `waitFor` retry or an `abort` — reaches it in NEITHER pass: both walkers stop at the
+    * first terminal erratum, so an effect positioned after one runs zero times for that attempt. This is the only way
+    * to lift an arbitrary effect into a `Txn`, which makes it the sharpest edge in the public API.
     *
     * It is also EAGERLY FORCED during the analysis pass, unlike the value argument to `set`/`modify`. A `spec` that
     * throws there under-approximates the footprint, and an under-approximated transaction is treated as conflicting
@@ -54,7 +56,8 @@ private[stm] trait TxnApiContext[F[_]] {
     liftSuccess(TxnDelay(spec))
 
   /** Lifts a by-name computation into a transaction. Same contract as [[fromF]]: the thunk runs in BOTH the analysis
-    * pass and the real run, so it must not carry side effects, and if it throws it under-approximates the footprint.
+    * pass and the real run when the flow reaches it (and in neither pass after an earlier `waitFor` retry or `abort`),
+    * so it must not carry side effects, and if it throws it under-approximates the footprint.
     */
   def delay[V](thunk: => V): Txn[V] =
     liftSuccess(TxnDelay(Async[F].delay(thunk)))
@@ -73,9 +76,11 @@ private[stm] trait TxnApiContext[F[_]] {
     *
     * The rule that follows is load-bearing, and breaking it parks a transaction permanently:
     *
-    * EVERYTHING THE PREDICATE DEPENDS ON MUST BE READ FROM A `TxnVar`/`TxnVarMap` INSIDE THE SAME TRANSACTION. Hoist
-    * the read out and the transaction has an empty read set, nothing can ever conflict with it, no wake ever fires, and
-    * it sleeps forever.
+    * EVERYTHING THE PREDICATE DEPENDS ON MUST BE READ FROM A `TxnVar`/`TxnVarMap` INSIDE THE SAME TRANSACTION, BEFORE
+    * THIS CALL. Hoist the read out and the transaction has an empty read set, nothing can ever conflict with it, no
+    * wake ever fires, and it sleeps forever. A parked transaction's footprint is exactly its pre-`waitFor` read set
+    * (the analysis stops here on a retry), so reads positioned after the `waitFor` contribute nothing to the wake —
+    * they never could legitimately, since the predicate cannot depend on them.
     *
     * A predicate that THROWS aborts the transaction rather than retrying it (the `Failure` branch below). And an
     * enclosing `handleErrorWith` does not absorb the retry — a blocked transaction stays blocked.

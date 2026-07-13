@@ -52,10 +52,12 @@ import bengal.stm.runtime.{ TxnCompilerContext, TxnLogContext, TxnRuntimeContext
   * }}}
   *
   * A transaction runs TWICE per commit attempt: once in a static-analysis pass that computes its footprint (the
-  * variables and keys it touches), and once for real. The scheduler uses the footprint to run only transactions that
-  * cannot conflict. Two consequences reach callers, and the README covers both: `delay`/`fromF` thunks are evaluated in
-  * both passes, so they must not carry side effects; and a transaction whose analysis pass THROWS gets an
-  * under-approximated footprint, which conflicts with everything and therefore runs alone.
+  * variables and keys it touches), and once for real. Both passes stop at the first `waitFor` retry or `abort`, so a
+  * step positioned after one runs in neither pass for that attempt. The scheduler uses the footprint to run only
+  * transactions that cannot conflict. Two consequences reach callers, and the README covers both: `delay`/`fromF`
+  * thunks are evaluated in both passes when the flow reaches them, so they must not carry side effects; and a
+  * transaction whose analysis pass THROWS gets an under-approximated footprint, which conflicts with everything and
+  * therefore runs alone.
   *
   * @tparam F
   *   the effect type (must have an `Async` instance)
