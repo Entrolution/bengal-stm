@@ -48,7 +48,11 @@ case class TxnVar[F[_], T](
 
 object TxnVar {
 
-  /** Creates a new `TxnVar` with the given initial value. Requires an implicit `STM[F]` runtime. */
+  /** Creates a new `TxnVar` with the given initial value. Requires an implicit `STM[F]` runtime.
+    *
+    * The variable belongs to that runtime: all transactions touching it must be committed through the same `STM[F]`
+    * instance. Use under a different runtime is undefined — see [[bengal.stm.STM.runtime]].
+    */
   def of[F[_]: STM: Async, T](value: T): F[TxnVar[F, T]] =
     for {
       id       <- STM[F].txnVarIdGen.updateAndGet(_ + 1)

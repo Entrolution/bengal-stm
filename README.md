@@ -338,6 +338,32 @@ Two further details:
 - `handleErrorWith` does **not** absorb a `waitFor` retry. Wrapping a blocking transaction in
   an error handler will not make it stop blocking.
 
+## Cancelling a commit
+
+Cancelling the `F` returned by `commit` — a `timeout`, a lost `race`, supervisor shutdown —
+**abandons** the transaction. Once the cancellation completes:
+
+- the transaction never begins executing again;
+- a parked `waitFor` transaction is removed from the retry machinery — no later commit can wake
+  it, so it cannot run and publish after its caller has gone;
+- all scheduler bookkeeping is released, and transactions queued behind the abandoned one
+  proceed.
+
+One carve-out: the **atomic commit window** itself is uncancelable. A window already executing
+when cancellation arrives runs to completion, and its writes may be published — cancellation
+does not interrupt a window in flight; it prevents every future one, promptly, without waiting
+on the in-flight one. `commit.timeout(d)` therefore composes safely with `waitFor`: the timeout
+fires, the transaction is abandoned, and nothing leaks.
+
+## One runtime per variable set
+
+Every `TxnVar` and `TxnVarMap` belongs to the `STM` runtime in scope when it was created, and
+all transactions touching it must be committed through that runtime. Sharing a variable across
+two runtimes is **undefined**: each scheduler enforces its conflict guarantees only over its own
+transactions, so two conflicting transactions committed under different runtimes can interleave
+unchecked — stale reads and lost updates with no error raised. One `STM.runtime` per
+application (or per isolated variable set) is the rule.
+
 ## Correctness
 
 Bengal's commit and scheduling protocols are specified in TLA+ and model-checked in CI on

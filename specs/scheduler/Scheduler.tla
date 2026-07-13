@@ -78,6 +78,19 @@
  * shut and does nothing. A plain submission can also abort, modelling the
  * submit wrapper's handleErrorWith in TxnRuntime.commit, which completes the
  * signal and leaves the transaction wherever it was.
+ *
+ * NOT MODELLED: ABANDONMENT (caller-cancelled commit). TxnScheduler.abandon
+ * removes a parked entry under the retry semaphore, demotes a Scheduled
+ * incarnation to NotScheduled under the graph semaphore (the ONE status
+ * demotion in the code) and drains its cascade, and an abandoned flag —
+ * re-checked inside the same semaphore regions the protocol already holds —
+ * stops every re-entry (park, resubmit, admission). The omission is sound
+ * for the properties checked here because abandonment only REMOVES
+ * behaviour: it cannot create an execute-window overlap (ContractC), and a
+ * lost wakeup for an ABANDONED transaction is the intended outcome, not a
+ * defect — NoLostWakeup speaks for callers still waiting. Behavioural and
+ * protocol-level pins live in spec/CancellationSpec and
+ * runtime/AbandonProtocolSpec.
  *)
 
 EXTENDS Footprint, Integers, FiniteSets, Sequences

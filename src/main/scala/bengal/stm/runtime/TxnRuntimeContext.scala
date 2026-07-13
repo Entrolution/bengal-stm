@@ -72,6 +72,53 @@ private[stm] trait TxnRuntimeContext[F[_]] {
     // the class name.
     override val toString: String = "TxnScheduler"
 
+    // Abandonment: the caller of `commit` cancelled. Cancellation must be
+    // PROMPT (this runs as an onCancel finalizer and never waits on a commit
+    // window) and COMPLETE (nothing the transaction registered anywhere may
+    // run it again). The flag is shared across every incarnation
+    // (freshIncarnation copies the Ref), so one abandonment covers wake-time
+    // and refinement resubmissions too; the flag is then re-checked INSIDE
+    // each semaphore region that could re-enter the transaction — a check
+    // outside the region would race an in-flight wake closure and lose.
+    //
+    //   - parked: the retryMap entry is removed under the retry semaphore, so
+    //     the wake closure is dropped and can never fire.
+    //   - Scheduled: demoted to NotScheduled and removed from
+    //     activeTransactions under the graph semaphore (serialized against
+    //     admitForExecution's CAS, which can therefore never admit it), then
+    //     its unsub cascade drains dependents' tallies — mirroring
+    //     registerCompletion.
+    //   - Running: left untouched. The commit window is uncancelable by
+    //     design; its own epilogue deregisters, and the flag stops every
+    //     path that would run the transaction AGAIN (park, resubmit,
+    //     admission).
+    def abandon(analysedTxn: AnalysedTxn[_]): F[Unit] =
+      for {
+        _ <- analysedTxn.abandoned.set(true)
+        _ <- retrySemaphore.permit.use { _ =>
+               Async[F].delay(retryMap.remove(analysedTxn.id)).void
+             }
+        demoted <- graphBuilderSemaphore.permit.use { _ =>
+                     Async[F].delay(activeTransactions.get(analysedTxn.id)).flatMap {
+                       case Some(current) =>
+                         current.executionStatus
+                           .modify {
+                             case Scheduled => (NotScheduled, true)
+                             case other => (other, false)
+                           }
+                           .flatTap { blocked =>
+                             Async[F].whenA(blocked)(
+                               Async[F].delay(activeTransactions.remove(current.id)).void
+                             )
+                           }
+                           .map(blocked => if (blocked) Some(current) else None)
+                       case None =>
+                         Async[F].pure(Option.empty[AnalysedTxn[_]])
+                     }
+                   }
+        _ <- demoted.traverse_(_.triggerUnsub.start)
+      } yield ()
+
     // Wakes every parked transaction whose footprint conflicts with the one
     // just submitted — EXCEPT the submitter itself. The retry map is read
     // when this acquires the semaphore, not when it was spawned, so a sweep
@@ -123,13 +170,20 @@ private[stm] trait TxnRuntimeContext[F[_]] {
       retrySemaphore.permit
         .use { _ =>
           for {
+            // The abandoned check lives INSIDE the semaphore region: abandon
+            // sets the flag before taking this semaphore to sweep the retry
+            // map, so either we see the flag here and never park, or our
+            // entry lands first and abandon's sweep removes it. A check
+            // outside the region could pass just before abandon completes
+            // and then park an entry nothing will ever remove.
+            abandoned <- analysedTxn.abandoned.get
             // ORDER IS LOAD-BEARING — see above.
             conflictActive <-
               Async[F].delay(
                 activeTransactions.values.exists(aTxn => !analysedTxn.idFootprint.isCompatibleWith(aTxn.idFootprint))
               )
             stale <- validLog.anyReadChangedSinceRead
-            park = !(stale || conflictActive)
+            park = !abandoned && !(stale || conflictActive)
             _ <- Async[F].whenA(park) {
                    // The wake action builds a fresh incarnation AT WAKE TIME
                    // so a parked transaction never re-enters the scheduler
@@ -143,11 +197,13 @@ private[stm] trait TxnRuntimeContext[F[_]] {
                      retryMap.addOne(analysedTxn.id -> ((analysedTxn.idFootprint, wake)))
                    )
                  }
-          } yield park
+          } yield (park, abandoned)
         }
-        .flatMap { parkedNow =>
-          // The window was live: skip the park and resubmit immediately.
-          Async[F].whenA(!parkedNow)(
+        .flatMap { case (parkedNow, abandoned) =>
+          // The window was live: skip the park and resubmit immediately —
+          // unless the caller has abandoned the transaction, in which case
+          // neither parking nor resubmission may happen.
+          Async[F].whenA(!parkedNow && !abandoned)(
             analysedTxn.freshIncarnation(analysedTxn.idFootprint).flatMap(submitTxn)
           )
         }
@@ -179,55 +235,59 @@ private[stm] trait TxnRuntimeContext[F[_]] {
     def submitTxnForImmediateRetry(analysedTxn: AnalysedTxn[_]): F[Unit] =
       for {
         _ <- analysedTxn.resetDependencyTally
-        _ <- graphBuilderSemaphore.permit.use { _ =>
-               for {
-                 testAndLink <- activeTransactions.values.toList.parTraverse { aTxn =>
-                                  (for {
-                                    status <- aTxn.executionStatus.get
-                                    _ <- status match {
-                                           case Running =>
-                                             Async[F].ifM(
-                                               Async[F].delay(
-                                                 analysedTxn.idFootprint
-                                                   .isCompatibleWith(
-                                                     aTxn.idFootprint
-                                                   )
-                                               )
-                                             )(
-                                               Async[F].unit,
-                                               aTxn.subscribeDownstreamDependency(
-                                                 analysedTxn
-                                               )
-                                             )
-                                           case Scheduled =>
-                                             Async[F].ifM(
-                                               Async[F].delay(
-                                                 analysedTxn.idFootprint
-                                                   .isCompatibleWith(
-                                                     aTxn.idFootprint
-                                                   )
-                                               )
-                                             )(
-                                               Async[F].unit,
-                                               analysedTxn.subscribeDownstreamDependency(
-                                                 aTxn
-                                               )
-                                             )
-                                           case _ =>
-                                             Async[F].unit
-                                         }
-                                  } yield ()).start
-                                }
-                 _ <- analysedTxn.executionStatus.set(Scheduled)
-                 _ <-
-                   Async[F].delay(
-                     activeTransactions.addOne(analysedTxn.id -> analysedTxn)
-                   )
-                 _ <- testAndLink.parTraverse(_.joinWithNever)
-                 _ <- analysedTxn.checkExecutionReadiness
-               } yield ()
-             }
-        _ <- checkRetryQueue(analysedTxn.id, analysedTxn.idFootprint).start
+        registered <- graphBuilderSemaphore.permit.use { _ =>
+                        // Abandoned check INSIDE the graph region — see submitTxn.
+                        Async[F].ifM(analysedTxn.abandoned.get)(
+                          Async[F].pure(false),
+                          for {
+                            testAndLink <- activeTransactions.values.toList.parTraverse { aTxn =>
+                                             (for {
+                                               status <- aTxn.executionStatus.get
+                                               _ <- status match {
+                                                      case Running =>
+                                                        Async[F].ifM(
+                                                          Async[F].delay(
+                                                            analysedTxn.idFootprint
+                                                              .isCompatibleWith(
+                                                                aTxn.idFootprint
+                                                              )
+                                                          )
+                                                        )(
+                                                          Async[F].unit,
+                                                          aTxn.subscribeDownstreamDependency(
+                                                            analysedTxn
+                                                          )
+                                                        )
+                                                      case Scheduled =>
+                                                        Async[F].ifM(
+                                                          Async[F].delay(
+                                                            analysedTxn.idFootprint
+                                                              .isCompatibleWith(
+                                                                aTxn.idFootprint
+                                                              )
+                                                          )
+                                                        )(
+                                                          Async[F].unit,
+                                                          analysedTxn.subscribeDownstreamDependency(
+                                                            aTxn
+                                                          )
+                                                        )
+                                                      case _ =>
+                                                        Async[F].unit
+                                                    }
+                                             } yield ()).start
+                                           }
+                            _ <- analysedTxn.executionStatus.set(Scheduled)
+                            _ <-
+                              Async[F].delay(
+                                activeTransactions.addOne(analysedTxn.id -> analysedTxn)
+                              )
+                            _ <- testAndLink.parTraverse(_.joinWithNever)
+                            _ <- analysedTxn.checkExecutionReadiness
+                          } yield true
+                        )
+                      }
+        _ <- Async[F].whenA(registered)(checkRetryQueue(analysedTxn.id, analysedTxn.idFootprint).start.void)
       } yield ()
 
     // The canonical submission sequence, and the order inside the graph
@@ -250,35 +310,47 @@ private[stm] trait TxnRuntimeContext[F[_]] {
     def submitTxn(analysedTxn: AnalysedTxn[_]): F[Unit] =
       for {
         _ <- analysedTxn.resetDependencyTally
-        _ <- graphBuilderSemaphore.permit.use { _ =>
-               for {
-                 // SPEC: ContractC — footprint-incompatible transactions never
-                 // overlap in their execute windows. This scan builds the edges;
-                 // admitForExecution is what makes them BINDING. Both run under
-                 // the graph semaphore, so no peer can be admitted between the
-                 // scan and the insert below (Scheduler.tla checks the guarantee
-                 // itself).
-                 testAndLink <- activeTransactions.values.toList.parTraverse { aTxn =>
-                                  Async[F]
-                                    .ifM(
-                                      Async[F].delay(
-                                        analysedTxn.idFootprint.isCompatibleWith(
-                                          aTxn.idFootprint
-                                        )
-                                      )
-                                    )(Async[F].unit, aTxn.subscribeDownstreamDependency(analysedTxn))
-                                    .start
-                                }
-                 _ <- analysedTxn.executionStatus.set(Scheduled)
-                 _ <-
-                   Async[F].delay(
-                     activeTransactions.addOne(analysedTxn.id -> analysedTxn)
-                   )
-                 _ <- testAndLink.parTraverse(_.joinWithNever)
-                 _ <- analysedTxn.checkExecutionReadiness
-               } yield ()
-             }
-        _ <- checkRetryQueue(analysedTxn.id, analysedTxn.idFootprint).start
+        registered <- graphBuilderSemaphore.permit.use { _ =>
+                        // The abandoned check lives INSIDE the graph region,
+                        // where it is serialized against abandon's own graph
+                        // region: either this read sees the flag and nothing
+                        // registers, or the registration lands first and
+                        // abandon's sweep demotes and removes it. Outside the
+                        // region, an in-flight wake closure could pass the
+                        // check while abandon completes, register afterwards,
+                        // and run — an abandoned transaction publishing
+                        // arbitrarily later.
+                        Async[F].ifM(analysedTxn.abandoned.get)(
+                          Async[F].pure(false),
+                          for {
+                            // SPEC: ContractC — footprint-incompatible transactions never
+                            // overlap in their execute windows. This scan builds the edges;
+                            // admitForExecution is what makes them BINDING. Both run under
+                            // the graph semaphore, so no peer can be admitted between the
+                            // scan and the insert below (Scheduler.tla checks the guarantee
+                            // itself).
+                            testAndLink <- activeTransactions.values.toList.parTraverse { aTxn =>
+                                             Async[F]
+                                               .ifM(
+                                                 Async[F].delay(
+                                                   analysedTxn.idFootprint.isCompatibleWith(
+                                                     aTxn.idFootprint
+                                                   )
+                                                 )
+                                               )(Async[F].unit, aTxn.subscribeDownstreamDependency(analysedTxn))
+                                               .start
+                                           }
+                            _ <- analysedTxn.executionStatus.set(Scheduled)
+                            _ <-
+                              Async[F].delay(
+                                activeTransactions.addOne(analysedTxn.id -> analysedTxn)
+                              )
+                            _ <- testAndLink.parTraverse(_.joinWithNever)
+                            _ <- analysedTxn.checkExecutionReadiness
+                          } yield true
+                        )
+                      }
+        _ <- Async[F].whenA(registered)(checkRetryQueue(analysedTxn.id, analysedTxn.idFootprint).start.void)
       } yield ()
 
     def registerCompletion(analysedTxn: AnalysedTxn[_]): F[Unit] =
@@ -302,12 +374,19 @@ private[stm] trait TxnRuntimeContext[F[_]] {
     // the tally to zero.)
     def admitForExecution(analysedTxn: AnalysedTxn[_]): F[Boolean] =
       graphBuilderSemaphore.permit.use { _ =>
-        Async[F].ifM(analysedTxn.dependencyTally.get.map(_ == 0))(
-          analysedTxn.executionStatus.modify {
-            case Scheduled => (Running, true)
-            case other => (other, false)
-          },
-          Async[F].pure(false)
+        // The abandoned read shares the semaphore with abandon's demotion, so
+        // "cancellation completed before the window began" strictly implies
+        // "the window never begins" — one Ref read under a permit already
+        // held.
+        Async[F].ifM(analysedTxn.abandoned.get)(
+          Async[F].pure(false),
+          Async[F].ifM(analysedTxn.dependencyTally.get.map(_ == 0))(
+            analysedTxn.executionStatus.modify {
+              case Scheduled => (Running, true)
+              case other => (other, false)
+            },
+            Async[F].pure(false)
+          )
         )
       }
   }
@@ -337,16 +416,23 @@ private[stm] trait TxnRuntimeContext[F[_]] {
     executionStatus: Ref[F, ExecutionStatus],
     hasDownstream: Ref[F, Boolean],
     cascadeFired: Ref[F, Boolean],
+    // Set once by TxnScheduler.abandon when the caller cancels `commit`, and
+    // DELIBERATELY SHARED ACROSS INCARNATIONS (freshIncarnation copies the
+    // Ref): one cancellation must cover every future resubmission — dirty
+    // refinements and wake-time incarnations included — or an abandoned
+    // transaction could re-enter the scheduler through a closure created
+    // before the cancellation.
+    abandoned: Ref[F, Boolean],
     scheduler: TxnScheduler
   ) {
 
     // Every resubmission gets FRESH protocol bookkeeping — tally, unsub
     // edges, status, cascade gate — sharing only the transaction, its id,
-    // and the caller's completion signal. In-flight unsubscribe cascades
-    // from the previous incarnation then drain refs nothing reads any
-    // more, instead of corrupting the new incarnation's dependency
-    // arithmetic (the H4 double-execution family; see the H4 narrative in
-    // specs/README.md).
+    // the caller's completion signal, and the abandoned flag. In-flight
+    // unsubscribe cascades from the previous incarnation then drain refs
+    // nothing reads any more, instead of corrupting the new incarnation's
+    // dependency arithmetic (the H4 double-execution family; see the H4
+    // narrative in specs/README.md).
     private[stm] def freshIncarnation(newFootprint: IdFootprint): F[AnalysedTxn[V]] =
       for {
         newTally   <- Ref.of[F, Int](0)
@@ -563,63 +649,91 @@ private[stm] trait TxnRuntimeContext[F[_]] {
     private[stm] def execute(
       ex: TxnScheduler
     ): F[Unit] =
-      Async[F].ifM(ex.admitForExecution(this))(
-        Async[F].uncancelable { poll =>
-          (for {
-            result <- poll(commit)
-            _      <- ex.registerCompletion(this)
-            // SPEC: CompletionAtMostOnce — completes here, in the error
-            // handler below, and in the submit wrapper (all Deferred
-            // first-wins); the admission gate guarantees at most one
-            // execute window per incarnation, so the success/failure
-            // completion fires at most once organically.
-            _ <- result match {
-                   case TxnResultSuccess(result) =>
-                     completionSignal
-                       .complete(
-                         Right[Throwable, V](result.asInstanceOf[V])
+      // Fast-path abandoned check with CLEANUP: a spawned execute for an
+      // abandoned transaction deregisters it (idempotent — TrieMap remove plus
+      // the cascade gate) instead of merely exiting, so a registration that
+      // raced ahead of abandon's sweep cannot strand dependents. The airtight
+      // gate is admitForExecution's in-semaphore check; this one just cleans
+      // up earlier. Deregistering-without-demoting here is safe ONLY because
+      // an incarnation has at most one live execute fiber (one tally-to-zero
+      // event per incarnation, serialized against admission): this fiber
+      // cascading cannot release a peer while a sibling window of the same
+      // incarnation runs, because no sibling exists.
+      Async[F].ifM(abandoned.get)(
+        ex.registerCompletion(this),
+        Async[F].ifM(ex.admitForExecution(this))(
+          Async[F].uncancelable { poll =>
+            (for {
+              result <- poll(commit)
+                          .onCancel(
+                            // If this fiber is ever cancelled mid-log-build
+                            // (nothing does today; supervision might), the
+                            // scheduler must not be left holding a dead
+                            // transaction that dependents wait on forever.
+                            ex.registerCompletion(this).attempt.void >>
+                              completionSignal
+                                .complete(
+                                  Left(
+                                    new java.util.concurrent.CancellationException("transaction execution cancelled")
+                                  )
+                                )
+                                .attempt
+                                .void
+                          )
+              _ <- ex.registerCompletion(this)
+              // SPEC: CompletionAtMostOnce — completes here, in the error
+              // handler below, and in the submit wrapper (all Deferred
+              // first-wins); the admission gate guarantees at most one
+              // execute window per incarnation, so the success/failure
+              // completion fires at most once organically.
+              _ <- result match {
+                     case TxnResultSuccess(result) =>
+                       completionSignal
+                         .complete(
+                           Right[Throwable, V](result.asInstanceOf[V])
+                         )
+                         .void
+                     // hasDownstream is TRUE exactly when an incompatible peer
+                     // subscribed to us while we were still in
+                     // activeTransactions — so that peer's submission sweep is
+                     // already SPENT: it swept before we could park and did not
+                     // see us. Parking now would be the H1 shape from the other
+                     // side, since nothing sweeps for us again and that peer's
+                     // commit is the very event our predicate waits on. Resubmit
+                     // instead: the resubmission's scan puts us downstream of it
+                     // and we re-run once it completes. Only a transaction with no
+                     // such peer takes the park path.
+                     //
+                     // This branch is also why the absent-key lost wakeup has no
+                     // behavioural reproduction. A conflictor early enough for the
+                     // park-time checks to be blind to it has necessarily already
+                     // set this flag, so we never park at all; one that arrives
+                     // later is caught by the park's own scan or staleness check.
+                     // The defect needs a conflictor's entire lifecycle to land
+                     // between the two, which is why it is pinned in the model
+                     // (specs/scheduler/SchedulerAbsentKey.cfg) and not in a test.
+                     case TxnResultRetry(validLog) =>
+                       Async[F].ifM(hasDownstream.get)(
+                         freshIncarnation(idFootprint).flatMap(ex.submitTxn),
+                         ex.submitTxnForRetry(this, validLog)
                        )
-                       .void
-                   // hasDownstream is TRUE exactly when an incompatible peer
-                   // subscribed to us while we were still in
-                   // activeTransactions — so that peer's submission sweep is
-                   // already SPENT: it swept before we could park and did not
-                   // see us. Parking now would be the H1 shape from the other
-                   // side, since nothing sweeps for us again and that peer's
-                   // commit is the very event our predicate waits on. Resubmit
-                   // instead: the resubmission's scan puts us downstream of it
-                   // and we re-run once it completes. Only a transaction with no
-                   // such peer takes the park path.
-                   //
-                   // This branch is also why the absent-key lost wakeup has no
-                   // behavioural reproduction. A conflictor early enough for the
-                   // park-time checks to be blind to it has necessarily already
-                   // set this flag, so we never park at all; one that arrives
-                   // later is caught by the park's own scan or staleness check.
-                   // The defect needs a conflictor's entire lifecycle to land
-                   // between the two, which is why it is pinned in the model
-                   // (specs/scheduler/SchedulerAbsentKey.cfg) and not in a test.
-                   case TxnResultRetry(validLog) =>
-                     Async[F].ifM(hasDownstream.get)(
-                       freshIncarnation(idFootprint).flatMap(ex.submitTxn),
-                       ex.submitTxnForRetry(this, validLog)
-                     )
-                   case TxnResultLogDirty(idFootprintRefinement) =>
-                     freshIncarnation(idFootprintRefinement.getValidated)
-                       .flatMap(ex.submitTxnForImmediateRetry)
-                   case TxnResultFailure(err) =>
-                     completionSignal
-                       .complete(Left[Throwable, V](err))
-                       .void
-                 }
-          } yield ()).handleErrorWith { unexpectedErr =>
-            ex.registerCompletion(this).attempt >>
-            completionSignal.complete(Left[Throwable, V](unexpectedErr)).void
-          }
-        },
-        // Lost the admission gate: a duplicate or stale spawn. Exit without side
-        // effects (see admitForExecution).
-        Async[F].unit
+                     case TxnResultLogDirty(idFootprintRefinement) =>
+                       freshIncarnation(idFootprintRefinement.getValidated)
+                         .flatMap(ex.submitTxnForImmediateRetry)
+                     case TxnResultFailure(err) =>
+                       completionSignal
+                         .complete(Left[Throwable, V](err))
+                         .void
+                   }
+            } yield ()).handleErrorWith { unexpectedErr =>
+              ex.registerCompletion(this).attempt >>
+              completionSignal.complete(Left[Throwable, V](unexpectedErr)).void
+            }
+          },
+          // Lost the admission gate: a duplicate or stale spawn. Exit without side
+          // effects (see admitForExecution).
+          Async[F].unit
+        )
       )
   }
 
@@ -693,6 +807,7 @@ private[stm] trait TxnRuntimeContext[F[_]] {
         hasDownstream    <- Ref[F].of(false)
         executionStatus  <- Ref[F].of(NotScheduled.asInstanceOf[ExecutionStatus])
         cascadeFired     <- Ref[F].of(false)
+        abandoned        <- Ref[F].of(false)
         id               <- txnIdGen.getAndUpdate(_ + 1)
         analysedTxn <-
           Async[F].delay(
@@ -706,16 +821,22 @@ private[stm] trait TxnRuntimeContext[F[_]] {
               executionStatus  = executionStatus,
               hasDownstream    = hasDownstream,
               cascadeFired     = cascadeFired,
+              abandoned        = abandoned,
               scheduler        = scheduler
             )
           )
-        _ <- (scheduler
-               .submitTxn(analysedTxn)
-               .handleErrorWith { err =>
-                 completionSignal.complete(Left[Throwable, V](err)).void
-               })
-               .start
-        completion <- completionSignal.get
+        // The finalizer scope covers the submission AND the wait: cancellation
+        // observed between the .start and the signal read must still abandon,
+        // or a just-registered transaction would have nobody to clean it up.
+        // Abandoning a transaction that never got as far as registering is a
+        // harmless no-op (empty sweeps, gated cascade).
+        completion <- (scheduler
+                        .submitTxn(analysedTxn)
+                        .handleErrorWith { err =>
+                          completionSignal.complete(Left[Throwable, V](err)).void
+                        }
+                        .start >> completionSignal.get)
+                        .onCancel(scheduler.abandon(analysedTxn))
         result <- completion match {
                     case Right(res) => Async[F].pure(res)
                     case Left(ex) => Async[F].raiseError(ex)

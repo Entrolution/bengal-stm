@@ -399,7 +399,7 @@ only sound if every producer sets it.
 
 | TLA+ variable | Scala |
 |---------------|-------|
-| `status[t]` | `AnalysedTxn.executionStatus: Ref[F, ExecutionStatus]` — never demoted, exactly as in the code (nothing writes it after `Running` except a resubmission's `set(Scheduled)`); completion is visible only via `completedCount` |
+| `status[t]` | `AnalysedTxn.executionStatus: Ref[F, ExecutionStatus]` — never demoted in-model. The code has ONE demotion the model scopes out: `TxnScheduler.abandon` (caller cancelled `commit`) CASes `Scheduled → NotScheduled` under the graph semaphore before deregistering. Abandonment only REMOVES behaviour — a demoted transaction never admits, parks, or resubmits — so it cannot create an overlap `ContractC` would catch or a wakeup `NoLostWakeup` relies on for a LIVE caller; see the scope note in `Scheduler.tla`'s header. Completion is visible only via `completedCount` |
 | `tally[t]` | `AnalysedTxn.dependencyTally: Ref[F, Int]` — fresh per incarnation since the H4 fix |
 | `unsubs[t]` | `AnalysedTxn.unsubSpecs: MutableMap[TxnId, F[Unit]]` — fresh per incarnation since the H4 fix; modelled as `<<downstreamId, downstreamIncAtSubscribe>>` pairs so drains against re-incarnated targets no-op (dead refs) |
 | `cascadeFired[t]` | `AnalysedTxn.cascadeFired: Ref[F, Boolean]` — `triggerUnsub`'s exactly-once gate, fresh per incarnation |

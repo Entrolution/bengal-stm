@@ -177,7 +177,11 @@ case class TxnVarMap[F[_]: STM: Async, K, V](
 
 object TxnVarMap {
 
-  /** Creates a new `TxnVarMap` with the given initial entries. Requires an implicit `STM[F]` runtime. */
+  /** Creates a new `TxnVarMap` with the given initial entries. Requires an implicit `STM[F]` runtime.
+    *
+    * The map belongs to that runtime: all transactions touching it must be committed through the same `STM[F]`
+    * instance. Use under a different runtime is undefined — see [[bengal.stm.STM.runtime]].
+    */
   def of[F[_]: STM: Async, K, V](valueMap: Map[K, V]): F[TxnVarMap[F, K, V]] =
     for {
       id <- STM[F].txnVarIdGen.updateAndGet(_ + 1)
