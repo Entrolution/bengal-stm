@@ -266,4 +266,51 @@ VARIABLE unused
 Init == unused = TRUE
 Next == UNCHANGED unused
 
+(* ---------------------------------------------------------------------------
+   NC-8: DOES H6'S COVERAGE CHECK SUBSUME THE COMMIT-TIME DIRTY CHECK?
+
+   Deleting the dirty check outright (IsDirty(t) == FALSE) changes no verdict in
+   any of the seven commit configs. That is a fact, and on its own it means
+   nothing: it is equally consistent with "the check is redundant" and with "the
+   catalogue is too small to exercise it". A model cannot tell those apart by
+   staying green.
+
+   So prove it instead. The argument runs:
+
+     1. For my write set to move, some peer must PUBLISH to an entity e I write.
+     2. Since the H6 fix, a peer only publishes if ITS coverage holds -- so e, or
+        e's parent, is in that peer's DECLARED updates.
+     3. If MY coverage holds, e or e's parent is in MY declared updates.
+     4. So we BOTH declare a write to e ... and therefore our declared footprints
+        are INCOMPATIBLE.                                    <-- THIS STEP
+     5. Contract C then keeps us out of each other's execute windows, so it cannot
+        have published inside mine. My write set cannot have moved. Not dirty.
+
+   Step 4 is the load-bearing one and it is a claim about the RELATION, so it can
+   be settled here, exhaustively, rather than argued. Steps 1-3 are the H6 fix and
+   the definition of Covers; step 5 is Contract C, which Spec B discharges.
+
+   If this holds, CoverageOk => ~IsDirty, and the dirty check is dead code.
+   CommitProtocol.tla asserts exactly that as CoverageSubsumesDirty. *)
+WriteCovered(e, f) ==
+    \/ e.val \in UpdateRawIds(f)
+    \/ (e.par /= NoParent /\ e.par \in UpdateRawIds(f))
+
+ASSUME LemmaCoWriteImpliesIncompatible ==
+    \A f, g \in CompleteFootprints :
+      \A e \in Ids :
+        (WriteCovered(e, f) /\ WriteCovered(e, g)) => ~IsCompatible(f, g)
+
+(* And the control for it: coverage is what makes step 2 and step 3 true. Without
+   coverage, two transactions CAN really write the same entity while their declared
+   footprints look compatible -- which is exactly H6, and exactly why the dirty
+   check used to be load-bearing. Stated so nobody reads the lemma above as saying
+   more than it does. *)
+ASSUME DocumentsWithoutCoverageCoWritersLookCompatible ==
+    \E f, g \in CompleteFootprints :
+      \E e \in Ids :
+        /\ IsCompatible(f, g)
+        /\ ~WriteCovered(e, f)
+        /\ ~WriteCovered(e, g)
+
 ===============================================================================

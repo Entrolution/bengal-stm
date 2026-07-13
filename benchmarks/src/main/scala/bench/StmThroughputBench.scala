@@ -68,9 +68,18 @@ import bengal.stm.syntax.all._
 @State(Scope.Benchmark)
 @BenchmarkMode(Array(Mode.Throughput))
 @OutputTimeUnit(TimeUnit.SECONDS)
-@Warmup(iterations = 3, time = 1, timeUnit = TimeUnit.SECONDS)
-@Measurement(iterations = 5, time = 1, timeUnit = TimeUnit.SECONDS)
-@Fork(1)
+// THE DEFAULTS ARE THE PUBLISHED PROTOCOL, so a bare `Jmh/run` reproduces the table.
+// They did not use to be: the class said -f1 -wi 3 -i 5 while the README documented
+// something else, so anyone following the docs measured a different thing from anyone
+// following the code.
+//
+// FIVE FORKS, not one. A single fork measures one JVM's JIT and allocation luck, and
+// that is the dominant source of run-to-run variance here -- at -f1 the two halves of an
+// A -> B -> A control disagreed by up to 6.5%, which is larger than most of the effects
+// being measured. Forks average that out; iterations do not.
+@Warmup(iterations = 5, time = 1, timeUnit = TimeUnit.SECONDS)
+@Measurement(iterations = 10, time = 1, timeUnit = TimeUnit.SECONDS)
+@Fork(5)
 class StmThroughputBench {
 
   private final val Batch = 32

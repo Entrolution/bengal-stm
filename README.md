@@ -35,8 +35,9 @@ semantic blocking and scheduling.
 - **Built on Cats Effect**, polymorphic in `F[_]` over `Async`.
 
 The commit and scheduling protocols are specified in TLA+ and model-checked in CI. That work
-found six concurrency defects, three of which no test could have caught — see
-[Correctness](#correctness).
+found eight concurrency defects in the shipped library — several of which no test could have
+caught, and one of which it later proved a whole commit-time check was unreachable and could be
+deleted. See [Correctness](#correctness).
 
 ## Requirements
 
@@ -258,11 +259,16 @@ not make the scheduler slightly less precise — it switches its protection off.
 a transaction on its own is what keeps it correct. (Before this was fixed, a pair of such
 transactions produced non-serializable results in 198 of 200 contended runs.)
 
-Measured cost: **−41%** throughput against the same workload before the fix (6,332 → 3,756
-ops/s), which is about 56% of what a comparable transaction with a fully-known footprint
-achieves. Ordinary workloads pay 1–7%; a data-dependent key (below) pays 12%. See
-[benchmarks](benchmarks/README.md), and read its opening before trusting any number you
-produce there yourself.
+Measured cost: **−34%** throughput against the same workload before the fix (7,244 → 4,759
+ops/s), which is about 58% of what a comparable transaction with a fully-known footprint
+achieves. A data-dependent key (below) costs **−10%**.
+
+**Nothing else got slower.** The commit path is in fact **6% faster** than it was before any of
+this correctness work, and a whole-map read plus insert is **13% faster** — because the same
+work that added H6's coverage check also proved the older commit-time *dirty* check could never
+fire, and deleting that was worth more than the coverage check costs. See
+[benchmarks](benchmarks/README.md), and read its opening before trusting any number you produce
+there yourself: it leads with the two ways these measurements have already been got wrong.
 
 ### Avoiding it
 
