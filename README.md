@@ -76,8 +76,8 @@ object QuickStart extends IOApp.Simple {
 ```
 
 All three imports are needed. `syntax.all._` is what brings `.get` / `.set` / `.modify` / `.commit`
-into scope; without it you get a `get is not a member` error rather than a missing-import one,
-because the runtime's own `private[stm]` members shadow the extension methods.
+into scope; without it `.get` fails with a `cannot be accessed` error rather than a missing-import
+one, because the runtime's own `private[stm]` members shadow the extension methods.
 
 ## API Reference
 
@@ -105,7 +105,7 @@ because the runtime's own `private[stm]` members shadow the extension methods.
 | `STM[IO].waitFor(value > 10)` | Semantically blocks a transaction until a condition is met | `def waitFor(predicate: => Boolean): Txn[Unit]` | No thread is blocked. **The predicate's inputs must be read from a `TxnVar`/`TxnVarMap` inside the same transaction** — see [How `waitFor` wakes up](#how-waitfor-wakes-up). A predicate that *throws* aborts the transaction rather than retrying it. |
 | `txnVar.setF(Async[F].pure(100))` | Sets value via an effect `F[V]` | `def setF(newValue: F[V]): Txn[Unit]` | Requires `syntax.all._` import |
 | `txnVar.modifyF(v => Async[F].pure(v + 1))` | Modifies value via an effectful function | `def modifyF(f: V => F[V]): Txn[Unit]` | Requires `syntax.all._` import |
-| `txnVarMap.set(Async[F].pure(Map("k" -> 1)))` | Sets map state via an effect | `def set(newValueMap: F[Map[K, V]]): Txn[Unit]` | Requires `syntax.all._` import |
+| `txnVarMap.setF(Async[F].pure(Map("k" -> 1)))` | Sets map state via an effect | `def setF(newValueMap: F[Map[K, V]]): Txn[Unit]` | Requires `syntax.all._` import |
 | `txnVarMap.modifyF(m => Async[F].pure(m))` | Modifies map via an effectful function | `def modifyF(f: Map[K,V] => F[Map[K,V]]): Txn[Unit]` | Requires `syntax.all._` import |
 | `txnVarMap.setF(key, Async[F].pure(100))` | Upserts key-value via an effect | `def setF(key: => K, newValue: F[V]): Txn[Unit]` | Requires `syntax.all._` import |
 | `txnVarMap.modifyF(key, v => Async[F].pure(v))` | Modifies key-value via an effectful function | `def modifyF(key: => K, f: V => F[V]): Txn[Unit]` | Requires `syntax.all._` import |
@@ -117,9 +117,9 @@ methods (`.get`, `.set`, `.modify`, `.commit`, and the `F`-variants) come from
 `import ai.entrolution.bengal.stm.syntax.all._`. An implicit `STM[F]` in scope is **not**
 enough on its own; you need the import.
 
-**On effectful arguments.** The `F`-variants (`setF`, `modifyF`, `handleErrorWithF`, and the
-`F[_]` overloads of `set`) and the `delay`/`fromF` combinators **must not encapsulate side
-effects** — but their evaluation frequencies differ. `delay`/`fromF` thunks run in **both**
+**On effectful arguments.** The `F`-variants (`setF`, `modifyF`, `handleErrorWithF`) and the
+`delay`/`fromF` combinators **must not encapsulate side effects** — but their evaluation
+frequencies differ. `delay`/`fromF` thunks run in **both**
 passes of every executed attempt that reaches them (the analysis pass and the log run), and
 again on every retry; a flow already terminated at a `waitFor` retry or `abort` reaches them in
 neither pass. The `F`-variant setter values are **not** forced during analysis: they run once

@@ -169,6 +169,26 @@ class TxnVarMapSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers with Ei
       }
         .asserting(_ shouldBe Some(25))
     }
+
+    "throw an error when modifying a key removed earlier in the same transaction" in {
+      withRuntime { implicit stm =>
+        for {
+          tVarMap <- TxnVarMap.of(baseMap)
+          result <- (for {
+                      _ <- tVarMap.remove("baz")
+                      _ <- tVarMap.modify("baz", _ + 1)
+                    } yield ()).commit.attempt
+          mapAfter <- tVarMap.get.commit
+        } yield (result, mapAfter)
+      }
+        .asserting { case (result, mapAfter) =>
+          result.left.value shouldBe a[RuntimeException]
+          result.left.value.getMessage should include("not found for modification")
+          // The raise fails the whole transaction: the remove rolls back too,
+          // rather than the modify resurrecting the deleted key.
+          mapAfter shouldBe baseMap
+        }
+    }
   }
 
   "TxnVarMap.remove(key)" - {
