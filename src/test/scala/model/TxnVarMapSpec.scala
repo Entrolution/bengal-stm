@@ -206,6 +206,97 @@ class TxnVarMapSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers with Ei
       }
         .asserting(_ shouldBe None)
     }
+
+    "throw an error when removing a key twice in the same transaction" in {
+      withRuntime { implicit stm =>
+        for {
+          tVarMap <- TxnVarMap.of(baseMap)
+          result <- (for {
+                      _ <- tVarMap.remove("baz")
+                      _ <- tVarMap.remove("baz")
+                    } yield ()).commit.attempt
+          mapAfter <- tVarMap.get.commit
+        } yield (result, mapAfter)
+      }
+        .asserting { case (result, mapAfter) =>
+          result.left.value shouldBe a[RuntimeException]
+          result.left.value.getMessage should include("non-existent key")
+          // The raise fails the whole transaction: the first remove rolls back too.
+          mapAfter shouldBe baseMap
+        }
+    }
+
+    "throw an error when removing an entry created and removed in the same transaction" in {
+      withRuntime { implicit stm =>
+        for {
+          tVarMap <- TxnVarMap.of(baseMap)
+          result <- (for {
+                      _ <- tVarMap.set("foobar", 22)
+                      _ <- tVarMap.remove("foobar")
+                      _ <- tVarMap.remove("foobar")
+                    } yield ()).commit.attempt
+        } yield result
+      }
+        .asserting { result =>
+          result.left.value shouldBe a[RuntimeException]
+          result.left.value.getMessage should include("non-existent key")
+        }
+    }
+
+    // remove is documented to fail the transaction when the key is absent (the
+    // README operations table and the syntax scaladoc both say so). A prior read
+    // of the absent key records a log entry for it, and that entry must not mask
+    // the absence: probe-then-remove fails exactly like a plain remove-of-absent.
+    "throw an error when removing an absent key that was read in the same transaction" in {
+      withRuntime { implicit stm =>
+        for {
+          tVarMap <- TxnVarMap.of(baseMap)
+          result <- (for {
+                      _ <- tVarMap.get("foobar")
+                      _ <- tVarMap.remove("foobar")
+                    } yield ()).commit.attempt
+        } yield result
+      }
+        .asserting { result =>
+          result.left.value shouldBe a[RuntimeException]
+          result.left.value.getMessage should include("non-existent key")
+        }
+    }
+
+    "re-insert a key removed earlier in the same transaction" in {
+      withRuntime { implicit stm =>
+        for {
+          tVarMap <- TxnVarMap.of(baseMap)
+          result <- (for {
+                      _           <- tVarMap.remove("baz")
+                      _           <- tVarMap.set("baz", 99)
+                      innerResult <- tVarMap.get("baz")
+                    } yield innerResult).commit
+          mapAfter <- tVarMap.get.commit
+        } yield (result, mapAfter)
+      }
+        .asserting { case (result, mapAfter) =>
+          result shouldBe Some(99)
+          mapAfter shouldBe Map("foo" -> 42, "bar" -> 27, "baz" -> 99)
+        }
+    }
+
+    // The absent-key failure keys on the entry's current value, not on "a remove
+    // happened earlier": a remove of the re-inserted value succeeds cleanly.
+    "remove a key re-inserted after an earlier remove in the same transaction" in {
+      withRuntime { implicit stm =>
+        for {
+          tVarMap <- TxnVarMap.of(baseMap)
+          _ <- (for {
+                 _ <- tVarMap.remove("baz")
+                 _ <- tVarMap.set("baz", 99)
+                 _ <- tVarMap.remove("baz")
+               } yield ()).commit
+          result <- tVarMap.get.commit
+        } yield result
+      }
+        .asserting(_ shouldBe Map("foo" -> 42, "bar" -> 27))
+    }
   }
 
   "concurrent new-key operations" - {

@@ -816,12 +816,16 @@ private[stm] trait TxnLogContext[F[_]] {
     // The user-facing keyed write: map.set(k, v) and map.remove(k).
     //
     // Same rule as writeVarMapValueEntry -- if the new value differs from the initial,
-    // record an update -- with ONE deliberate difference at the bottom: removing a key that
-    // is not there FAILS the transaction, because the user asked to delete something that
-    // does not exist and STM.scala says so. writeVarMapValueEntry returns None for the same
-    // input instead, and that is not a contradiction: it serves setVarMap's internal diff,
-    // where a key absent from both the old and the new map is simply not a change. The two
-    // used to be written far apart, and it was easy to read them as opposite policies.
+    // record an update -- with ONE deliberate difference: removing a key that is not
+    // there FAILS the transaction, because the user asked to delete something that does
+    // not exist and STM.scala says so. As in modifyVarMapValue, "not there" is a fact
+    // about the key's logical VALUE, not about log-entry existence: a key removed
+    // earlier in this transaction, or recorded absent by a read, has an entry whose
+    // value is None -- and removing it fails exactly like removing a key that never
+    // existed. writeVarMapValueEntry returns None for the same input instead, and that
+    // is not a contradiction: it serves setVarMap's internal diff, where a key absent
+    // from both the old and the new map is simply not a change. The two used to be
+    // written far apart, and it was easy to read them as opposite policies.
     //
     // NULL VALUES are preserved end to end: a stored null reads back as Some(null) — the
     // key is present, its value is null — and only a genuinely absent key reads as None.
@@ -833,6 +837,17 @@ private[stm] trait TxnLogContext[F[_]] {
       newOpt: Option[F[V]],
       txnVarMap: TxnVarMap[F, K, V]
     ): F[TxnLog] = {
+      // Removing a logically absent key fails the transaction — raised (not
+      // state-threaded) so the trailing handleErrorWith(raiseError) wraps it and
+      // an enclosing TxnHandleError can recover it like any other error. One def
+      // for both absent shapes below, so the policy and message cannot drift.
+      def raiseRemoveAbsent(materializedKey: K): F[TxnLog] =
+        Async[F].raiseError[TxnLog](
+          new RuntimeException(
+            s"Tried to remove non-existent key $materializedKey in transactional map"
+          )
+        )
+
       val resultSpec = for {
         materializedKey    <- key
         materializedNewOpt <- newOpt.traverse(identity)
@@ -840,9 +855,17 @@ private[stm] trait TxnLogContext[F[_]] {
         (rid, oTxnVar, oEntry) = resolved
         result <- oEntry match {
                     case Some(entry) =>
-                      Async[F].delay(
-                        TxnLogValid(log + (rid -> entry.set(materializedNewOpt))): TxnLog
-                      )
+                      (materializedNewOpt, entry.get) match {
+                        // Remove of a key this transaction already holds as absent
+                        // (removed earlier, or read while absent): the entry's value
+                        // is None, so the key is logically not there to remove.
+                        case (None, None) =>
+                          raiseRemoveAbsent(materializedKey)
+                        case _ =>
+                          Async[F].delay(
+                            TxnLogValid(log + (rid -> entry.set(materializedNewOpt))): TxnLog
+                          )
+                      }
 
                     case None =>
                       oTxnVar match {
@@ -881,16 +904,9 @@ private[stm] trait TxnLogContext[F[_]] {
                                 ): TxnLog
                               )
 
-                            // Remove of a key that is not there. Fails the transaction —
-                            // raised (not state-threaded) so the trailing
-                            // handleErrorWith(raiseError) wraps it and an enclosing
-                            // TxnHandleError can recover it like any other error.
+                            // Remove of a key that is not there.
                             case None =>
-                              Async[F].raiseError[TxnLog](
-                                new RuntimeException(
-                                  s"Tried to remove non-existent key $materializedKey in transactional map"
-                                )
-                              )
+                              raiseRemoveAbsent(materializedKey)
                           }
                       }
                   }

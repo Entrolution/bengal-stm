@@ -155,6 +155,24 @@ class StmApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers with StmSu
         .asserting(_ should include("missing"))
     }
 
+    "handleErrorWith recovers a remove of a key this transaction already removed" in {
+      withRuntime { implicit stm =>
+        for {
+          tVarMap <- TxnVarMap.of(Map("k" -> 1))
+          _ <- (for {
+                 _ <- tVarMap.remove("k")
+                 _ <- tVarMap
+                        .remove("k")
+                        .handleErrorWith(_ => STM[IO].unit)
+               } yield ()).commit
+          after <- tVarMap.get.commit
+        } yield after
+      }
+        // Recovery runs against the PRE-BLOCK log, which already stages the first
+        // remove: the transaction commits with the key deleted exactly once.
+        .asserting(_ shouldBe Map.empty[String, Int])
+    }
+
     "handleErrorWith recovers a modify of an absent key" in {
       withRuntime { implicit stm =>
         for {
