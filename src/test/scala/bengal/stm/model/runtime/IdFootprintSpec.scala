@@ -126,6 +126,32 @@ class IdFootprintSpec extends AnyFreeSpec with Matchers {
       fp.isValidated shouldBe false
       fp.getValidated.isValidated shouldBe true
     }
+
+    "is reset by every content-changing op, and only those" in {
+      val validated = IdFootprint(readIds = Set(id1), updatedIds = Set(id2)).getValidated
+      validated.isValidated shouldBe true
+      validated.addReadId(id3).isValidated shouldBe false
+      validated.addWriteId(id3).isValidated shouldBe false
+      validated.mergeWith(IdFootprint(readIds = Set(id3), updatedIds = Set.empty)).isValidated shouldBe false
+      // A VALIDATED argument must not smuggle its flag into the merge result:
+      // two validated halves can still cross-overlap, so their union is
+      // unvalidated no matter what either flag said.
+      validated
+        .mergeWith(IdFootprint(readIds = Set(id3), updatedIds = Set(id1)).getValidated)
+        .isValidated shouldBe false
+      // markUnderApproximated alone preserves the flag: it changes no content,
+      // and validation carries the under flag through.
+      validated.markUnderApproximated.isValidated shouldBe true
+    }
+
+    "re-validates content added after a validation" in {
+      // A read equal to an existing write arrives AFTER validation: were the
+      // memo flag carried through the mutation, the second getValidated would
+      // short-circuit and the overlapping read would survive undeduped.
+      val validated = IdFootprint(readIds = Set(id1), updatedIds = Set(id2)).getValidated
+      val mutated   = validated.addReadId(id2)
+      mutated.getValidated.readIds shouldBe Set(id1)
+    }
   }
 
   "isCompatibleWith" - {

@@ -19,9 +19,9 @@
  *     Modelled as [reads |-> set of ids, updates |-> set of ids]. The Scala
  *     `isValidated` boolean is a memoisation flag, not semantics. The
  *     ValidatedIdempotent lemma (FootprintLemmas.tla) covers its
- *     re-application half; the other half is call-site discipline, since
- *     the Scala mutators copy the flag through (see the IdFootprint.scala
- *     anchor).
+ *     re-application half; the other half is structural — the Scala
+ *     mutators reset the flag, forcing re-validation after any content
+ *     change (see the IdFootprint.scala anchor).
  *
  * Runtime IDs in the real system are Longs issued by one global allocator
  * (TxnStateEntity.runtimeId, TxnVarMap.getRuntimeId), so distinct entities

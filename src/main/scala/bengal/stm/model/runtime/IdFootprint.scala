@@ -44,11 +44,11 @@ private[stm] case class IdFootprint(
 
   // SPEC: LemmaValidatedIdempotent — one application of this transform is a
   // fixpoint (FootprintLemmas.tla checks it exhaustively), which makes the
-  // isValidated short-circuit sound ON RE-APPLICATION. The flag's full
-  // soundness also needs call-site discipline: addReadId/addWriteId/mergeWith
-  // copy isValidated through unchanged, so a validated footprint that is
-  // subsequently mutated would skip re-validation (today's call sites never
-  // do that — validation happens last, in the runtime).
+  // isValidated short-circuit sound ON RE-APPLICATION. The other half is
+  // structural rather than disciplinary: addReadId/addWriteId/mergeWith reset
+  // isValidated, so a footprint mutated after validation re-validates instead
+  // of trusting a stale dedup. (Today's call sites validate last anyway; the
+  // reset is what makes that an invariant instead of a convention.)
   //
   // The copy below is also the only reason isUnderApproximated survives
   // validation, and the runtime compares VALIDATED footprints everywhere. Build
@@ -76,16 +76,20 @@ private[stm] case class IdFootprint(
 
   private[stm] lazy val readRawIds: Set[Long] = readIds.map(_.value)
 
+  // Content changes reset the validation memo: new ids may overlap the write
+  // set, so the result must earn its isValidated short-circuit through a fresh
+  // getValidated, not inherit it.
   private[stm] def addReadId(id: TxnVarRuntimeId): IdFootprint =
-    this.copy(readIds = readIds + id)
+    this.copy(readIds = readIds + id, isValidated = false)
 
   private[stm] def addWriteId(id: TxnVarRuntimeId): IdFootprint =
-    this.copy(updatedIds = updatedIds + id)
+    this.copy(updatedIds = updatedIds + id, isValidated = false)
 
   private[stm] def mergeWith(idScope: IdFootprint): IdFootprint =
     this.copy(
-      readIds    = readIds ++ idScope.readIds,
-      updatedIds = updatedIds ++ idScope.updatedIds,
+      readIds     = readIds ++ idScope.readIds,
+      updatedIds  = updatedIds ++ idScope.updatedIds,
+      isValidated = false,
       // Incompleteness is contagious: a merge is only as trustworthy as its
       // least trustworthy half.
       isUnderApproximated = isUnderApproximated || idScope.isUnderApproximated
@@ -94,6 +98,10 @@ private[stm] case class IdFootprint(
   // The static analysis could not see the whole access set. Everything after
   // the throw point in the free recursion went unrecorded, so what we hold is a
   // subset of the truth and must not be trusted as if it were the truth.
+  //
+  // Alone among the mutators this PRESERVES isValidated: it changes no read or
+  // write content, and validation only dedupes reads and carries this flag
+  // through — a validated footprint is still a fixpoint after marking.
   private[stm] def markUnderApproximated: IdFootprint =
     this.copy(isUnderApproximated = true)
 

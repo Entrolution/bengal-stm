@@ -14,9 +14,9 @@ verdicts**.
 - The exact `isCompatibleWith` / `getValidated` semantics, encoded once in
   `common/Footprint.tla` and shared by every other spec
 - Algebraic lemmas: symmetry, validation idempotence (the re-application
-  half of the `isValidated` flag's soundness — the other half is call-site
-  discipline, see the `IdFootprint.scala` anchor), validation monotonicity,
-  writer self-incompatibility
+  half of the `isValidated` flag's soundness — the other half is structural:
+  the mutators reset the flag, see the `IdFootprint.scala` anchor),
+  validation monotonicity, writer self-incompatibility
 - The full parent-hierarchy conflict matrix, including the **H5 fix**: a
   parent-structure READ now conflicts with a child-entry WRITE (whole-map
   read vs new-key insert) while parent-read vs child-read stays compatible —
@@ -376,7 +376,7 @@ Every anchor below sits at a **fix site**. No expected-red rows remain.
 
 | Anchor | Source site | How TLC checks it | Status at anchor |
 |--------|-------------|-------------------|------------------|
-| `LemmaValidatedIdempotent` | `src/main/scala/bengal/stm/model/runtime/IdFootprint.scala` | named `ASSUME` in `FootprintLemmas.tla` | one `getValidated` application is a fixpoint — HOLDS, which is what makes the memoisation flag sound |
+| `LemmaValidatedIdempotent` | `src/main/scala/bengal/stm/model/runtime/IdFootprint.scala` | named `ASSUME` in `FootprintLemmas.tla` | one `getValidated` application is a fixpoint — HOLDS; together with the mutators resetting the flag, this is what makes the memoisation short-circuit sound |
 | `DocumentsParentReadChildWriteCaught` | `src/main/scala/bengal/stm/model/runtime/IdFootprint.scala` | named `ASSUME` in `FootprintLemmas.tla` | the relation's third conjunct conflicts child writes with parent reads — the H5 fix |
 | `LemmaCoverageIsSound` | `src/main/scala/bengal/stm/model/runtime/IdFootprint.scala` (`covers`) | named `ASSUME` in `FootprintLemmas.tla`, exhaustive over ordered **triples** of complete footprints | coverage implies Contract C carries from the declared footprint to the actual one — HOLDS, and it is the load-bearing half of the H6 fix. The other half is not checked here: `covers` is only sound if `actual` is a log footprint and therefore complete by construction, which is a claim about the Scala, not the model |
 
