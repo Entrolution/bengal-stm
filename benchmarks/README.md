@@ -6,8 +6,8 @@ What did the correctness fixes cost?
 sbt 'benchmarks/Jmh/run .*StmThroughputBench.*'
 ```
 
-The defaults in `StmThroughputBench` **are** the protocol used below (`-f5 -wi 5 -i 10`), so a
-bare run reproduces this table. The benchmarks module is **not aggregated** into the root
+The defaults in `StmThroughputBench` **are** the protocol used below (`-f5 -wi 5 -i 10`) — but
+the tables themselves are historical since the harness rework; see the banner under Results. The benchmarks module is **not aggregated** into the root
 project, so `sbt test` and CI never build it.
 
 ## Read this before trusting any number you produce here
@@ -57,12 +57,31 @@ Three trees, four phases, one box: **A → B → C → A**.
 Every fix was `private[stm]`, so the same benchmark compiles unchanged against all three, and
 only `src/main` is swapped.
 
-`@OperationsPerInvocation(32)` on the six batched benchmarks makes JMH report per-**transaction**
-throughput, so all seven are comparable. (`uncontendedCommit` runs one transaction per invocation
-and needs no annotation.) That `32` is written literally and must track `Batch`; change one
-without the other and every number here is silently wrong by the ratio.
+`@OperationsPerInvocation(32)` on the batched benchmarks makes JMH report per-**transaction**
+throughput, so they are comparable with each other. (`uncontendedCommit` runs one transaction per
+invocation and needs no annotation; `dataDependentKey` declares **33**, because its keySrc bump is
+a 33rd real commit inside the timed region that must stay concurrent with the readers.) That `32`
+is written literally and must track `Batch`; change one without the other and every number here is
+silently wrong by the ratio.
+
+**One comparability caveat**: `uncontendedCommit` is driven synchronously from the JMH worker
+thread — one `unsafeRunSync` per transaction, no fiber fan-out — while every batched benchmark
+amortizes 1/32 of a batch-sized fan-out's spawn/join into each reported per-transaction figure. Cross-benchmark ratios against the baseline therefore conflate scheduler
+admission cost with fiber-orchestration cost — compare batched rows with batched rows, and treat
+`x / uncontendedCommit` ratios as indicative only.
 
 ## Results
+
+> **These tables are HISTORICAL as of the harness rework.** Three workloads changed underneath
+> their rows — `mapWriteConcurrent` now measures steady-state *inserts* with a two-owner write
+> set (it used to degenerate to per-key updates after two invocations), `underDeclaredConcurrent`
+> is bounded (the same-transaction remove keeps `scratch` empty; the old shape's unbounded growth
+> biased the −34% cliff with GC drag), and `dataDependentKey` is credited at 33 ops — plus
+> `crossMapInsert` is new with no baseline, `@Threads(1)` is pinned, and the map-entry id cost
+> model changed since measurement (see "The optimisation that came out of this"). The numbers
+> below remain a faithful record of what was measured **with the pre-rework harness on the
+> pre-rework cost model**; re-measurement on a dedicated box with the full A→B→C→A protocol is
+> pending, and no current-tree number should be quoted from this table.
 
 Dedicated AMD Ryzen 9 5950X (16 cores), JDK 21.0.11. `-f5 -wi 5 -i 10`, except
 `uncontendedCommit` at `-f20`. Per-transaction ops/s, ± the 99.9% CI. `after` is the mean of the
@@ -135,7 +154,7 @@ UUID hash for a map entry (since replaced by a registry lookup that allocates on
 first touch, which lowers the per-entry cost further) — so there was nothing to overlap and the
 fibers were pure overhead. A whole-map read expands into one log entry *per key*, so the fiber
 count tracked the map size. Switching to `traverse` is part of why `wholeMapReadPlusInsert` is
-now faster than the baseline rather than 21% slower.
+faster than the baseline rather than 21% slower in the published (pre-rework) measurement.
 
 The laptop measured that same change as making things *worse across the board*. It was throttling.
 
@@ -143,3 +162,12 @@ The laptop measured that same change as making things *worse across the board*. 
 that it is stable *and* that it can resolve the effect you intend to report. That is the same
 discipline the TLA+ negative controls and the soaks' fix-reversion checks apply everywhere else in
 this project, and it is the reason two of the three tables above have a drift column.
+
+## Known, accepted contamination
+
+Unjoined scheduler fibers — wake sweeps spawned at submission, unsub cascades spawned at
+completion — can still be draining when an invocation's timer stops, bleeding CPU into the next
+invocation's window. There is no quiescence API to await them. The tail is bounded (the fibers
+close over the finished runtime and touch only bookkeeping), believed below the noise floor at
+these scales, and recorded here so the next dedicated-box session can verify that rather than
+assume it.

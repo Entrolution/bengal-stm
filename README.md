@@ -271,9 +271,11 @@ achieves. A data-dependent key (below) costs **−10%**.
 **Nothing else got slower.** The commit path is in fact **6% faster** than it was before any of
 this correctness work, and a whole-map read plus insert is **13% faster** — because the same
 work that added H6's coverage check also proved the older commit-time *dirty* check could never
-fire, and deleting that was worth more than the coverage check costs. See
-[benchmarks](benchmarks/README.md), and read its opening before trusting any number you produce
-there yourself: it leads with the two ways these measurements have already been got wrong.
+fire, and deleting that was worth more than the coverage check costs. (All of these figures were
+measured with the pre-rework harness; the benchmark tables are historical pending re-measurement
+— see the banner in [benchmarks](benchmarks/README.md).) Read that README's opening before
+trusting any number you produce there yourself: it leads with the two ways these measurements
+have already been got wrong.
 
 ### Avoiding it
 
