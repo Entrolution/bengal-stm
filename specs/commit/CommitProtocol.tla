@@ -1,15 +1,16 @@
 --------------------------- MODULE CommitProtocol ---------------------------
 (*
- * Spec A: the bengal-stm commit protocol — withLock / isDirty / commit.
+ * Spec A: the bengal-stm commit protocol — withLock / coverage / commit.
  * Scala correspondence: TxnLogContext.scala (TxnLogValid.withLock,
- * TxnLogValid.isDirty, TxnLogValid.commit, TxnLogEntry.lock) and
- * TxnRuntimeContext.scala (AnalysedTxn.commit's dispatch). Actions cite
+ * TxnLogValid.commit, TxnLogEntry.lock) and TxnRuntimeContext.scala
+ * (AnalysedTxn.commit's dispatch and coversActualFootprint). Actions cite
  * method names, never line numbers — line refs rot and verify_anchors.sh
  * cannot guard them.
  *
  * SCOPE: the log run (read phase), lock resolution, lock acquisition, the
- * commit-time dirty check, the commit-time COVERAGE check (CoverageOk — the
- * H6 fix), publish, release, and the refinement path that both checks share.
+ * commit-time COVERAGE check (CoverageOk — the H6 fix; the commit-time dirty
+ * check it subsumed survives only as the ghost IsDirty), publish, release,
+ * and the refinement path.
  * The SCHEDULER is not modelled — it is ASSUMED, as Contract C:
  *
  *     Contract C: no two transactions whose DECLARED footprints are
@@ -191,22 +192,25 @@
  *       (`.distinct` keeps first occurrence — so two entries aliasing to one
  *       map lock acquire it once, which is what stops a 1-permit Semaphore
  *       self-deadlocking). This is where H2's cycle forms.
- *   A4. The dirty check (isDirty) is ONE step, and it needs LESS than the
- *       premise above. It reads WRITE-SET entities only (read-only entries
- *       hardcode isDirty = false); a transaction holds a lock on every entity
- *       it writes; and any transaction whose publish could move one of those
- *       entities holds THE SAME lock, so nothing the check reads can move
- *       while it runs — whatever the footprints happen to say. That the lock
- *       identity cannot go stale between resolution and use is not assumed
- *       either: LockOwnerStable pins it. The one aliasing case the lock leg
- *       does not cover — a structure WRITER against a child writer, whose
- *       publishes move the same version while holding different locks — is
- *       conjunct 2 of the relation and so is Contract-C-excluded; and no
- *       catalogued transaction writes a structure at all, setVarMap being
- *       barred by the scenario precondition below.
- *       The COVERAGE half of the same guard reads no shared state whatsoever:
- *       declared[t] moves only on t's own restart and ActualFP is a constant.
- *       Collapsing that is not a reduction.
+ *   A4. The dirty check is now a GHOST (IsDirty — read only by the
+ *       CoverageSubsumesDirty invariant), but its one-step evaluation rests
+ *       on the same argument it always did, and the invariant is meaningful
+ *       only because that argument holds. It reads WRITE-SET entities only
+ *       (read-only entries hardcode isDirty = false); a transaction holds a
+ *       lock on every entity it writes; and any transaction whose publish
+ *       could move one of those entities holds THE SAME lock, so nothing the
+ *       ghost reads can move while it is evaluated — whatever the footprints
+ *       happen to say. That the lock identity cannot go stale between
+ *       resolution and use is not assumed either: LockOwnerStable pins it.
+ *       The one aliasing case the lock leg does not cover — a structure
+ *       WRITER against a child writer, whose publishes move the same version
+ *       while holding different locks — is conjunct 2 of the relation and so
+ *       is Contract-C-excluded; and no catalogued transaction writes a
+ *       structure at all, setVarMap being barred by the scenario
+ *       precondition below.
+ *       The COVERAGE check reads no shared state whatsoever: declared[t]
+ *       moves only on t's own restart and ActualFP is a constant. Collapsing
+ *       that is not a reduction.
  *   A5. Publish (log.commit) is ONE step — the refinement obligation the
  *       two-spec split owes, now DISCHARGED. This one needs the FULL premise,
  *       and in its strongest form: no concurrent transaction may so much as
@@ -265,11 +269,8 @@
  * incompatible, hence serialized by Contract C — so the second one's snapshot
  * always finds the key present and takes the version branch instead. It is
  * reachable only by combining maps WITH under-declaration, which no config
- * does. Nor is an insert-then-delete ABA representable at all: Publish only
- * ever sets keyExists TRUE, and TxnLogUpdateVarMapEntry.commit's delete path
- * (`case (Some(_), None) => txnVarMap.delete(key)`) is not modelled. Deletes
- * and the maps+fallback combination are the obvious next scenarios; until then
- * this paragraph is a scope statement, not a verified claim.
+ * does — the maps+fallback combination is an obvious next scenario, and until
+ * then this paragraph is a scope statement, not a verified claim.
  *
  * OUT OF SCOPE, deliberately:
  *   - The TxnLogRetry re-validation branch, as BEHAVIOUR. Its park/wake
@@ -279,6 +280,16 @@
  *     read-only transaction in the accurate config makes non-trivial. A
  *     model that "helpfully" re-validated reads before parking would mask
  *     the very gap that forced hasChangedSinceRead into existence.
+ *   - DELETES. Publish only ever sets keyExists TRUE, and the delete path of
+ *     TxnLogUpdateVarMapEntry.commit (`case (Some(_), None) =>
+ *     txnVarMap.delete(key)`) has no counterpart here. Consequences, stated
+ *     so they are not mistaken for verified claims: insert-then-delete ABA is
+ *     unrepresentable here; the delete-driven
+ *     dynamic lock-aliasing escape (a key deleted between log-build and
+ *     lock-resolution turning an entry lock into a map lock) is closed by the
+ *     Contract-C argument in the header ONLY as prose; and LockOwnerStable
+ *     cannot actually be violated in-model, so that pin is weaker evidence
+ *     than it reads. Deletes are the other obvious next scenario.
  *   - TxnVarMap.internalStructureLock (a leaf lock strictly below every
  *     commitLock modelled here). (Runtime-id distinctness is not an
  *     assumption to scope out: ids are allocator-issued and unique by
@@ -398,8 +409,8 @@ LockOfWrite(e, exists) ==
                 could still (pre-fix) wreck a correctly-declared peer's reads.
                 HISTORICAL: wwa+wwb both under-declared used to be H3's
                 contrast case — the fallback WAS caught when the conflict
-                landed on the write set, which the locks and the dirty check do
-                cover. The H3 fix serializes them, so that pair can no longer
+                landed on the write set, which the locks and the then-live
+                dirty check DID cover. The H3 fix serializes them, so that pair can no longer
                 collide and wwb is now unused. See CommitDirty.cfg, which had
                 to be rebuilt around ddw for exactly this reason.
      ddw      : declares a write to y, really writes x — DATA-DEPENDENT
@@ -434,7 +445,7 @@ ASSUME UnderDeclared \subseteq Txns
 (* The DECLARED footprint (StaticFP, what the analyser computes) and the     *)
 (* LOG footprint (ActualFP, what the transaction really touches) are         *)
 (* separate operators, because their divergence IS H3. But ActualFP still    *)
-(* does double duty: it is both the log's footprint (what a dirty restart    *)
+(* does double duty: it is both the log's footprint (what RefineAndRestart   *)
 (* refines to) and — via Writes(t) — the set of log entries that resolve a   *)
 (* lock. In the CODE, three operations break that correspondence:            *)
 (*                                                                           *)
@@ -532,15 +543,12 @@ Writes(t)   == ActualFP(t).updates
 Accessed(t) == CombinedIds(ActualFP(t))
 
 (* The read set CommitSnapshotValid ranges over: reads that are not also
-   writes (those are covered by isDirty) and are not under a parent this
-   transaction itself writes — exactly IdFootprint.getValidated. *)
+   writes (writes validate themselves — a peer that could move a written
+   entity must co-declare that write, and coverage plus Contract C keep such
+   a peer out of the window entirely; CoverageSubsumesDirty is exactly this
+   claim) and are not under a parent this transaction itself writes —
+   exactly IdFootprint.getValidated. *)
 ReadSet(t)  == Validated(ActualFP(t)).reads
-
-TxnRank(t) ==
-    CASE t = "h2a" -> 1 [] t = "h2b" -> 2 [] t = "h3a" -> 3 [] t = "h3b" -> 4
-      [] t = "h5a" -> 5 [] t = "h5b" -> 6 [] t = "wwa" -> 7 [] t = "wwb" -> 8
-      [] t = "pfa" -> 9 [] t = "pfb" -> 10 [] t = "ro" -> 11 [] t = "dbl" -> 12
-      [] t = "ddw" -> 13
 
 ---------------------------------------------------------------------------
 (* State *)
@@ -624,7 +632,8 @@ SortedWrites(t) ==
      - TxnLogUpdateVarMapEntry with initial = None (a NEW-KEY insert):
          oValue.isDefined — "does the key exist now", NOT "did the version
          move". An insert-then-delete since our snapshot therefore reads
-         CLEAN, and the model shows that rather than hiding it.
+         CLEAN — the operator encodes that faithfully, though deletes
+         themselves are out of scope here (see the header).
      - read-only entries: pure(false). Never consulted — Writes(t) only. *)
 EntryDirty(t, e) ==
     IF e \in MapEntries /\ ~snapEx[t][e]
@@ -641,7 +650,7 @@ IsDirty(t) == \E e \in Writes(t) : EntryDirty(t, e)
    exhaustively over every footprint triple) and the scheduling was sound. If it
    does not, the transaction was placed on a footprint that did not describe it —
    so it must ABORT WITHOUT PUBLISHING and re-run with the refined footprint,
-   exactly as the dirty path does.
+   exactly as the dirty path did.
 
    Aborting before the publish is what makes this work in BOTH directions: our
    undeclared write never lands, so a peer's unvalidated read of it stays valid;
@@ -875,9 +884,11 @@ AcquireDone(t) ==
                    pubCount, truncated>>
 
 ---------------------------------------------------------------------------
-(* Inside the lock region: ifM(log.isDirty)(None, log.commit.as(logValue)).
-   The dirty check ranges over the WRITE SET ONLY (A4) — read-only entries
-   hardcode isDirty = false. That is the hole H3 walks through. *)
+(* Inside the lock region: refine <- delay(!coversActualFootprint(actual));
+   ifM(refine)(None, log.commit.as(logValue)). Coverage quantifies over reads
+   and writes alike. The old dirty check ranged over the WRITE SET ONLY (A4)
+   — read-only entries hardcode isDirty = false — and that was the hole H3
+   walked through. *)
 ---------------------------------------------------------------------------
 
 (* CLEAN -> publish. readValid is stamped against the PRE-publish versions,
@@ -902,34 +913,25 @@ Publish(t) ==
    footprint from the ACTUAL log (freshIncarnation(refinement.getValidated)),
    and re-run via submitTxnForImmediateRetry.
 
-   BOTH failure modes arrive here, and the H6 fix changed what that is worth.
-   The DIRTY check reads the write set alone, so by itself it can only ever
-   self-correct a WRITE. The COVERAGE check quantifies over reads and writes
-   alike (see Covers), so an under-declared READ is caught here too — which it
-   never was before, and which is the whole reason a read-side defect could
-   survive the dirty machinery for as long as it did.
+   The COVERAGE check quantifies over reads and writes alike (see Covers), so an
+   under-declared READ is caught here — which the old commit-time DIRTY check
+   never did: it read the write set alone, so by itself it could only ever
+   self-correct a WRITE. That asymmetry is why a read-side defect could survive
+   the dirty machinery for as long as it did.
 
    WHO ACTUALLY REACHES THIS ACTION: only a transaction whose declared footprint
    diverged WITHOUT the analyser throwing. A FLAGGED transaction cannot — it
-   runs alone, so nothing moves underneath it and it is never dirty, and
-   CoverageOk short-circuits on the flag. DirtyRestart accordingly has ZERO
-   action coverage in every fallback config, and `ddw` is the only transaction in
-   the catalogue that ever gets here.
+   runs alone, so nothing moves underneath it, and CoverageOk short-circuits on
+   the flag. `ddw` is the only transaction in the catalogue that ever gets here.
 
-   THE ACTION IS SPLIT IN TWO, AND THE SPLIT IS THE POINT. Both restarts do the
-   same thing; only the guard differs, and the two guards are DISJOINT. That
-   costs nothing — IsDirty \/ (~IsDirty /\ ~CoverageOk) is exactly
-   NeedsRefinement, so the transition relation, the state count and every verdict
-   are unchanged — but it makes TLC's action coverage attribute each transition
-   to the trigger that CAUSED it.
-
-   Without the split, "DirtyRestart fires" was the stated non-vacuity evidence for
-   CommitDirty.cfg, and it had quietly stopped meaning what it claimed: `ddw`
-   under-declares unconditionally, so COVERAGE restarts it whether or not the
-   dirty check works at all. Delete the entire IsDirty disjunct and the config
-   still verified clean with DirtyRestart still firing. The check had become
-   untested, and nothing said so. Now a dead dirty check reads as DirtyRestart: 0,
-   and a dead coverage check reads as CoverageRestart: 0. *)
+   HISTORY: while the dirty check existed, refinement was eventually SPLIT into
+   two actions on disjoint guards (DirtyRestart on IsDirty, CoverageRestart on
+   the rest), so
+   TLC's action coverage would attribute each transition to the trigger that
+   CAUSED it. That split is how the dirty check was measured at one transition
+   and zero new states across the whole of Spec A — and then deleted; the full
+   record lives in CommitDirty.cfg. Only CoverageRestart remains, and a dead
+   coverage check reads as CoverageRestart: 0. *)
 RefineAndRestart(t) ==
     /\ lockHolder' = [l \in Locks |->
                         IF lockHolder[l] = t THEN "none" ELSE lockHolder[l]]
