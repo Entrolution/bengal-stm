@@ -273,10 +273,11 @@
  * then this paragraph is a scope statement, not a verified claim.
  *
  * OUT OF SCOPE, deliberately:
- *   - The TxnLogRetry re-validation branch, as BEHAVIOUR. Its park/wake
- *     consequences are Spec B's (H1). What Spec A owes it is the
- *     fidelity pin that it is VACUOUS for a pure reader — no locks, never
- *     dirty — and that is the NoLocksWithoutWrites invariant below, which a
+ *   - The TxnLogRetry arm, as BEHAVIOUR. Its park/wake consequences are
+ *     Spec B's (H1), and its coverage gate — the arm's only under-lock work
+ *     in the code — is modelled at Spec B's ExecCommit. What Spec A owes it
+ *     is the fidelity pin that a pure reader resolves NO locks and never
+ *     reports dirty — the NoLocksWithoutWrites invariant below, which a
  *     read-only transaction in the accurate config makes non-trivial. A
  *     model that "helpfully" re-validated reads before parking would mask
  *     the very gap that forced hasChangedSinceRead into existence.

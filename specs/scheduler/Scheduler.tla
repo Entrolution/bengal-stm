@@ -66,8 +66,13 @@
  * no-op, modelling decrements of dead refs); triggerUnsub fires exactly
  * once per incarnation (cascadeFired).
  *
- * Commit outcomes are TRUTHFUL rather than nondeterministic: dirty iff a
- * written var's version moved since this fiber's snapshot. A nondeterministic
+ * Commit outcomes are TRUTHFUL rather than nondeterministic: a transaction
+ * retries iff its predicate fails against this fiber's snapshot (refining
+ * instead of parking when its coverage gate fails); otherwise it publishes
+ * iff its declared footprint covers its LOGGED one (the code's coverage
+ * gate — the commit-time dirty check is gone), and refines otherwise, with
+ * the per-arm under-flag asymmetry mirrored from the code at ExecCommit. A
+ * nondeterministic
  * failure can strike the commit (before publish — a mid-publish throw is
  * inside the atomic-commit abstraction and out of scope here) or the dispatch
  * of a dirty resubmission, modelling `execute`'s handleErrorWith: it runs
@@ -97,8 +102,10 @@ EXTENDS Footprint, Integers, FiniteSets, Sequences
 
 CONSTANTS
     Txns,            \* the scenario's transaction set (see the catalogue below)
-    MaxInc,          \* dirty-resubmission bound per txn (action-level
-                     \* truncation: ExecResubTruncate retires the fiber)
+    MaxInc,          \* incarnation bound per txn — consumed by every
+                     \* resubmission road (refinement, retry-with-downstream,
+                     \* sweep wakes); action-level truncation at
+                     \* ExecResubTruncate and SweepWake's truncatedWake
     MaxVer,          \* version bound per var (CONSTRAINT backstop)
     AbortsEnabled    \* enable the nondeterministic failure injections
 
@@ -160,9 +167,9 @@ LoggedFP(t) ==
       [] OTHER    -> ActualFP(t)
 
 (* Declared base footprints. t1's declared footprint is EMPTY while it really
-   writes V1, so t1 and t2 are judged compatible, run concurrently, collide on
-   V1, and one of them goes dirty — which is what opens the H4 window. tr/tw
-   declare accurately.
+   writes V1, so t1 and t2 are judged compatible and run concurrently; t1's
+   footprint then fails the coverage gate at commit and it refines and
+   resubmits — which is what opens the H4 window. tr/tw declare accurately.
 
    WHAT t1 MODELS CHANGED WITH THE H3 FIX (2026-07-11), and the distinction
    matters. It used to model the static-analysis FALLBACK: the walker threw and
@@ -597,8 +604,9 @@ ExecAdmit(t, s) ==
 (* Log construction abstracted to one snapshot of the footprint's versions,
    PER FIBER — each execute run builds a private log in the code, so
    concurrent fibers of one txn capture independent initial values. Spec A
-   refines read-time granularity; Spec B needs the snapshot only to make
-   the dirty outcome truthful. *)
+   refines read-time granularity; Spec B needs the snapshot for the retry
+   decision (RetryPred evaluates against it) and the park-time staleness
+   check — the coverage gate itself is snapshot-free. *)
 ExecSnapshot(t, s) ==
     /\ exec[<<t, s>>].pc = "snap"
     /\ snap' = [snap EXCEPT ![<<t, s>>] = [v \in VarIds |-> version[v]]]
@@ -607,23 +615,70 @@ ExecSnapshot(t, s) ==
                    declared, publishedInc, doublePub, cascadeFired,
                    droppedSpawn, submitVars, unsubW, schedVars, retryVars>>
 
-(* The atomic commit: dirty iff a written var moved since the snapshot
-   (models the commit pipeline withLock{isDirty}/commit, at
-   Spec B's granularity). Publish = bump every written var. *)
+(* The atomic commit, at Spec B's granularity: COVERAGE decides refinement,
+   mirroring AnalysedTxn.commit — the commit-time dirty check is gone from
+   the code, and a transaction publishes iff its declared footprint covers
+   what the run really LOGGED. Both of the code's arms fold over the log
+   (log.idFootprint), so the check is modelled over LoggedFP per the
+   standing rule (specs/README.md): a check that mirrors a fold over the
+   log must read what the log RECORDS, not what the transaction touches.
+
+   THE UNDER-APPROXIMATION FLAG POINTS OPPOSITE WAYS ON THE TWO ARMS,
+   faithfully to the code: on the commit arm the flag SHORT-CIRCUITS TO
+   PUBLISH (coversActualFootprint — a flagged transaction ran alone, so
+   nothing moved under it and a coverage lap could teach it nothing); on
+   the retry arm the flag FORCES REFINEMENT (the TxnLogRetry arm — a
+   flagged park is incompatible with everything and would be woken by
+   every commit in the system). Neither `.under` disjunct is exercised by
+   the current catalogue — no Spec B transaction is under-approximated —
+   they are written out so the asymmetry is stated rather than left
+   discoverable. In fact the WHOLE refine-instead-of-park arm never fires
+   with this catalogue: both retry transactions declare footprints that
+   cover their logs (tr exactly; tm from above — declared strictly wider
+   than logged), so, like ExecResubTruncate, that branch has zero action
+   coverage today. The missing witness is a retry transaction whose
+   declared footprint misses a logged read. One fidelity note for that
+   future scenario: the code's retry arm folds the log AS OF THE RETRY
+   THROW — a prefix of the full run — while LoggedFP here describes the
+   full-run log. Covers is monotone in the actual side, so this model can
+   only refine MORE eagerly than the code, never less — the unsafe
+   direction for a park check (a model that refines where the code parks
+   never explores those parked interleavings); a retry scenario with
+   post-retry-point accesses must add a prefix-log operator
+   (RetryLoggedFP) rather than reuse LoggedFP.
+
+   The refine outcome keeps the historical out-label "dirty": every
+   downstream consumer routes on that string, and the routing (deregister,
+   refine declared from Validated(LoggedFP), resubmit immediately) is
+   exactly what the code's TxnResultLogDirty does regardless of which arm
+   produced it. Publish = bump every written var. *)
 ExecCommit(t, s) ==
     /\ exec[<<t, s>>].pc = "commit"
-    /\ LET dirtyNow == \E v \in Writes(t) : version[v] /= snap[<<t, s>>][v]
+    /\ LET covered  == Covers(declared[t], Validated(LoggedFP(t)))
            retryNow == ~RetryPred(t, snap[<<t, s>>])
+           refineOnCommit == ~declared[t].under /\ ~covered
+           refineOnRetry  == declared[t].under \/ ~covered
        IN IF retryNow
-          \* TxnLogRetry: the predicate failed against the SNAPSHOT. The
-          \* code's park-time re-validation under lock is vacuous for
-          \* read-only logs (RO entries hardcode isDirty = false), so a
-          \* write committed since the snapshot does not rescue this
-          \* outcome — modelled by deciding on snap, not version.
-          THEN /\ exec' = [exec EXCEPT ![<<t, s>>] =
-                              [pc |-> "regComp", out |-> "retry", fInc |-> exec[<<t, s>>].fInc]]
-               /\ UNCHANGED <<version, publishedInc, doublePub>>
-          ELSE IF dirtyNow
+          THEN IF refineOnRetry
+               \* TxnLogRetry, refine-instead-of-park: a parked transaction
+               \* whose declared footprint does not cover its logged reads
+               \* can be left asleep by a conflictor the scheduler never
+               \* matched it against — so it refines and re-runs instead.
+               THEN /\ exec' = [exec EXCEPT ![<<t, s>>] =
+                                   [pc |-> "regComp", out |-> "dirty", fInc |-> exec[<<t, s>>].fInc]]
+                    /\ UNCHANGED <<version, publishedInc, doublePub>>
+               \* TxnLogRetry, park: the predicate failed against the
+               \* SNAPSHOT, and nothing on this arm re-reads live state —
+               \* its withLock region checks only coverage (version-blind),
+               \* and a read-only log resolves zero locks anyway — so a
+               \* write committed since the snapshot does not rescue this
+               \* outcome: modelled by deciding on snap, not version. The
+               \* live staleness re-check happens later, at the park guards
+               \* (ExecParkScan / ExecParkStale).
+               ELSE /\ exec' = [exec EXCEPT ![<<t, s>>] =
+                                   [pc |-> "regComp", out |-> "retry", fInc |-> exec[<<t, s>>].fInc]]
+                    /\ UNCHANGED <<version, publishedInc, doublePub>>
+          ELSE IF refineOnCommit
           THEN /\ exec' = [exec EXCEPT ![<<t, s>>] =
                               [pc |-> "regComp", out |-> "dirty", fInc |-> exec[<<t, s>>].fInc]]
                /\ UNCHANGED <<version, publishedInc, doublePub>>
