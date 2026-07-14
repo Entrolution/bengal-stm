@@ -50,9 +50,11 @@ executed through plan-mode + critique ratchet, revert-checked tests, and per-com
   unfixed code where the fix changes behaviour (doc-promise pins noted as green-on-current).
   Plus 10 CI-level negative-control mutation checks (a new `negative-controls` job runs committed
   spec-mutation patches on every push; a mutant that stays green fails the build).
-- **Deferrals**: 1, user-approved — the benchmark re-run/re-publication (dedicated-box A→B→C→A
-  protocol; the harness rework changed three workloads and the id cost model changed under the
-  published table, which is now annotated as historical).
+- **Deferrals**: 1, user-approved — the benchmark re-run/re-publication — and closed the same
+  day: re-measured on a dedicated vast.ai Ryzen 9 5950X (A→B→A, drift-gated) and republished.
+  The H3 cliff reproduced at −34.7% with zero drift; `dataDependentKey` flipped to a net +15%;
+  and the pre-H2 library deadlocked outright on the new `crossMapInsert` workload — the model's
+  counterexample reproduced live by the instrument built to measure it.
 - **In-situ discoveries**: 2 recorded in the checklist (the failure-path coverage-gate limitation,
   documented; the wake-time re-analysis design lesson). The review loops additionally caught and
   fixed errors in the hardening itself before commit — a wrong lock-span justification in spec

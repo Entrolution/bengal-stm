@@ -264,18 +264,20 @@ not make the scheduler slightly less precise — it switches its protection off.
 a transaction on its own is what keeps it correct. (Before this was fixed, a pair of such
 transactions produced non-serializable results in 198 of 200 contended runs.)
 
-Measured cost: **−34%** throughput against the same workload before the fix (7,244 → 4,759
-ops/s), which is about 58% of what a comparable transaction with a fully-known footprint
-achieves. A data-dependent key (below) costs **−10%**.
+Measured cost: **−34.7%** throughput against the same workload before the fix (8,437 → 5,506
+ops/s on the current instrument), roughly two-thirds of what a comparable transaction with a
+fully-known footprint achieves. A data-dependent key (below) is a net **+15%** on the current
+tree — the coverage check costs what it costs, and the id-registry and fold work that landed
+since more than pays for it.
 
-**Nothing else got slower.** The commit path is in fact **6% faster** than it was before any of
-this correctness work, and a whole-map read plus insert is **13% faster** — because the same
-work that added H6's coverage check also proved the older commit-time *dirty* check could never
-fire, and deleting that was worth more than the coverage check costs. (All of these figures were
-measured with the pre-rework harness; the benchmark tables are historical pending re-measurement
-— see the banner in [benchmarks](benchmarks/README.md).) Read that README's opening before
-trusting any number you produce there yourself: it leads with the two ways these measurements
-have already been got wrong.
+**Nothing else got slower.** The commit path sits inside its own noise against the pre-fix
+baseline while carrying H6's coverage check on every commit, and a whole-map read plus insert is
+**21% faster** — because the same work that added the coverage check also proved the older
+commit-time *dirty* check could never fire, and deleting that (plus the id-registry and fold
+work) was worth more than the coverage check costs. (Re-measured 2026-07-14 on a dedicated
+Ryzen 9 5950X with the reworked harness — see [benchmarks](benchmarks/README.md).) Read that
+README's opening before trusting any number you produce there yourself: it leads with the two
+ways these measurements have already been got wrong.
 
 ### Avoiding it
 
