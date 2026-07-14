@@ -52,10 +52,12 @@ import bengal.stm.runtime.{ TxnCompilerContext, TxnLogContext, TxnRuntimeContext
   * }}}
   *
   * A transaction runs TWICE per commit attempt: once in a static-analysis pass that computes its footprint (the
-  * variables and keys it touches), and once for real. The scheduler uses the footprint to run only transactions that
-  * cannot conflict. Two consequences reach callers, and the README covers both: `delay`/`fromF` thunks are evaluated in
-  * both passes, so they must not carry side effects; and a transaction whose analysis pass THROWS gets an
-  * under-approximated footprint, which conflicts with everything and therefore runs alone.
+  * variables and keys it touches), and once for real. Both passes stop at the first `waitFor` retry or `abort`, so a
+  * step positioned after one runs in neither pass for that attempt. The scheduler uses the footprint to run only
+  * transactions that cannot conflict. Two consequences reach callers, and the README covers both: `delay`/`fromF`
+  * thunks are evaluated in both passes when the flow reaches them, so they must not carry side effects; and a
+  * transaction whose analysis pass THROWS gets an under-approximated footprint, which conflicts with everything and
+  * therefore runs alone.
   *
   * @tparam F
   *   the effect type (must have an `Async` instance)
@@ -137,7 +139,16 @@ abstract class STM[F[_]: Async]
   /** Provides `commit` and error-handling operations on `Txn` values. */
   implicit class TxnOps[V](txn: => Txn[V]) {
 
-    /** Commits the transaction, executing it against the STM runtime and lifting the result into `F`. */
+    /** Commits the transaction, executing it against the STM runtime and lifting the result into `F`.
+      *
+      * CANCELLATION ABANDONS THE TRANSACTION. Cancelling the returned `F` (a `timeout`, a lost `race`, supervisor
+      * shutdown) is safe and prompt: once the cancellation completes, the transaction never begins executing again,
+      * never parks or retries, and holds no scheduler state — a parked `waitFor` transaction in particular can never be
+      * woken by a later commit and run after its caller has gone. One carve-out: the atomic commit window itself is
+      * uncancelable, so a window already executing when cancellation arrives runs to completion and its writes may be
+      * published; cancellation does not interrupt a window in flight — it prevents every future one, without waiting on
+      * the in-flight one.
+      */
     def commit: F[V] =
       commitTxn(txn)
 
@@ -157,7 +168,14 @@ object STM {
   def apply[F[_]](implicit stm: STM[F]): STM[F] =
     stm
 
-  /** Creates a new STM runtime, allocating the internal ID generators and scheduler. This is the main entry point. */
+  /** Creates a new STM runtime, allocating the internal ID generators and scheduler. This is the main entry point.
+    *
+    * ONE RUNTIME PER SET OF TRANSACTIONAL VARIABLES. Every `TxnVar`/`TxnVarMap` belongs to the runtime in scope when it
+    * was created, and all transactions touching it must run through that runtime. Sharing a variable across two
+    * runtimes is undefined: each scheduler enforces its conflict guarantees only over its own transactions, so two
+    * conflicting transactions committed under different runtimes can interleave unchecked — stale reads and lost
+    * updates with no error raised.
+    */
   def runtime[F[_]: Async]: F[STM[F]] =
     for {
       idGenVar              <- Ref.of[F, Long](0)

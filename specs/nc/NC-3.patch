@@ -1,0 +1,21 @@
+--- a/specs/common/Footprint.tla
++++ b/specs/common/Footprint.tla
+@@ -74,18 +74,16 @@
+  * raw overlap with writes; any-op-under-written-parent; write-under-read-
+  * parent — while parent-read vs child-read stays compatible.
+  * FootprintLemmas.tla pins every case.
+  *)
+ AsymCompat(f, g) ==
+     /\ CombinedRawIds(f) \cap UpdateRawIds(g) = {}
+     /\ ~\E id \in CombinedIds(f) :
+             id.par /= NoParent /\ id.par \in UpdateRawIds(g)
+-    /\ ~\E id \in f.updates :
+-            id.par /= NoParent /\ id.par \in ReadRawIds(g)
+ 
+ (*
+  * isCompatibleWith. THE FIRST CLAUSE IS THE H3 FIX: a footprint that
+  * under-approximates its transaction's access set is incompatible with
+  * EVERYTHING, because the ids that would have revealed a conflict are exactly
+  * the ids that are missing. Any "compatible" verdict would be an inference from
+  * absent evidence. Such a transaction is therefore serialized against all
+  * others and runs alone, which makes its unvalidated reads trivially safe.

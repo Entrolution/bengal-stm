@@ -30,12 +30,17 @@ import bengal.stm.model.runtime._
   * `TxnVar` instances are created outside the `Txn` monad via [[TxnVar.of]] and then read/written within transactions
   * using the syntax extensions provided by the `STM` implicit class or `bengal.stm.syntax.all._`.
   *
+  * Construction is factory-only: [[TxnVar.of]] draws the variable's identity from the runtime's allocator, and the
+  * sealed constructor is what makes that identity trustworthy — user-built or copied instances could alias one backing
+  * `Ref` under two runtime ids, or two `Ref`s under one, and the scheduler's conflict detection is sound only because
+  * neither can exist.
+  *
   * @tparam F
   *   the effect type
   * @tparam T
   *   the value type
   */
-case class TxnVar[F[_], T](
+final class TxnVar[F[_], T] private[stm] (
   private[stm] val id: TxnVarId,
   protected val value: Ref[F, T],
   private[stm] val commitLock: Semaphore[F]
@@ -48,11 +53,15 @@ case class TxnVar[F[_], T](
 
 object TxnVar {
 
-  /** Creates a new `TxnVar` with the given initial value. Requires an implicit `STM[F]` runtime. */
+  /** Creates a new `TxnVar` with the given initial value. Requires an implicit `STM[F]` runtime.
+    *
+    * The variable belongs to that runtime: all transactions touching it must be committed through the same `STM[F]`
+    * instance. Use under a different runtime is undefined — see [[bengal.stm.STM.runtime]].
+    */
   def of[F[_]: STM: Async, T](value: T): F[TxnVar[F, T]] =
     for {
       id       <- STM[F].txnVarIdGen.updateAndGet(_ + 1)
       valueRef <- Async[F].ref(value)
       lock     <- Semaphore[F](1)
-    } yield TxnVar(id, valueRef, lock)
+    } yield new TxnVar(id, valueRef, lock)
 }

@@ -17,9 +17,7 @@
 package ai.entrolution
 package bengal.stm.model
 
-import java.util.UUID
-
-import scala.collection.mutable.{ Map => MutableMap }
+import scala.collection.concurrent.TrieMap
 
 import cats.effect.Ref
 import cats.effect.kernel.Async
@@ -34,6 +32,17 @@ import bengal.stm.model.runtime._
   * Unlike wrapping a `Map` in a `TxnVar`, `TxnVarMap` tracks individual keys as separate transactional entities,
   * enabling finer-grained conflict detection and better concurrency. Create instances via [[TxnVarMap.of]].
   *
+  * Keys must have stable `equals`/`hashCode` for as long as they are used with the map (the usual `Map` key contract):
+  * conflict detection identifies a key by that equality. Each distinct key ever referenced — read, written, deleted, or
+  * merely probed — retains one internal id-registry entry (including a strong reference to the key object) for the
+  * lifetime of this `TxnVarMap`. Workloads streaming unboundedly many distinct keys through one map will grow that
+  * registry without bound; prefer bounded key spaces, or fresh maps per epoch.
+  *
+  * Construction is factory-only: [[TxnVarMap.of]] draws the map's identity from the runtime's allocator, and the sealed
+  * constructor is what makes that identity trustworthy. It also makes a second handle over this map's state
+  * unrepresentable in user code — the map's internal key-id registry is per-instance, so a copied handle would disagree
+  * with the original about key identity in ways that silently break conflict detection.
+  *
   * @tparam F
   *   the effect type
   * @tparam K
@@ -41,7 +50,7 @@ import bengal.stm.model.runtime._
   * @tparam V
   *   the value type
   */
-case class TxnVarMap[F[_]: STM: Async, K, V](
+final class TxnVarMap[F[_]: STM: Async, K, V] private[stm] (
   private[stm] val id: TxnVarId,
   protected val value: Ref[F, VarIndex[F, K, V]],
   private[stm] val commitLock: Semaphore[F],
@@ -74,8 +83,8 @@ case class TxnVarMap[F[_]: STM: Async, K, V](
                 }
     } yield result
 
-  // EXISTENTIAL because it does not need the key to exist. Hashed from
-  // (mapId, key) rather than taken from a TxnVar, it names a slot that may hold
+  // The EXISTENTIAL id registry: one stable id per distinct key, whether or not
+  // the key exists. An id that does not need a TxnVar names a slot that may hold
   // nothing at all — which is the only reason an ABSENT-key read is visible to
   // the scheduler. Reading a missing key is still a read: it observes that the
   // key is missing, and a transaction that inserts it must conflict with the
@@ -83,6 +92,29 @@ case class TxnVarMap[F[_]: STM: Async, K, V](
   // declare and nothing to compare, and every waitFor on a key-not-yet-created
   // would be invisible to the conflict relation.
   //
+  // Ids are issued by the runtime's ONE global allocator (STM.txnVarIdGen), the
+  // same counter that numbers TxnVars and maps, so a key id can never alias an
+  // entity id — IdFootprint compares raw values with the parent stripped, so
+  // global uniqueness is load-bearing, not cosmetic. Identity is the key's own
+  // equals/hashCode (the TrieMap's), i.e. exactly the equality the value store
+  // uses — never a rendering like toString, whose equivalence classes need not
+  // match equality in either direction.
+  //
+  // ENTRIES ARE NEVER EVICTED, deletes included. A parked transaction's
+  // footprint holds the key's id; evict-and-reallocate would issue a DIFFERENT
+  // id for the same key, and the wake sweep and coverage check would compare the
+  // two as unrelated slots — a lost wakeup by construction. Delete-then-reinsert
+  // must keep the same existential id for the same reason. The price is one
+  // registry entry (and a strong reference to the key) per distinct key ever
+  // referenced, for the lifetime of the map; the class scaladoc states it.
+  //
+  // Per-instance on purpose (it shares the map's lifetime and GCs with it). A
+  // second handle sharing the state Ref but not this registry would disagree
+  // about key identity — which is why the constructor is sealed and copy no
+  // longer exists: that handle is now unrepresentable (class scaladoc).
+  private val existentialIds: TrieMap[K, TxnVarRuntimeId] =
+    TrieMap.empty[K, TxnVarRuntimeId]
+
   // It is also a SECOND ID SPACE, and that has bitten twice. This id is what the
   // entry is LOGGED under, but an absent key has no TxnVar, so the entry LOCKS
   // the map's structural lock instead — owner and log key are different
@@ -90,19 +122,31 @@ case class TxnVarMap[F[_]: STM: Async, K, V](
   // sat in the declared footprint while recording no log entry at all, which is
   // the absent-key lost wakeup: Contract C and the wake sweeps could see the
   // read, and the park-time staleness check — which walks the LOG — could not.
-  private def getRuntimeExistentialId(key: K): TxnVarRuntimeId =
-    TxnVarRuntimeId(UUID.nameUUIDFromBytes((id, key).toString.getBytes).hashCode())
-
+  //
   // The parent link, and the whole of the id hierarchy the conflict relation
   // reasons over: an entry's id carries the MAP's id as its parent. That is what
   // lets IdFootprint conflict a whole-map read against a write to any single key
   // (its third conjunct, the H5 fix) and lets a declared map-level id COVER the
   // per-key ids a whole-map read expands into at run time (its coverage check,
   // the H6 fix). Both tests are one hop; see TxnVarRuntimeId.
+  //
+  // For a key that already EXISTS, the first call for it typically happens at
+  // commit time, inside the locked region (the log entry's idFootprint under
+  // withLock): a one-time allocate-and-publish per key, lock-free on the
+  // registry, a plain lookup ever after. A putIfAbsent race between two fibers
+  // burns one counter value; gaps in the sequence are meaningless.
   private[stm] def getRuntimeId(
     key: K
   ): F[TxnVarRuntimeId] =
-    Async[F].delay(getRuntimeExistentialId(key).addParent(runtimeId))
+    Async[F].delay(existentialIds.get(key)).flatMap {
+      case Some(rid) =>
+        Async[F].pure(rid)
+      case None =>
+        STM[F].txnVarIdGen.updateAndGet(_ + 1).map { newId =>
+          val candidate = TxnVarRuntimeId(newId, Some(runtimeId))
+          existentialIds.putIfAbsent(key, candidate).getOrElse(candidate)
+        }
+    }
 
   private[stm] def addOrUpdate(key: K, newValue: V): F[Unit] =
     withLock(internalStructureLock) {
@@ -114,7 +158,7 @@ case class TxnVarMap[F[_]: STM: Async, K, V](
                case None =>
                  for {
                    newTxnVar <- TxnVar.of(newValue)
-                   _         <- value.update(_ += (key -> newTxnVar))
+                   _         <- value.update(_ + (key -> newTxnVar))
                  } yield ()
              }
       } yield ()
@@ -126,7 +170,7 @@ case class TxnVarMap[F[_]: STM: Async, K, V](
         txnVarMap <- value.get
         _ <- txnVarMap.get(key) match {
                case Some(_) =>
-                 value.update(_ -= key)
+                 value.update(_ - key)
                case None =>
                  Async[F].unit
              }
@@ -136,15 +180,19 @@ case class TxnVarMap[F[_]: STM: Async, K, V](
 
 object TxnVarMap {
 
-  /** Creates a new `TxnVarMap` with the given initial entries. Requires an implicit `STM[F]` runtime. */
+  /** Creates a new `TxnVarMap` with the given initial entries. Requires an implicit `STM[F]` runtime.
+    *
+    * The map belongs to that runtime: all transactions touching it must be committed through the same `STM[F]`
+    * instance. Use under a different runtime is undefined — see [[bengal.stm.STM.runtime]].
+    */
   def of[F[_]: STM: Async, K, V](valueMap: Map[K, V]): F[TxnVarMap[F, K, V]] =
     for {
       id <- STM[F].txnVarIdGen.updateAndGet(_ + 1)
       values <- valueMap.toList.traverse { kv =>
                   TxnVar.of(kv._2).map(txv => kv._1 -> txv)
                 }
-      valuesRef             <- Async[F].ref(MutableMap(values: _*))
+      valuesRef             <- Async[F].ref(values.toMap: VarIndex[F, K, V])
       lock                  <- Semaphore[F](1)
       internalStructureLock <- Semaphore[F](1)
-    } yield TxnVarMap(id, valuesRef, lock, internalStructureLock)
+    } yield new TxnVarMap(id, valuesRef, lock, internalStructureLock)
 }

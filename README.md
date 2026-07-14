@@ -76,8 +76,8 @@ object QuickStart extends IOApp.Simple {
 ```
 
 All three imports are needed. `syntax.all._` is what brings `.get` / `.set` / `.modify` / `.commit`
-into scope; without it you get a `get is not a member` error rather than a missing-import one,
-because the runtime's own `private[stm]` members shadow the extension methods.
+into scope; without it `.get` fails with a `cannot be accessed` error rather than a missing-import
+one, because the runtime's own `private[stm]` members shadow the extension methods.
 
 ## API Reference
 
@@ -105,7 +105,7 @@ because the runtime's own `private[stm]` members shadow the extension methods.
 | `STM[IO].waitFor(value > 10)` | Semantically blocks a transaction until a condition is met | `def waitFor(predicate: => Boolean): Txn[Unit]` | No thread is blocked. **The predicate's inputs must be read from a `TxnVar`/`TxnVarMap` inside the same transaction** — see [How `waitFor` wakes up](#how-waitfor-wakes-up). A predicate that *throws* aborts the transaction rather than retrying it. |
 | `txnVar.setF(Async[F].pure(100))` | Sets value via an effect `F[V]` | `def setF(newValue: F[V]): Txn[Unit]` | Requires `syntax.all._` import |
 | `txnVar.modifyF(v => Async[F].pure(v + 1))` | Modifies value via an effectful function | `def modifyF(f: V => F[V]): Txn[Unit]` | Requires `syntax.all._` import |
-| `txnVarMap.set(Async[F].pure(Map("k" -> 1)))` | Sets map state via an effect | `def set(newValueMap: F[Map[K, V]]): Txn[Unit]` | Requires `syntax.all._` import |
+| `txnVarMap.setF(Async[F].pure(Map("k" -> 1)))` | Sets map state via an effect | `def setF(newValueMap: F[Map[K, V]]): Txn[Unit]` | Requires `syntax.all._` import |
 | `txnVarMap.modifyF(m => Async[F].pure(m))` | Modifies map via an effectful function | `def modifyF(f: Map[K,V] => F[Map[K,V]]): Txn[Unit]` | Requires `syntax.all._` import |
 | `txnVarMap.setF(key, Async[F].pure(100))` | Upserts key-value via an effect | `def setF(key: => K, newValue: F[V]): Txn[Unit]` | Requires `syntax.all._` import |
 | `txnVarMap.modifyF(key, v => Async[F].pure(v))` | Modifies key-value via an effectful function | `def modifyF(key: => K, f: V => F[V]): Txn[Unit]` | Requires `syntax.all._` import |
@@ -117,9 +117,14 @@ methods (`.get`, `.set`, `.modify`, `.commit`, and the `F`-variants) come from
 `import ai.entrolution.bengal.stm.syntax.all._`. An implicit `STM[F]` in scope is **not**
 enough on its own; you need the import.
 
-**On effectful arguments.** The `F`-variants (`setF`, `modifyF`, `handleErrorWithF`, and the
-`F[_]` overloads of `set`) and the `delay`/`fromF` combinators **must not encapsulate side
-effects**: they are evaluated at least twice per commit attempt, and again on every retry.
+**On effectful arguments.** The `F`-variants (`setF`, `modifyF`, `handleErrorWithF`) and the
+`delay`/`fromF` combinators **must not encapsulate side effects** — but their evaluation
+frequencies differ. `delay`/`fromF` thunks run in **both**
+passes of every executed attempt that reaches them (the analysis pass and the log run), and
+again on every retry; a flow already terminated at a `waitFor` retry or `abort` reaches them in
+neither pass. The `F`-variant setter values are **not** forced during analysis: they run once
+per executed attempt, plus once per retry. `handleErrorWithF`'s handler runs only on an error.
+The common rule stands for all of them — a re-run must be harmless.
 
 **On by-name arguments.** Every `=>` above is load-bearing rather than cosmetic. Whether an
 expression is evaluated during the analysis pass — and can therefore throw there — depends on
@@ -259,16 +264,20 @@ not make the scheduler slightly less precise — it switches its protection off.
 a transaction on its own is what keeps it correct. (Before this was fixed, a pair of such
 transactions produced non-serializable results in 198 of 200 contended runs.)
 
-Measured cost: **−34%** throughput against the same workload before the fix (7,244 → 4,759
-ops/s), which is about 58% of what a comparable transaction with a fully-known footprint
-achieves. A data-dependent key (below) costs **−10%**.
+Measured cost: **−34.7%** throughput against the same workload before the fix (8,437 → 5,506
+ops/s on the current instrument), roughly two-thirds of what a comparable transaction with a
+fully-known footprint achieves. A data-dependent key (below) is a net **+15%** on the current
+tree — the coverage check costs what it costs, and the id-registry and fold work that landed
+since more than pays for it.
 
-**Nothing else got slower.** The commit path is in fact **6% faster** than it was before any of
-this correctness work, and a whole-map read plus insert is **13% faster** — because the same
-work that added H6's coverage check also proved the older commit-time *dirty* check could never
-fire, and deleting that was worth more than the coverage check costs. See
-[benchmarks](benchmarks/README.md), and read its opening before trusting any number you produce
-there yourself: it leads with the two ways these measurements have already been got wrong.
+**Nothing else got slower.** The commit path sits inside its own noise against the pre-fix
+baseline while carrying H6's coverage check on every commit, and a whole-map read plus insert is
+**21% faster** — because the same work that added the coverage check also proved the older
+commit-time *dirty* check could never fire, and deleting that (plus the id-registry and fold
+work) was worth more than the coverage check costs. (Re-measured 2026-07-14 on a dedicated
+Ryzen 9 5950X with the reworked harness — see [benchmarks](benchmarks/README.md).) Read that
+README's opening before trusting any number you produce there yourself: it leads with the two
+ways these measurements have already been got wrong.
 
 ### Avoiding it
 
@@ -337,6 +346,32 @@ Two further details:
 - A predicate that **throws** aborts the transaction; it does not retry it.
 - `handleErrorWith` does **not** absorb a `waitFor` retry. Wrapping a blocking transaction in
   an error handler will not make it stop blocking.
+
+## Cancelling a commit
+
+Cancelling the `F` returned by `commit` — a `timeout`, a lost `race`, supervisor shutdown —
+**abandons** the transaction. Once the cancellation completes:
+
+- the transaction never begins executing again;
+- a parked `waitFor` transaction is removed from the retry machinery — no later commit can wake
+  it, so it cannot run and publish after its caller has gone;
+- all scheduler bookkeeping is released, and transactions queued behind the abandoned one
+  proceed.
+
+One carve-out: the **atomic commit window** itself is uncancelable. A window already executing
+when cancellation arrives runs to completion, and its writes may be published — cancellation
+does not interrupt a window in flight; it prevents every future one, promptly, without waiting
+on the in-flight one. `commit.timeout(d)` therefore composes safely with `waitFor`: the timeout
+fires, the transaction is abandoned, and nothing leaks.
+
+## One runtime per variable set
+
+Every `TxnVar` and `TxnVarMap` belongs to the `STM` runtime in scope when it was created, and
+all transactions touching it must be committed through that runtime. Sharing a variable across
+two runtimes is **undefined**: each scheduler enforces its conflict guarantees only over its own
+transactions, so two conflicting transactions committed under different runtimes can interleave
+unchecked — stale reads and lost updates with no error raised. One `STM.runtime` per
+application (or per isolated variable set) is the rule.
 
 ## Correctness
 

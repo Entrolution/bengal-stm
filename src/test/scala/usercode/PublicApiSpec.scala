@@ -121,4 +121,57 @@ class PublicApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
         .asserting(_ shouldBe Some(11))
     }
   }
+
+  // These probe strings COMPILED against the case-class versions of TxnVar and
+  // TxnVarMap: construction, copy and Product access from user code were exactly
+  // the leak — productElement handed out the backing Ref and locks regardless of
+  // their access modifiers, and copy(id = ...) could alias one Ref under two
+  // runtime ids. The probes pin today's signatures; a future public constructor
+  // with a different shape would need them maintained alongside.
+  "the internals stay sealed from user code" - {
+
+    // assertTypeError rather than assertDoesNotCompile throughout: the latter
+    // also passes on a parse error, so a typo introduced into a probe string
+    // would silently pin nothing. These must fail TYPECHECKING specifically.
+    "TxnVar cannot be constructed, copied or introspected" in {
+      assertTypeError("new TxnVar[IO, Int](1L, null, null)")
+      assertTypeError("TxnVar[IO, Int](1L, null, null)")
+      assertTypeError("(??? : TxnVar[IO, Int]).copy()")
+      assertTypeError("(??? : TxnVar[IO, Int]).productElement(0)")
+      assertTypeError("(??? : TxnVar[IO, Int]): Product")
+      assertTypeError("(??? : TxnVar[IO, Int]) match { case TxnVar(_, _, _) => () }")
+    }
+
+    // TxnVarMap's constructor, apply and copy take the runtime implicitly (class
+    // context bounds), so the probes must sit where an implicit STM[IO] is
+    // lexically visible — otherwise they fail to compile for the wrong reason
+    // (missing implicit) and pin nothing.
+    "TxnVarMap cannot be constructed, copied or introspected" in {
+      STM
+        .runtime[IO]
+        .flatMap { implicit stm =>
+          for {
+            _ <- TxnVarMap.of[IO, String, Int](Map.empty)
+            out <- IO {
+                     assertTypeError("new TxnVarMap[IO, String, Int](1L, null, null, null)")
+                     assertTypeError("TxnVarMap[IO, String, Int](1L, null, null, null)")
+                     assertTypeError("(??? : TxnVarMap[IO, String, Int]).copy()")
+                     assertTypeError("(??? : TxnVarMap[IO, String, Int]).productElement(0)")
+                     assertTypeError("(??? : TxnVarMap[IO, String, Int]): Product")
+                     assertTypeError(
+                       "(??? : TxnVarMap[IO, String, Int]) match { case TxnVarMap(_, _, _, _) => () }"
+                     )
+                     succeed
+                   }
+          } yield out
+        }
+        .timeout(30.seconds)
+        .asserting(_ shouldBe succeed)
+    }
+
+    "ExecutionStatus is not part of the public API" in {
+      assertTypeError("(??? : ai.entrolution.bengal.stm.model.runtime.ExecutionStatus)")
+      assertTypeError("ai.entrolution.bengal.stm.model.runtime.Scheduled")
+    }
+  }
 }

@@ -6,8 +6,8 @@ What did the correctness fixes cost?
 sbt 'benchmarks/Jmh/run .*StmThroughputBench.*'
 ```
 
-The defaults in `StmThroughputBench` **are** the protocol used below (`-f5 -wi 5 -i 10`), so a
-bare run reproduces this table. The benchmarks module is **not aggregated** into the root
+The defaults in `StmThroughputBench` **are** the protocol used below (`-f5 -wi 5 -i 10`) — but
+the tables themselves are historical since the harness rework; see the banner under Results. The benchmarks module is **not aggregated** into the root
 project, so `sbt test` and CI never build it.
 
 ## Read this before trusting any number you produce here
@@ -57,35 +57,69 @@ Three trees, four phases, one box: **A → B → C → A**.
 Every fix was `private[stm]`, so the same benchmark compiles unchanged against all three, and
 only `src/main` is swapped.
 
-`@OperationsPerInvocation(32)` on the six batched benchmarks makes JMH report per-**transaction**
-throughput, so all seven are comparable. (`uncontendedCommit` runs one transaction per invocation
-and needs no annotation.) That `32` is written literally and must track `Batch`; change one
-without the other and every number here is silently wrong by the ratio.
+`@OperationsPerInvocation(32)` on the batched benchmarks makes JMH report per-**transaction**
+throughput, so they are comparable with each other. (`uncontendedCommit` runs one transaction per
+invocation and needs no annotation; `dataDependentKey` declares **33**, because its keySrc bump is
+a 33rd real commit inside the timed region that must stay concurrent with the readers.) That `32`
+is written literally and must track `Batch`; change one without the other and every number here is
+silently wrong by the ratio.
+
+**One comparability caveat**: `uncontendedCommit` is driven synchronously from the JMH worker
+thread — one `unsafeRunSync` per transaction, no fiber fan-out — while every batched benchmark
+amortizes 1/32 of a batch-sized fan-out's spawn/join into each reported per-transaction figure. Cross-benchmark ratios against the baseline therefore conflate scheduler
+admission cost with fiber-orchestration cost — compare batched rows with batched rows, and treat
+`x / uncontendedCommit` ratios as indicative only.
 
 ## Results
 
-Dedicated AMD Ryzen 9 5950X (16 cores), JDK 21.0.11. `-f5 -wi 5 -i 10`, except
-`uncontendedCommit` at `-f20`. Per-transaction ops/s, ± the 99.9% CI. `after` is the mean of the
-two A runs.
+Dedicated AMD Ryzen 9 5950X (16 cores; the vast.ai host exposes 30 of its 32 threads), JDK
+21.0.11, Illinois, 2026-07-14 — measured with the **reworked harness** (steady-state inserts,
+bounded under-declaration, 33-op crediting, `@Threads(1)`, teardown assertions), A → B → A.
+`-f5 -wi 5 -i 10`, except `uncontendedCommit` at `-f20`. Per-transaction ops/s, ± the 99.9% CI.
+`after` is the mean of the two A runs; drift is the disagreement between them, and an effect is
+claimed only when it clears twice its row's drift.
 
-### What the correctness fixes cost
+Rows are **not comparable to the previously published table** (kept below for the dirty-check
+comparison): `mapWriteConcurrent` and `underDeclaredConcurrent` measure changed workloads, and
+"before" now carries every cost the old library had (the dirty check, the fiber-per-entry
+footprint fold, hash-derived ids), so each row is the fix's cost **net of every subsequent win**.
+
+### What the correctness work cost, net (current tree vs `4b0638d`)
 
 | benchmark | before (`4b0638d`) | after | change | | drift |
 |---|---:|---:|---:|:-:|---:|
-| `underDeclaredConcurrent` | 7,244 ± 363 | 4,759 ± 233 | **−34%** | ● | 3.1% |
-| `dataDependentKey` | 4,444 ± 217 | 3,983 ± 193 | **−10%** | ● | 0.3% |
-| `wholeMapReadPlusInsert` | 905 ± 50 | 1,020 ± 49 | **+13%** | ● | 0.6% |
-| `uncontendedCommit` | 17,356 ± 587 | 18,415 ± 660 | **+6%** | ● | 1.6% |
-| `contendedConcurrent` | 5,254 ± 253 | 5,517 ± 274 | **+5%** | ● | 1.3% |
-| `disjointConcurrent` | 8,031 ± 418 | 8,209 ± 445 | +2% | ○ | 1.1% |
-| `mapWriteConcurrent` | 8,153 ± 422 | 7,948 ± 411 | −3% | ○ | 4.4% |
+| `underDeclaredConcurrent` | 8,437 ± 102 | 5,506 ± 72 | **−34.7%** | ● | 0.0% |
+| `dataDependentKey` | 3,929 ± 424 | 4,518 ± 81 | **+15.0%** | ● | 0.6% |
+| `wholeMapReadPlusInsert` | 964 ± 23 | 1,170 ± 26 | **+21.4%** | ● | 0.8% |
+| `mapWriteConcurrent` | 7,337 ± 91 | 7,694 ± 95 | **+4.9%** | ● | 1.0% |
+| `contendedConcurrent` | 5,740 ± 56 | 5,997 ± 80 | **+4.5%** | ● | 0.4% |
+| `uncontendedCommit` | 17,834 ± 760 | 18,324 ± 341 (`-f20`) | +2.2% (`-f5`) | ○ | 4.7% (`-f5`) |
+| `disjointConcurrent` | 8,670 ± 163 | 8,638 ± 166 | −0.4% | ○ | 2.6% |
+| `crossMapInsert` | **deadlocks** † | 6,795 ± 93 | — | — | 5.7% |
 
 ● resolved · ○ **within this row's noise — no change detected, and none is claimed**
 
-### What deleting the commit-time dirty check bought
+† `crossMapInsert` is the H2 topology — two transactions inserting fresh keys into two maps.
+Run against the pre-H2 library, its **first fork deadlocked** (both fibers holding one
+structural lock and waiting on the other, forever) and had to be killed ~38 minutes in: the
+model's counterexample, reproduced live by the instrument built to measure it. The `4b0638d`
+phase therefore ran with this benchmark excluded, and its row has no "before" by construction.
 
-Same code either way; the *only* difference is the check. It was removed because it could never
-fire — see `CoverageSubsumesDirty` in `specs/README.md`.
+The headline is unchanged and now measured on the bounded workload: the H3 cliff is **−34.7%**
+(drift 0.0% — the old harness's unbounded allocation moved the absolute numbers, not the ratio).
+`dataDependentKey` **flipped sign**: the H6 coverage check's cost on this workload is now more
+than paid for by the id-registry, fold, and dirty-check-deletion wins that landed after
+`4b0638d`. The commit path itself sits inside its own noise against the pre-fix baseline while
+carrying the coverage check on every commit.
+
+### What deleting the commit-time dirty check bought (historical)
+
+> Measured 2026-07-13 with the pre-rework harness on the 0.14-era tree — the dirty-check-restored
+> "C" tree is not reconstructible against the current code, so this table is a preserved record,
+> not a current measurement. Its question was settled: the check was removed because it could
+> never fire — see `CoverageSubsumesDirty` in `specs/README.md`.
+
+Same code either way; the *only* difference was the check.
 
 | benchmark | with the check | without | gain | |
 |---|---:|---:|---:|:-:|
@@ -99,41 +133,50 @@ fire — see `CoverageSubsumesDirty` in `specs/README.md`.
 
 ## What the numbers say
 
-**The one real cost is `underDeclaredConcurrent`, at −34%, and that is the H3 fix working as
+**The one real cost is `underDeclaredConcurrent`, at −34.7%, and that is the H3 fix working as
 designed.** A transaction whose static analysis threw now carries a footprint flagged as
 incompatible with everything, so it runs alone. That path used to be *silently unsound* — it
 skewed 198 of 200 contended reps. Serialising it is the price of correctness, it is confined to
 that path, and it is **steady-state, not a one-off a retry recovers**: such a transaction runs
 alone every time, so nothing moves underneath it and nothing refines it. The README's "Static
-analysis and transaction footprints" explains how to avoid triggering it at all.
+analysis and transaction footprints" explains how to avoid triggering it at all. The figure
+survived the harness rework unchanged — bounding the workload moved the absolute numbers, not
+the ratio — which is what an effect that belongs to the *protocol* rather than the *instrument*
+looks like.
 
-**`dataDependentKey` pays −10%** for the coverage check plus the re-runs it triggers when the
-declared footprint does not describe the transaction. The soak reports around 80% of
-data-dependent operations diverging, so this path really is doing that work.
+**`dataDependentKey` is now a net +15.0%** — a sign flip from the −10% first measured. The
+coverage check and its refinement re-runs still cost what they cost (the soak reports ~78% of
+data-dependent operations diverging, so the path really does that work); what changed is
+everything underneath it since `4b0638d`: allocator-issued ids instead of a UUID hash per map
+entry, a `traverse` fold instead of a fiber per log entry, and no dirty-check fiber on any
+commit. The "before" column carries all of those old costs, so this row now reads as the fix's
+price net of the wins that followed it.
 
-**Everything else got FASTER, including the commit path itself.** That is not a rounding error
-and it deserves stating plainly: the library now commits a simple transaction **6% faster than
-it did before any of this correctness work**, and a whole-map read plus insert **13% faster** —
-while carrying H6's coverage check on every commit and H5's whole-map/insert conflict, neither of
-which it had before.
+**Every resolved row except the cliff is a gain.** A whole-map read plus insert is **+21.4%**,
+steady-state map inserts **+4.9%**, full write contention **+4.5%** — all while carrying H6's
+coverage check on every commit and H5's whole-map/insert conflict, neither of which `4b0638d`
+had. The commit path itself sits **inside its own noise** against the pre-fix baseline (+2.2%
+against a 4.7% drift at `-f5`; 18,324 ± 341 at `-f20`): the honest claim is "not slower", not
+"faster", and the earlier +6% headline came from a comparison that no longer isolates the same
+things.
 
-The reason is the second table. **The check that H6 made redundant cost more than H6 does.** The
-commit-time dirty check forked a fiber, allocated a `Deferred`, and cancelled and joined it on
-*every commit* — and a whole-map read expands into one log entry **per key**, so that fan-out
-scaled with the size of the map. Removing it is worth **+13% on the commit path and +22% on
-whole-map reads**, and it more than pays for what the coverage check costs.
+**`crossMapInsert` has no before-column and never will**: the pre-H2 library deadlocks on the
+workload (see the † note above). Its 6,795 ops/s is a baseline for the future, and the deadlock
+itself is the strongest fix-validation this suite has produced.
 
-**Three workloads show no measurable change at all.** Not "a small change" — *nothing detectable*
-at their own resolution. Do not read the +2% and −3% as findings; they are the noise floor, and
+**Two workloads show no measurable change at all.** Not "a small change" — *nothing detectable*
+at their own resolution. Do not read +2.2% or −0.4% as findings; they are the noise floor, and
 they are printed only so nobody re-derives them and believes them.
 
 ## The optimisation that came out of this
 
 `TxnLogValid.idFootprint` used `parTraverse`, spawning a fiber per log entry. Every entry's
-footprint is a **pure computation** (a cached `runtimeId` for a var, a UUID hash for a map entry),
-so there was nothing to overlap and the fibers were pure overhead — and a whole-map read expands
-into one log entry *per key*, so the fiber count tracked the map size. Switching to `traverse` is
-part of why `wholeMapReadPlusInsert` is now faster than the baseline rather than 21% slower.
+footprint is trivial — a cached `runtimeId` for a var; at the time these figures were taken, a
+UUID hash for a map entry (since replaced by a registry lookup that allocates only on a key's
+first touch, which lowers the per-entry cost further) — so there was nothing to overlap and the
+fibers were pure overhead. A whole-map read expands into one log entry *per key*, so the fiber
+count tracked the map size. Switching to `traverse` is part of why `wholeMapReadPlusInsert` is
+faster than the baseline rather than 21% slower in the published (pre-rework) measurement.
 
 The laptop measured that same change as making things *worse across the board*. It was throttling.
 
@@ -141,3 +184,12 @@ The laptop measured that same change as making things *worse across the board*. 
 that it is stable *and* that it can resolve the effect you intend to report. That is the same
 discipline the TLA+ negative controls and the soaks' fix-reversion checks apply everywhere else in
 this project, and it is the reason two of the three tables above have a drift column.
+
+## Known, accepted contamination
+
+Unjoined scheduler fibers — wake sweeps spawned at submission, unsub cascades spawned at
+completion — can still be draining when an invocation's timer stops, bleeding CPU into the next
+invocation's window. There is no quiescence API to await them. The tail is bounded (the fibers
+close over the finished runtime and touch only bookkeeping), believed below the noise floor at
+these scales, and recorded here so the next dedicated-box session can verify that rather than
+assume it.

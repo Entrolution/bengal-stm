@@ -77,9 +77,9 @@ ASSUME LemmaCompatSymmetric ==
 
 (* getValidated is a fixpoint after one application. This covers the
    re-application half of the isValidated memoisation flag's soundness;
-   the other half is call-site discipline — addReadId/addWriteId/mergeWith
-   copy the flag through without resetting it, so validated footprints
-   must not be mutated afterwards (see the anchor in IdFootprint.scala). *)
+   the other half is structural — addReadId/addWriteId/mergeWith reset the
+   flag, so a footprint mutated after validation re-validates rather than
+   trusting a stale dedup (see the anchor in IdFootprint.scala). *)
 ASSUME LemmaValidatedIdempotent ==
     \A f \in Footprints :
         Validated(Validated(f)) = Validated(f)

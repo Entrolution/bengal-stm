@@ -136,7 +136,10 @@ behaviour changed.
 
 ```bash
 ./specs/expectations.sh --list          # validate the registry (no TLC; instant)
-./specs/expectations.sh                 # model-check everything CI checks
+./specs/expectations.sh                 # model-check the push-gated expectations
+./specs/negative_controls.sh            # break each fix, require its red to come back
+                                        # (a spec edit that touches a mutation site must
+                                        # regenerate the affected specs/nc/ patches)
 ./specs/verify_anchors.sh               # every // SPEC: anchor maps to a row
 ```
 

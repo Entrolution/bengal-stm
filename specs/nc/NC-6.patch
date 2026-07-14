@@ -1,0 +1,21 @@
+--- a/specs/commit/CommitProtocol.tla
++++ b/specs/commit/CommitProtocol.tla
+@@ -664,17 +664,17 @@
+ CoverageOk(t) ==
+     \/ declared[t].under
+     \/ Covers(declared[t], Validated(ActualFP(t)))
+ 
+ (* Either failure sends the transaction down the same road: release, refine from
+    the actual log, re-run. *)
+ (* THE DIRTY CHECK IS GONE, and CoverageSubsumesDirty below is why.
+    It used to be NeedsRefinement(t) == IsDirty(t) \/ ~CoverageOk(t). *)
+-NeedsRefinement(t) == ~CoverageOk(t)
++NeedsRefinement(t) == FALSE
+ 
+ (* WHY THERE IS NO DIRTY CHECK, AND WHAT KEEPS ITS ABSENCE HONEST.
+    IsDirty is now a GHOST: nothing in the protocol reads it. It survives solely so
+    that this invariant can assert the property that licenses its removal.
+ 
+      IF THE DECLARED FOOTPRINT COVERS THE ACTUAL ONE, THE WRITE SET CANNOT HAVE
+      MOVED UNDERNEATH US.
+ 

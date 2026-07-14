@@ -115,5 +115,30 @@ class NullResultSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers with S
           all shouldBe Map("k" -> null)
         }
     }
+
+    "can be removed, with and without a prior read in the same transaction" in {
+      withRuntime { implicit stm =>
+        for {
+          mapA <- TxnVarMap.of[IO, String, String](Map("k" -> null))
+          _    <- mapA.remove("k").commit
+          allA <- mapA.get.commit
+          mapB <- TxnVarMap.of[IO, String, String](Map("k" -> null))
+          read <- (for {
+                    innerRead <- mapB.get("k")
+                    _         <- mapB.remove("k")
+                  } yield innerRead).commit
+          allB <- mapB.get.commit
+        } yield (allA, read, allB)
+      }
+        .asserting { case (allA, read, allB) =>
+          // A null-valued key is PRESENT -- its log entry holds Some(null), never
+          // None -- so removing it must succeed. Failing it as absent, or silently
+          // skipping the delete, would both be the Option(...) collapse regressing
+          // somewhere in the remove path.
+          allA shouldBe Map.empty[String, String]
+          read shouldBe Some(null)
+          allB shouldBe Map.empty[String, String]
+        }
+    }
   }
 }

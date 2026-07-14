@@ -11,7 +11,7 @@
  * the guard against repeating that.)
  *
  * Scala correspondence:
- *   - TxnVarRuntimeId(value: Int, parent: Option[TxnVarRuntimeId])
+ *   - TxnVarRuntimeId(value: Long, parent: Option[TxnVarRuntimeId])
  *     An id is modelled as [val |-> Nat, par |-> Nat or NoParent]. Only the
  *     parent's raw value is ever consulted by the relation, so `par` holds
  *     the parent's value directly rather than a nested record.
@@ -19,14 +19,14 @@
  *     Modelled as [reads |-> set of ids, updates |-> set of ids]. The Scala
  *     `isValidated` boolean is a memoisation flag, not semantics. The
  *     ValidatedIdempotent lemma (FootprintLemmas.tla) covers its
- *     re-application half; the other half is call-site discipline, since
- *     the Scala mutators copy the flag through (see the IdFootprint.scala
- *     anchor).
+ *     re-application half; the other half is structural — the Scala
+ *     mutators reset the flag, forcing re-validation after any content
+ *     change (see the IdFootprint.scala anchor).
  *
- * Runtime IDs in the real system are UUID-hash-derived Ints
- * (TxnStateEntity.runtimeId); collisions are possible but are excluded
- * here by construction (distinct model ids). This ASSUMPTION is recorded in
- * specs/README.md.
+ * Runtime IDs in the real system are Longs issued by one global allocator
+ * (TxnStateEntity.runtimeId, TxnVarMap.getRuntimeId), so distinct entities
+ * have distinct raw values by construction. The distinct model ids used here
+ * therefore MATCH the code rather than record an assumption about it.
  *)
 
 EXTENDS Naturals, FiniteSets

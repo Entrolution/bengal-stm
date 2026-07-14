@@ -1,0 +1,21 @@
+--- a/specs/commit/CommitProtocol.tla
++++ b/specs/commit/CommitProtocol.tla
+@@ -607,17 +607,17 @@
+ 
+    BEFORE THE FIX this operator returned the LOG KEY: `e.val` (the existential
+    id hashed from (mapId, key)) for an absent key. That ordered acquisitions by
+    a hash of the KEY while the locks acquired belonged to the MAPS — two
+    unrelated id spaces — and TLC found the resulting cycle. Reverting this one
+    operator to the log key is negative control NC-1, and it must go RED. *)
+ LockOwnerVal(t, e) ==
+     IF e \in MapEntries
+-    THEN IF snapEx[t][e] THEN EntryVarVal(e) ELSE ParentStruct(e).val
++    THEN IF snapEx[t][e] THEN EntryVarVal(e) ELSE e.val
+     ELSE e.val
+ 
+ (* The lock-contributing entries, ordered by their LOCK'S OWNER. Read-only
+    entries return lock = None and are dropped by `.flatten`, so they cannot
+    affect the acquisition order at all — omitting them is exact, not a
+    reduction. Sorting on the owner is what makes this a total order over locks;
+    the code reaches the same sequence via `.sortBy(_._1.value)` after resolving
+    every lock. *)

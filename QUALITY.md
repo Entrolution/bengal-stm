@@ -1,5 +1,81 @@
 # Quality Cycles
 
+## Cycle 2 — 2026-07-13 (bug hunt)
+
+**Scope**: correctness, concurrency, and API-contract bugs. Full main source (runtime, compiler,
+model), the serializability oracle and soak harness, both TLA+ specs (spec↔code parity), and the
+throughput benchmark. 15 specialist agents over 2 batches, ~7,150 lines. Cycle artifacts:
+`.claude/reviews/bug-hunt-cycle-2/` (findings JSONL, manifest, structural risks, execution checklist).
+
+- **Modules reviewed**: 6 covering ~7,150 lines
+- **Specialist agents**: 15 (across 2 batches; 0 rate-limited)
+- **Findings**: 38 total (0 critical, 7 high, 15 medium, 16 low)
+- **By category**: 0 security / 19 correctness / 15 quality / 4 architecture
+- **OWASP distribution**: n/a (no security-category findings)
+- **Crown-jewel overrides**: 0
+- **Cross-validated**: 6 findings independently confirmed by 2–3 agents (the TxnVarMap index race by three)
+- **Contradictions**: 1 (null map values) — resolved as a false positive caused by a stale comment, which became a finding itself
+- **Structural risks identified**: 8
+- **False positives retracted**: 1
+- **Rate-limited agents**: 0
+
+The five main-source High findings: whole-map `set` corrupts the transaction log (proven by
+executed repro — unchanged keys vanish from read-your-writes, and a following whole-map `set`
+durably leaks deleted keys); cancelling `commit` neither cancels nor rolls back (writes publish
+after timeout, parked `waitFor` transactions resurrect later); TxnVarMap's mutable index is read
+unlocked against in-place structural writes (three vectors, one of which escapes Contract C
+entirely); map-key conflict identity derives from `toString` while storage identity is `equals`
+(lost updates for `BigDecimal`-like keys); and all runtime ids collapse to 32 bits, putting
+birthday collisions in range of the advertised database-index scale. The two benchmark-scoped
+Highs: the H3-cliff scenario confounds itself with unbounded allocation, and no scenario in the
+suite ever executes H2's multi-lock ordering.
+
+Two meta-results. The conflict-detection *algebra* is sound — every agent that checked
+`IdFootprint`, the lock ordering, the park protocol, or the commit gates verified them clean, and
+the TLA+ footprint model mirrors the code exactly — but its identity *inputs* (toString, 32-bit
+ids, the unlocked index) are where the correctness holes live. And stale prose is an active bug
+vector: one stale comment produced two false bug reports inside this very hunt, and both specs
+carry narration describing deleted code (Scheduler.tla's commit action still models the removed
+dirty check).
+
+### Execution Results — 2026-07-14
+
+Six phases, **15 commits** on `fix/harden-cycle-2` (73ca304 → 3844a77), every checklist item
+executed through plan-mode + critique ratchet, revert-checked tests, and per-commit review-fix.
+
+- **Items fixed**: every fix checkbox across all six phases — committed-data correctness,
+  error/cancellation contract, liveness, model-layer sealing, documentation truth, and the
+  instrumentation cluster (both TLA+ specs, the soak meters, the JMH harness).
+- **Regression tests added**: 57 (212 → **269**, none ignored), each red-checked against the
+  unfixed code where the fix changes behaviour (doc-promise pins noted as green-on-current).
+  Plus 10 CI-level negative-control mutation checks (a new `negative-controls` job runs committed
+  spec-mutation patches on every push; a mutant that stays green fails the build).
+- **Deferrals**: 1, user-approved — the benchmark re-run/re-publication — and closed the same
+  day: re-measured on a dedicated vast.ai Ryzen 9 5950X (A→B→A, drift-gated) and republished.
+  The H3 cliff reproduced at −34.7% with zero drift; `dataDependentKey` flipped to a net +15%;
+  and the pre-H2 library deadlocked outright on the new `crossMapInsert` workload — the model's
+  counterexample reproduced live by the instrument built to measure it.
+- **In-situ discoveries**: 2 recorded in the checklist (the failure-path coverage-gate limitation,
+  documented; the wake-time re-analysis design lesson). The review loops additionally caught and
+  fixed errors in the hardening itself before commit — a wrong lock-span justification in spec
+  prose, a wrong negative-control retirement (NC-2 reinstated as the H3-fix revert), and a
+  vocabulary misuse (erratum vs short-circuit) that would have misdescribed the H3 benchmark's
+  premise.
+- **Review-fix cycles**: every commit gated; the larger commits took full multi-agent loops with
+  independent verification (Phase 4's sealing: 5 reviewers + 3 verifiers; the Scheduler.tla
+  coverage remodel: 3 reviewers), the doc/instrumentation commits took focused loops.
+- **Spec-model debt cleared**: Spec B's commit step now models the coverage gate over `LoggedFP`
+  (state space 846k → 1.90M distinct, every pinned verdict reproduced including the
+  SchedulerAbsentKey deadlock), the DirtyRestart narrative is history everywhere, and the
+  negative controls are executable.
+- **Final counts**: 269 tests; 12 CI-pinned TLC expectations (unchanged: ten clean, two red) plus
+  10 automated negative controls; MiMa vacuous on the 0.15 line throughout (re-confirmed at every
+  commit).
+
+- **Trend**: first full-scope bug hunt (Cycle 1 was prose-scoped: 2 live defects found).
+  Critical: flat (0 → 0). The live-defect count (7 High) reflects scope expansion, not
+  regression — none of the 7 were reachable by Cycle 1's methods.
+
 ## Cycle 1 — 2026-07-12
 
 **Scope**: comments, documentation, duplication. Architecture and general hygiene were out of

@@ -1,0 +1,21 @@
+--- a/specs/scheduler/Scheduler.tla
++++ b/specs/scheduler/Scheduler.tla
+@@ -1020,17 +1020,17 @@
+    do it again — an unbounded spurious spin. Its own submission cannot
+    satisfy its own predicate: it retried rather than committed. This is why
+    the retry map is keyed by TxnId rather than by footprint. *)
+ SweepWake(t, k) ==
+     /\ sweep[<<t, k>>].ph = "scan"
+     /\ sweep[<<t, k>>].pend /= {}
+     /\ retrySem = [kind |-> "sweep", t |-> t]
+     /\ \E p \in sweep[<<t, k>>].pend :
+-        IF p /= t /\ ~IsCompatible(sweep[<<t, k>>].fp, declared[p]) /\ p \in parked
++        IF ~IsCompatible(sweep[<<t, k>>].fp, declared[p]) /\ p \in parked
+         THEN /\ parked' = parked \ {p}
+              /\ IF inc[p] < MaxInc
+                 THEN /\ inc'          = [inc EXCEPT ![p] = @ + 1]
+                      /\ tally'        = [tally EXCEPT ![p] = 0]
+                      /\ unsubs'       = [unsubs EXCEPT ![p] = {}]
+                      /\ status'       = [status EXCEPT ![p] = "NotScheduled"]
+                      /\ cascadeFired' = [cascadeFired EXCEPT ![p] = FALSE]
+                      /\ hasDown'      = [hasDown EXCEPT ![p] = FALSE]

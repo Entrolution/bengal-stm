@@ -64,7 +64,7 @@ package object all {
       STM[F].setTxnVarMap(newValueMap, txnVarMap)
 
     /** Replaces the entire map state via an effect. The effect must not encapsulate side effects. */
-    def set(newValueMap: F[Map[K, V]]): Txn[Unit] =
+    def setF(newValueMap: F[Map[K, V]]): Txn[Unit] =
       STM[F].setTxnVarMapF(newValueMap, txnVarMap)
 
     /** Modifies the entire map by applying a pure function. */
@@ -75,7 +75,9 @@ package object all {
     def modifyF(f: Map[K, V] => F[Map[K, V]]): Txn[Unit] =
       STM[F].modifyTxnVarMapF(f, txnVarMap)
 
-    /** Retrieves the value for a key, returning `None` if the key was deleted in this transaction. */
+    /** Retrieves the value for a key. Returns `None` when the key does not exist — whether it was never created, or was
+      * deleted earlier in this transaction. It does not fail.
+      */
     def get(key: => K): Txn[Option[V]] =
       STM[F].getTxnVarMapValue(key, txnVarMap)
 
@@ -83,20 +85,29 @@ package object all {
     def set(key: => K, newValue: => V): Txn[Unit] =
       STM[F].setTxnVarMapValue(key, newValue, txnVarMap)
 
-    /** Upserts a key-value pair via an effect. The effect must not encapsulate side effects. */
+    /** Upserts a key-value pair via an effect. Creates the key if not present. The effect must not encapsulate side
+      * effects.
+      */
     def setF(key: => K, newValue: F[V]): Txn[Unit] =
       STM[F].setTxnVarMapValueF(key, newValue, txnVarMap)
 
-    /** Modifies the value for a key by applying a pure function. Throws if the key is absent. */
+    /** Modifies the value for a key by applying a pure function. FAILS THE TRANSACTION if the key is absent: nothing is
+      * thrown at `Txn`-construction time, the resulting `F` from `commit` fails, no writes are published, and it is
+      * recoverable with `handleErrorWith`.
+      */
     def modify(key: => K, f: V => V): Txn[Unit] =
       STM[F].modifyTxnVarMapValue(key, f, txnVarMap)
 
-    /** Modifies the value for a key by applying an effectful function. The function must not encapsulate side effects.
+    /** Modifies the value for a key by applying an effectful function. FAILS THE TRANSACTION if the key is absent, on
+      * the same terms as `modify(key, f)` above — a failed `F`, not a thrown exception, and recoverable. The function
+      * must not encapsulate side effects.
       */
     def modifyF(key: => K, f: V => F[V]): Txn[Unit] =
       STM[F].modifyTxnVarMapValueF(key, f, txnVarMap)
 
-    /** Removes a key-value pair from the map. Throws if the key is absent. */
+    /** Removes a key-value pair from the map. FAILS THE TRANSACTION if the key is absent, on the same terms as
+      * `modify(key, f)` above — a failed `F`, not a thrown exception, and recoverable.
+      */
     def remove(key: => K): Txn[Unit] =
       STM[F].removeTxnVarMapValue(key, txnVarMap)
   }

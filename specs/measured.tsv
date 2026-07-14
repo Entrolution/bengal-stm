@@ -13,5 +13,5 @@ specs/commit/CommitH3.cfg                 	51	45	21
 specs/commit/CommitH3Partial.cfg          	91	69	27
 specs/commit/CommitH3Writer.cfg           	45	41	20
 specs/commit/CommitH6.cfg                 	155	97	25
-specs/scheduler/Scheduler.cfg             	3775555	845687	85
+specs/scheduler/Scheduler.cfg             	8637265	1900552	84
 specs/scheduler/SchedulerRetry.cfg        	22483	7665	61

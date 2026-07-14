@@ -42,7 +42,7 @@ class IdFootprintPropertySpec extends AnyFreeSpec with ScalaCheckPropertyChecks 
   implicit override val generatorDrivenConfig: PropertyCheckConfiguration =
     PropertyCheckConfiguration(minSuccessful = 200)
 
-  private val genRawId: Gen[Int] = Gen.choose(0, 20)
+  private val genRawId: Gen[Long] = Gen.choose(0L, 20L)
 
   private val genTxnVarRuntimeId: Gen[TxnVarRuntimeId] = for {
     value     <- genRawId
@@ -232,6 +232,56 @@ class IdFootprintPropertySpec extends AnyFreeSpec with ScalaCheckPropertyChecks 
   "validation never removes write IDs" in {
     forAll(genIdFootprint) { fp =>
       fp.getValidated.updatedIds shouldBe fp.updatedIds
+    }
+  }
+
+  /* The enforcement half of the isValidated memo's soundness: the content-
+   * changing ops reset the flag, so no interleaving of mutation and validation
+   * can leave a footprint that CLAIMS validation while holding undeduped reads.
+   * Validate is generated frequently on purpose — validate-then-mutate is the
+   * sequence a sticky flag gets wrong, and a generator that rarely validates
+   * mid-stream would barely exercise it.
+   */
+  "any op sequence ending in getValidated yields fully-deduped reads" in {
+    sealed trait FootprintOp
+    case class AddRead(id: TxnVarRuntimeId) extends FootprintOp
+    case class AddWrite(id: TxnVarRuntimeId) extends FootprintOp
+    case class Merge(fp: IdFootprint) extends FootprintOp
+    case object Validate extends FootprintOp
+
+    val genOp: Gen[FootprintOp] = Gen.frequency(
+      2 -> genTxnVarRuntimeId.map(AddRead(_)),
+      2 -> genTxnVarRuntimeId.map(AddWrite(_)),
+      // The merge ARGUMENT can itself be validated. A generator that cannot
+      // reach that flag would let a flag-combining mergeWith mutant pass —
+      // the exact restriction this file's header warns about.
+      1 -> genIdFootprint.flatMap(fp => Gen.oneOf(fp, fp.getValidated)).map(Merge(_)),
+      2 -> Gen.const(Validate)
+    )
+
+    def applyOp(fp: IdFootprint, op: FootprintOp): IdFootprint =
+      op match {
+        case AddRead(id) => fp.addReadId(id)
+        case AddWrite(id) => fp.addWriteId(id)
+        case Merge(other) => fp.mergeWith(other)
+        case Validate => fp.getValidated
+      }
+
+    forAll(genIdFootprint, Gen.listOf(genOp)) { (start, ops) =>
+      val folded = ops.foldLeft(start)(applyOp)
+      val result = folded.getValidated
+      result.readIds.intersect(result.updatedIds) shouldBe empty
+      result.readIds.foreach { id =>
+        id.parent.foreach { p =>
+          result.updateRawIds should not contain p.value
+        }
+      }
+      // The memo must also be observationally transparent: validating through
+      // whatever flag state the ops left behind equals validating from scratch.
+      val fresh = folded.copy(isValidated = false).getValidated
+      result.readIds shouldBe fresh.readIds
+      result.updatedIds shouldBe fresh.updatedIds
+      result.isUnderApproximated shouldBe fresh.isUnderApproximated
     }
   }
 

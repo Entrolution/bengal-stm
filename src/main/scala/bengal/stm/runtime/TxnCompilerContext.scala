@@ -18,6 +18,7 @@ package ai.entrolution
 package bengal.stm.runtime
 
 import scala.annotation.nowarn
+import scala.util.control.NoStackTrace
 
 import cats.arrow.FunctionK
 import cats.data.StateT
@@ -41,29 +42,55 @@ private[stm] trait TxnCompilerContext[F[_]] {
     idFootprint: IdFootprint
   ) extends RuntimeException
 
-  // @nowarn on BOTH FunctionK.apply methods below, and not for exhaustivity:
-  // each match ends in `case _ =>`, so it is exhaustive by construction and no
-  // compiler ever asks. What the annotation suppresses is the free-monad
-  // interpreter's unavoidable Unit casts. A FunctionK must produce a V for every
-  // op, including the ops whose result genuinely is Unit — the setters, the
-  // no-ops, the errata — so those arms hand back ().asInstanceOf[V], and Scala
-  // 2.13 flags every one as a "dubious usage of asInstanceOf with unit value".
-  // Scala 3 instead flags the opposite: the trailing `case _ =>` in
-  // txnLogCompiler's erratum match is UNREACHABLE, TxnRetry and TxnError having
-  // already exhausted TxnErratum. CI compiles both, with warnings fatal.
+  // The walker reached a terminal erratum — a waitFor retry or an abort — and
+  // STOPPED. Unlike StaticAnalysisShortCircuitException above, the carried
+  // footprint is COMPLETE for this attempt, not partial: everything past the
+  // erratum is unreachable in the run pass too (the run terminates at the same
+  // node when the passes agree, and the commit-time coverage gate refines when
+  // they diverge). The erratum kind travels along because TxnHandleError's
+  // analysis arm must mirror the runtime's split: errors are recoverable and
+  // the walk resumes past the handler, but a retry is not absorbable and must
+  // stop the whole analysis. NoStackTrace: this is raised on every park
+  // attempt's analysis pass, and the trace is noise.
+  private[stm] case class StaticAnalysisErratumStopException(
+    idFootprint: IdFootprint,
+    erratum: TxnErratum
+  ) extends RuntimeException
+      with NoStackTrace
+
+  // @nowarn on BOTH FunctionK.apply methods below, and not for exhaustivity.
+  // What the annotation suppresses is the free-monad interpreter's unavoidable
+  // Unit casts. A FunctionK must produce a V for every op, including the ops
+  // whose result genuinely is Unit — the setters, the no-ops, the errata — so
+  // those arms hand back ().asInstanceOf[V], and Scala 2.13 flags every one as
+  // a "dubious usage of asInstanceOf with unit value". Scala 3 instead flags
+  // the opposite: the trailing `case _ =>` in txnLogCompiler's erratum match is
+  // UNREACHABLE, TxnRetry and TxnError having already exhausted TxnErratum. CI
+  // compiles both, with warnings fatal.
   //
-  // The two walkers do not cover the same ground, which matters more than the
-  // annotation does. txnLogCompiler enumerates the errata — TxnRetry schedules a
-  // retry, TxnError raises. staticAnalysisCompiler matches NO erratum: its
-  // `case _ =>` swallows the whole Left side, so the walk carries on past a
-  // retry or an abort that will terminate the real run. That is safe, because a
-  // footprint declares what a transaction MAY touch: walking past a
-  // short-circuit can only OVER-approximate, and over-approximation costs
-  // concurrency rather than soundness (`covers` still holds; the scheduler just
-  // serializes more than it needs to). Under-approximation is the unsound
-  // direction — H3, and the reason TxnRuntime.commit flags it. Where the
-  // continuation cannot cope with the Unit it gets handed back, the walk throws
-  // instead, and that same handler flags the footprint.
+  // BOTH walkers stop at a terminal erratum, each in its own way. txnLogCompiler
+  // enumerates the errata — TxnRetry schedules a retry (which throws), TxnError
+  // raises. staticAnalysisCompiler raises StaticAnalysisErratumStopException,
+  // and the footprint it carries is COMPLETE: the run pass terminates at the
+  // same node, so nothing past it can be touched this attempt. The walker USED
+  // to walk past errata instead, on the argument that over-approximation only
+  // costs concurrency — true, but walking past is also what made post-waitFor
+  // nodes analysable, and a throw there (the ordinary read-your-own-write
+  // fallback shape) marked the footprint UNDER-approximated. A blocked
+  // transaction with an under-approximated footprint is incompatible with
+  // everything: it cannot park quietly, is woken by every commit, and wakes
+  // every other parked transaction when it resubmits. Stopping at the erratum
+  // makes that flag unmanufacturable on the park path — the parking footprint
+  // is exactly the pre-waitFor read set, which is the predicate's dependency
+  // set by the waitFor contract — and it stops thunks positioned after a
+  // terminal erratum from running in a pass whose run-side never reaches them.
+  // Divergence between the passes (the predicate flipping between analysis and
+  // run) is caught by the commit-time coverage gate, which refines from the
+  // actual log and re-runs — the same road every data-dependent divergence
+  // takes. That includes every wake whose continuation writes: wakes fire from
+  // pre-publish submission sweeps (H1), so no analysis timed anywhere before
+  // the woken run can see the satisfied predicate — the refinement lap is the
+  // structural price of the stop, bounded at one per wake.
   private[stm] def staticAnalysisCompiler: FunctionK[TxnOrErr, IdFootprintStore] =
     new (FunctionK[TxnOrErr, IdFootprintStore]) {
 
@@ -200,11 +227,11 @@ private[stm] trait TxnCompilerContext[F[_]] {
                       Async[F].delay((s.markUnderApproximated, ()))
                     }
                 }
-              // The FOURTH error-swallowing handler in this walker, and the only
-              // one that neither short-circuits nor flags — so read it against
-              // the three above, which call the flag mandatory.
+              // The error-swallowing handler in this walker that neither
+              // short-circuits nor flags — read it against the three write-arm
+              // handlers above, which call the flag mandatory.
               //
-              // On an inner failure this returns `s`, discarding everything the
+              // On an inner ERROR this returns `s`, discarding everything the
               // inner analysis accumulated, a
               // StaticAnalysisShortCircuitException's partial footprint
               // included. And adt.f — the RECOVERY branch — is never analysed at
@@ -226,6 +253,17 @@ private[stm] trait TxnCompilerContext[F[_]] {
               // IdFootprint.isCompatibleWith), so the transaction would be
               // serialized against all peers for good rather than re-running once
               // with an accurate footprint.
+              //
+              // A RETRY-origin stop is the one thing this arm must NOT swallow,
+              // mirroring txnLogCompiler's handler arm, which re-raises
+              // TxnRetryException past handlers (a retry is not absorbable).
+              // Swallowing it here would drop the block's pre-waitFor reads
+              // from the declared footprint AND hand the post-handler
+              // continuation a Unit it may force — a throw there would mark the
+              // footprint under-approximated, recreating the very storm the
+              // erratum stop exists to prevent. Re-raised, the stop's carried
+              // footprint was built with the in-block state, so the eventual
+              // park footprint includes the block's reads exactly.
               case adt: TxnHandleError[_] =>
                 StateT[F, IdFootprint, V] { s =>
                   adt.fa
@@ -234,15 +272,24 @@ private[stm] trait TxnCompilerContext[F[_]] {
                         .foldMap(staticAnalysisCompiler)
                         .run(s)
                     }
-                    .handleErrorWith { _ =>
-                      Async[F].delay((s, ().asInstanceOf[V]))
+                    .handleErrorWith {
+                      case e @ StaticAnalysisErratumStopException(_, TxnRetry) =>
+                        Async[F].raiseError(e)
+                      case _ =>
+                        Async[F].delay((s, ().asInstanceOf[V]))
                     }
                 }
               case _ =>
                 noOp[IdFootprint].map(_.asInstanceOf[V])
             }
-          case _ =>
-            noOp[IdFootprint].map(_.asInstanceOf[V])
+          case Left(erratum) =>
+            // A terminal erratum: the walk STOPS, carrying the accumulated
+            // footprint as COMPLETE. See the header comment; the run pass
+            // terminates at this same node when the passes agree, and the
+            // coverage gate refines when they diverge.
+            StateT[F, IdFootprint, V] { s =>
+              Async[F].raiseError(StaticAnalysisErratumStopException(s, erratum))
+            }
         }
     }
 
@@ -307,26 +354,37 @@ private[stm] trait TxnCompilerContext[F[_]] {
                   s.deleteVarMapValue(adt.key, adt.txnVarMap)
                     .map((_, ()))
                 }
+              // Recovery is EXCEPTION-based: errors short-circuit the fold as a
+              // raised TxnErrorException (TxnLogContext.raiseError and
+              // TxnLogValid.delay's handler), so the guarded block's failure
+              // arrives here as a raised F, never as a threaded TxnLogError
+              // state. Recovery runs against the PRE-BLOCK state `s` — every
+              // write the failed block staged is rolled back by construction.
+              //
+              // The last arm catches raw throwables too (a `map` function
+              // throwing mid-glue, a by-name Txn constructor throwing): the
+              // IMMEDIATE handler recovers them, where the state-threaded
+              // design routed them past its own recovery dispatch and only a
+              // second, enclosing handler could catch them. A retry is the one
+              // signal deliberately NOT absorbable — a blocked transaction
+              // stays blocked (re-raised, as before).
+              //
+              // An error raised by the RECOVERY branch itself is not re-caught
+              // here — it propagates to the next enclosing handler, or to the
+              // caller. That matches the state-threaded behaviour.
               case adt: TxnHandleError[_] =>
                 StateT[F, TxnLog, V] { s =>
                   (for {
                     materializedF <- adt.fa
                     originalResult <-
                       materializedF.foldMap(txnLogCompiler).run(s)
-                    finalResult <- originalResult._1 match {
-                                     case TxnLogError(ex) =>
-                                       adt
-                                         .f(ex)
-                                         .flatMap {
-                                           _.foldMap(txnLogCompiler)
-                                             .run(s)
-                                         }
-                                     case _ =>
-                                       Async[F].pure(originalResult)
-                                   }
-                  } yield (finalResult._1, finalResult._2)).handleErrorWith {
-                    case ex: TxnRetryException => Async[F].raiseError(ex)
-                    case ex => s.raiseError(ex).map((_, ().asInstanceOf[V]))
+                  } yield originalResult).handleErrorWith {
+                    case ex: TxnRetryException =>
+                      Async[F].raiseError(ex)
+                    case TxnErrorException(originalEx) =>
+                      adt.f(originalEx).flatMap(_.foldMap(txnLogCompiler).run(s))
+                    case ex =>
+                      adt.f(ex).flatMap(_.foldMap(txnLogCompiler).run(s))
                   }
                 }
               case _ =>

@@ -54,14 +54,14 @@ class FVariantSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers with Stm
     }
   }
 
-  "TxnVarMap.set(F[Map])" - {
+  "TxnVarMap.setF(F[Map])" - {
     "set entire map via effect" in {
       val newMap = Map("x" -> 1, "y" -> 2)
 
       withRuntime { implicit stm =>
         for {
           tVarMap <- TxnVarMap.of(Map("a" -> 10))
-          _       <- tVarMap.set(IO.pure(newMap)).commit
+          _       <- tVarMap.setF(IO.pure(newMap)).commit
           result  <- tVarMap.get.commit
         } yield result
       }
@@ -118,6 +118,23 @@ class FVariantSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers with Stm
         } yield result
       }
         .asserting(_ shouldBe Some(15))
+    }
+
+    // The F-variant fails on an absent key exactly like pure modify (both build
+    // the same ADT), and recovery goes through handleErrorWith — the contract
+    // its scaladoc states. Pinned here so the variants cannot silently diverge.
+    "fail the transaction on an absent key, recoverably" in {
+      withRuntime { implicit stm =>
+        for {
+          tVarMap <- TxnVarMap.of(Map("a" -> 10))
+          result <- tVarMap
+                      .modifyF("missing", v => IO.pure(v + 5))
+                      .map(_ => "not-recovered")
+                      .handleErrorWith(ex => STM[IO].pure(ex.getMessage))
+                      .commit
+        } yield result
+      }
+        .asserting(_ should include("missing"))
     }
   }
 

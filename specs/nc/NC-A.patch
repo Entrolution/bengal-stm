@@ -1,0 +1,39 @@
+--- a/specs/scheduler/Scheduler.tla	2026-07-14 13:01:58
++++ b/specs/scheduler/Scheduler.tla	2026-07-14 13:01:58
+@@ -962,32 +962,32 @@
+    The reverse order (stale, then scan) LOSES WAKEUPS: a conflictor can commit
+    after the stale read and leave activeTransactions before the scan, escaping
+    both. That is not a hypothetical — negative control NC-A commits exactly
+    that reversal as a patch (specs/nc/, run by negative_controls.sh on every
+    push) and SchedulerRetry.cfg deadlocks in a 36-state trace, with tw's
+    ExecCommit and ExecRegComplete landing in exactly the gap between tr's
+    stale read and tr's scan. *)
+ ExecParkStale(t, s) ==
+-    /\ exec[<<t, s>>].pc = "parkStale"
++    /\ exec[<<t, s>>].pc = "parkScan"
+     /\ retrySem = [kind |-> "park", t |-> t]
+     \* LoggedFP, not ActualFP: anyReadChangedSinceRead folds over log.values,
+     \* so a read that recorded no entry is INVISIBLE to this check.
+     /\ parkChk' = [parkChk EXCEPT ![<<t, s>>].st =
+                       \E v \in CombinedIds(LoggedFP(t)) : version[v] /= snap[<<t, s>>][v]]
+-    /\ exec' = [exec EXCEPT ![<<t, s>>].pc = "parkInsert"]
++    /\ exec' = [exec EXCEPT ![<<t, s>>].pc = "parkStale"]
+     /\ UNCHANGED <<txnVars, submitVars, unsubW, active, graphSem, version,
+                    parked, retrySem, sweep, droppedSweep, truncatedWake>>
+ 
+ ExecParkScan(t, s) ==
+-    /\ exec[<<t, s>>].pc = "parkScan"
++    /\ exec[<<t, s>>].pc = "parkStale"
+     /\ retrySem = [kind |-> "park", t |-> t]
+     /\ parkChk' = [parkChk EXCEPT ![<<t, s>>].cf =
+                       \E a \in active : ~IsCompatible(declared[t], declared[a])]
+-    /\ exec' = [exec EXCEPT ![<<t, s>>].pc = "parkStale"]
++    /\ exec' = [exec EXCEPT ![<<t, s>>].pc = "parkInsert"]
+     /\ UNCHANGED <<txnVars, submitVars, unsubW, active, graphSem, version,
+                    parked, retrySem, sweep, droppedSweep, truncatedWake>>
+ 
+ ExecParkInsert(t, s) ==
+     /\ exec[<<t, s>>].pc = "parkInsert"
+     /\ retrySem = [kind |-> "park", t |-> t]
+     /\ parkChk' = [parkChk EXCEPT ![<<t, s>>] = [cf |-> FALSE, st |-> FALSE]]
+     /\ retrySem' = NoHolder

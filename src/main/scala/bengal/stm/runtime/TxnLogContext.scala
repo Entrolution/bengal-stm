@@ -18,6 +18,7 @@ package ai.entrolution
 package bengal.stm.runtime
 
 import scala.annotation.nowarn
+import scala.util.control.NoStackTrace
 
 import cats.effect.implicits._
 import cats.effect.kernel.{ Async, Resource }
@@ -327,7 +328,7 @@ private[stm] trait TxnLogContext[F[_]] {
 
     // The map-lock fallback: a key that does not yet exist has no TxnVar, so this
     // entry locks the MAP's structural commitLock while being logged under the
-    // existential id hashed from (mapId, key). Owner and log key are different
+    // existential id allocated for (map, key). Owner and log key are different
     // entities — the id-space split withLock's ordering turns on.
     override private[stm] lazy val lock: F[Option[(TxnVarRuntimeId, Semaphore[F])]] =
       for {
@@ -351,18 +352,23 @@ private[stm] trait TxnLogContext[F[_]] {
 
     private[stm] def getVar[V](txnVar: TxnVar[F, V]): F[(TxnLog, V)]
 
-    // @nowarn on base TxnLog methods: These are no-op defaults that intentionally ignore
-    // their parameters (returning Unit cast to V, empty maps, or self unchanged). They exist
-    // so that terminal log states (TxnLogRetry, TxnLogError) inherit safe defaults without
-    // reimplementing every method. TxnLogValid overrides all of these with real logic.
-    // The compiler warns about unused parameters, which is expected and correct here.
+    // Base TxnLog methods: DEFENSIVE TOTALITY ONLY. Terminal log states
+    // (TxnLogRetry, TxnLogError) inherit these defaults, but an intact
+    // interpreter can no longer reach them mid-fold: a retry THROWS
+    // TxnRetryException (scheduleRetry) and an error THROWS TxnErrorException
+    // (raiseError, TxnLogValid.delay's handler), so the fold stops at the
+    // first terminal event and no continuation ever runs against a terminal
+    // state. TxnLogValid overrides all of these with real logic.
+    //
+    // @nowarn where a default still ignores its parameter; `delay` keeps the
+    // Unit cast because it must not run the effect and has no value to give —
+    // acceptable only BECAUSE the arm is unreachable.
     @nowarn
     private[stm] def delay[V](value: F[V]): F[(TxnLog, V)] =
       Async[F].delay(self, ().asInstanceOf[V])
 
-    @nowarn
     private[stm] def pure[V](value: V): F[(TxnLog, V)] =
-      Async[F].pure(self, ().asInstanceOf[V])
+      Async[F].pure((self, value))
 
     @nowarn
     private[stm] def setVar[V](
@@ -414,9 +420,16 @@ private[stm] trait TxnLogContext[F[_]] {
     ): F[TxnLog] =
       Async[F].pure(self)
 
-    @nowarn
+    // The one base default whose no-op form would be actively unsafe if the
+    // mid-fold invariant (state is always TxnLogValid) were ever broken:
+    // swallowing an error silently. Raise instead — unreachable today, loud if
+    // that ever changes.
     private[stm] def raiseError(ex: Throwable): F[TxnLog] =
-      Async[F].pure(self)
+      ex match {
+        case e: TxnRetryException => Async[F].raiseError(e)
+        case e: TxnErrorException => Async[F].raiseError(e)
+        case e => Async[F].raiseError(TxnErrorException(e))
+      }
 
     private[stm] def scheduleRetry: F[TxnLog]
 
@@ -441,7 +454,7 @@ private[stm] trait TxnLogContext[F[_]] {
     // TWO UNRELATED ID SPACES, and every keyed operation has to choose between them
     // identically. A key that EXISTS has a TxnVar, and its log entry is keyed by that
     // VAR's own runtimeId. A key that does NOT exist yet has no TxnVar, and its entry is
-    // keyed by the EXISTENTIAL id hashed from (mapId, key) — the same id the static
+    // keyed by the EXISTENTIAL id allocated for (map, key) — the same id the static
     // analysis walker puts in the footprint, which is why the scheduler can protect a read
     // of a key that is not there. (Which LOCK it takes is a third question again: a new-key
     // entry locks the MAP's structural commitLock. That was H2.)
@@ -466,17 +479,22 @@ private[stm] trait TxnLogContext[F[_]] {
         entry <- getLogEntry[Option[V]](rid)
       } yield (rid, oTxnVar, entry)
 
-    // @nowarn: the error branch has no V to hand back — the log is now a
-    // TxnLogError and the fold is running only to reach a handleError — so it
-    // returns ().asInstanceOf[V], which Scala 2.13 flags as a dubious Unit cast.
-    @nowarn
+    // A failed effect SHORT-CIRCUITS the fold: there is no V to hand a
+    // continuation, so none may run. The carrier makes the failure catchable
+    // by TxnHandleError (which recovers with the ORIGINAL exception) and
+    // unwrappable by getTxnLogResult; threading a TxnLogError state instead —
+    // the old design — forced a bogus unit into the value channel, which a
+    // typed continuation then cast (ClassCastException masking the user's
+    // real error).
     override private[stm] def delay[V](
       value: F[V]
     ): F[(TxnLog, V)] =
       value
         .map((this.asInstanceOf[TxnLog], _))
-        .handleErrorWith { ex =>
-          Async[F].delay((TxnLogError(ex), ().asInstanceOf[V]))
+        .handleErrorWith {
+          case e: TxnRetryException => Async[F].raiseError(e)
+          case e: TxnErrorException => Async[F].raiseError(e)
+          case ex => Async[F].raiseError(TxnErrorException(ex))
         }
 
     override private[stm] def pure[V](value: V): F[(TxnLog, V)] =
@@ -671,20 +689,34 @@ private[stm] trait TxnLogContext[F[_]] {
       }
     }
 
-    // Computes the log entry a write WOULD need, or None if it needs none. Used by
-    // setVarMap to diff a whole-map replacement into per-key entries.
+    // Computes the log entry a write needs. Used by setVarMap to diff a whole-map
+    // replacement into per-key entries.
     //
-    // ONE RULE, and the two id spaces do not change it: if the new value differs from what
-    // was there, record an update; if it does not, nothing changed and no entry is needed.
-    // A live key's "what was there" is its value; an ABSENT key's is None. So inserting
-    // into an absent key records an entry (None -> Some), and "deleting" an absent key
-    // records nothing (None -> None) because nothing changed.
+    // ONE RULE, and the two id spaces do not change it: if the new value differs from
+    // what was there, record an update; if it does not, record a READ-ONLY entry for the
+    // unchanged key. A live key's "what was there" is its value; an ABSENT key's is None.
     //
-    // That last case reads like a silent no-op next to removeTxnVarMapValue, which FAILS
-    // the transaction on an absent key. They are not in conflict: this is setVarMap's
-    // internal diff, where a key absent from both the old and new map is simply not a
-    // change, and `remove` is a user asking to delete something that is not there. The two
-    // used to be written far apart and it was easy to read them as contradicting.
+    // The read-only entry for an unchanged key is not optional bookkeeping. setVarMap
+    // logs the map's STRUCTURE entry, and extractMap reconstructs a whole-map view from
+    // the per-key entries ALONE whenever the structure entry is present — its invariant
+    // is "structure entry present => every live key has a per-key entry". getVarMap
+    // establishes that invariant when reading; this diff must establish it when writing,
+    // or unchanged keys vanish from same-transaction whole-map reads and a LATER
+    // whole-map set diffs against the truncated view and never records its deletions —
+    // leaked keys that survive the commit. An unchanged key already IN the log was never
+    // the gap (entry.set collapses an equal-valued update to a read-only entry itself);
+    // only the never-logged unchanged key was. Footprint-wise the new read entries are
+    // free: their parent is the map, and the structure WRITE setVarMap declares covers
+    // parent-child reads and writes alike.
+    //
+    // A key absent from both the old and new map records an absence read (None -> None)
+    // — defensively uniform, though setVarMap's deletion diff cannot produce it (it
+    // draws deletions from the current view, whose keys exist). That arm reads like a
+    // silent no-op next to removeTxnVarMapValue, which FAILS the transaction on an
+    // absent key. They are not in conflict: this is setVarMap's internal diff, where a
+    // key absent from both sides is not a change, and `remove` is a user asking to
+    // delete something that is not there. The two used to be written far apart and it
+    // was easy to read them as contradicting.
     private def writeVarMapValueEntry[K, V](
       key: K,
       newOpt: Option[V],
@@ -702,7 +734,13 @@ private[stm] trait TxnLogContext[F[_]] {
                        }
           } yield
             if (initial == newOpt) {
-              None
+              Some(
+                (
+                  rid,
+                  TxnLogReadOnlyVarMapEntry(key, initial, txnVarMap)
+                    .asInstanceOf[TxnLogEntry[Option[V]]]
+                )
+              )
             } else {
               Some(
                 (
@@ -778,24 +816,38 @@ private[stm] trait TxnLogContext[F[_]] {
     // The user-facing keyed write: map.set(k, v) and map.remove(k).
     //
     // Same rule as writeVarMapValueEntry -- if the new value differs from the initial,
-    // record an update -- with ONE deliberate difference at the bottom: removing a key that
-    // is not there FAILS the transaction, because the user asked to delete something that
-    // does not exist and STM.scala says so. writeVarMapValueEntry returns None for the same
-    // input instead, and that is not a contradiction: it serves setVarMap's internal diff,
-    // where a key absent from both the old and the new map is simply not a change. The two
-    // used to be written far apart, and it was easy to read them as opposite policies.
+    // record an update -- with ONE deliberate difference: removing a key that is not
+    // there FAILS the transaction, because the user asked to delete something that does
+    // not exist and STM.scala says so. As in modifyVarMapValue, "not there" is a fact
+    // about the key's logical VALUE, not about log-entry existence: a key removed
+    // earlier in this transaction, or recorded absent by a read, has an entry whose
+    // value is None -- and removing it fails exactly like removing a key that never
+    // existed. writeVarMapValueEntry returns None for the same input instead, and that
+    // is not a contradiction: it serves setVarMap's internal diff, where a key absent
+    // from both the old and the new map is simply not a change. The two used to be
+    // written far apart, and it was easy to read them as opposite policies.
     //
-    // NOTE ON NULL. `initial` is built with Some(...) here and Option(...) in the read
-    // paths, and for a null value those disagree. It is not observable today, because a null
-    // map value is invisible on the way back out: Option(null) is None, so get(key) reports
-    // the key as ABSENT and extractMap drops it from a whole-map read. Storing null in a
-    // TxnVarMap silently loses the key. That is a real defect and it is tracked separately;
-    // preserving behaviour exactly is the whole point of a collapse, so it is not fixed here.
+    // NULL VALUES are preserved end to end: a stored null reads back as Some(null) — the
+    // key is present, its value is null — and only a genuinely absent key reads as None.
+    // Every path builds `initial` and reads with Some(...), never Option(...), which would
+    // collapse null to None and conflate "value is null" with "key is absent".
+    // NullResultSpec pins both the keyed read and the whole-map extraction.
     private def writeVarMapValue[K, V](
       key: F[K],
       newOpt: Option[F[V]],
       txnVarMap: TxnVarMap[F, K, V]
     ): F[TxnLog] = {
+      // Removing a logically absent key fails the transaction — raised (not
+      // state-threaded) so the trailing handleErrorWith(raiseError) wraps it and
+      // an enclosing TxnHandleError can recover it like any other error. One def
+      // for both absent shapes below, so the policy and message cannot drift.
+      def raiseRemoveAbsent(materializedKey: K): F[TxnLog] =
+        Async[F].raiseError[TxnLog](
+          new RuntimeException(
+            s"Tried to remove non-existent key $materializedKey in transactional map"
+          )
+        )
+
       val resultSpec = for {
         materializedKey    <- key
         materializedNewOpt <- newOpt.traverse(identity)
@@ -803,9 +855,17 @@ private[stm] trait TxnLogContext[F[_]] {
         (rid, oTxnVar, oEntry) = resolved
         result <- oEntry match {
                     case Some(entry) =>
-                      Async[F].delay(
-                        TxnLogValid(log + (rid -> entry.set(materializedNewOpt))): TxnLog
-                      )
+                      (materializedNewOpt, entry.get) match {
+                        // Remove of a key this transaction already holds as absent
+                        // (removed earlier, or read while absent): the entry's value
+                        // is None, so the key is logically not there to remove.
+                        case (None, None) =>
+                          raiseRemoveAbsent(materializedKey)
+                        case _ =>
+                          Async[F].delay(
+                            TxnLogValid(log + (rid -> entry.set(materializedNewOpt))): TxnLog
+                          )
+                      }
 
                     case None =>
                       oTxnVar match {
@@ -844,13 +904,9 @@ private[stm] trait TxnLogContext[F[_]] {
                                 ): TxnLog
                               )
 
-                            // Remove of a key that is not there. Fails the transaction.
+                            // Remove of a key that is not there.
                             case None =>
-                              Async[F].delay(TxnLogError {
-                                new RuntimeException(
-                                  s"Tried to remove non-existent key $materializedKey in transactional map"
-                                )
-                              }: TxnLog)
+                              raiseRemoveAbsent(materializedKey)
                           }
                       }
                   }
@@ -889,12 +945,10 @@ private[stm] trait TxnLogContext[F[_]] {
                             TxnLogValid(log + (rid -> entry.set(Some(evaluation)))): TxnLog
                           }
                         case None =>
-                          Async[F].delay(
-                            TxnLogError(
-                              new RuntimeException(
-                                s"Key $materializedKey not found for modification"
-                              )
-                            ): TxnLog
+                          Async[F].raiseError[TxnLog](
+                            new RuntimeException(
+                              s"Key $materializedKey not found for modification"
+                            )
                           )
                       }
 
@@ -916,12 +970,10 @@ private[stm] trait TxnLogContext[F[_]] {
                           ): TxnLog
 
                         case None =>
-                          Async[F].delay(
-                            TxnLogError(
-                              new RuntimeException(
-                                s"Key $materializedKey not found for modification"
-                              )
-                            ): TxnLog
+                          Async[F].raiseError[TxnLog](
+                            new RuntimeException(
+                              s"Key $materializedKey not found for modification"
+                            )
                           )
                       }
                   }
@@ -936,16 +988,25 @@ private[stm] trait TxnLogContext[F[_]] {
     ): F[TxnLog] =
       writeVarMapValue[K, V](key, None, txnVarMap)
 
+    // Errors SHORT-CIRCUIT the fold, exactly as retries do below: past the
+    // first error there is no value to hand any continuation, so none may
+    // run. TxnHandleError catches the carrier and runs its recovery branch
+    // against the PRE-BLOCK state (rollback of everything the failed block
+    // staged), and getTxnLogResult unwraps it at the boundary, so the user
+    // always sees the ORIGINAL exception. Already-wrapped carriers pass
+    // through untouched — a re-wrap would bury the original one level deeper
+    // at every enclosing handler.
     override private[stm] def raiseError(ex: Throwable): F[TxnLog] =
-      Async[F].delay(TxnLogError(ex))
+      ex match {
+        case e: TxnRetryException => Async[F].raiseError(e)
+        case e: TxnErrorException => Async[F].raiseError(e)
+        case e => Async[F].raiseError(TxnErrorException(e))
+      }
 
     // We throw here to short-circuit the Free compiler recursion.
     // There is no point in processing anything else beyond the retry,
     // which could lead to impossible casts being attempted, which would
     // just throw anyway.
-    // Note that we do not throw on `raiseError` as the Txn may contain
-    // a handleError entry; i.e. we can not simply short-circuit the
-    // recursion.
     override private[stm] def scheduleRetry: F[TxnLog] =
       throw TxnRetryException(this)
 
@@ -965,18 +1026,21 @@ private[stm] trait TxnLogContext[F[_]] {
     // bug was latent while this was only forced on the dirty path (where the log
     // is non-empty by construction); the H6 coverage check forces it on every
     // commit, which is what brought it out.
-    // `traverse`, NOT `parTraverse`. Every entry's idFootprint is a pure
-    // computation — a cached runtimeId for a var, a UUID hash for a map entry —
-    // so there is nothing to overlap and a fiber per entry is pure overhead.
-    // That did not matter while this was forced only on the dirty path; the H6
-    // coverage check forces it on EVERY commit, and a whole-map read expands
-    // into a log entry per key, so the fiber count tracked the map size.
+    // `traverse`, NOT `parTraverse`. Every entry's idFootprint is trivial — a
+    // cached runtimeId for a var, a registry lookup (one-time allocation on
+    // first touch) for a map entry — so there is nothing to overlap and a fiber
+    // per entry is pure overhead. That did not matter while this was forced only
+    // on the dirty path; the H6 coverage check forces it on EVERY commit, and a
+    // whole-map read expands into a log entry per key, so the fiber count
+    // tracked the map size.
     //
     // The switch was measured on dedicated hardware and it is worth real
     // percentage points on the whole-map-read workload; benchmarks/README.md
     // carries the figures, and its header explains why the hardware matters —
     // the first attempt at this measurement ran on a thermally throttling laptop
-    // and reported the exact opposite.
+    // and reported the exact opposite. (Those figures predate the removal of the
+    // per-entry UUID/MD5 hash from this fold, which only lowers the per-entry
+    // cost further and strengthens the same conclusion.)
     override private[stm] lazy val idFootprint: F[IdFootprint] =
       log.values.toList
         .traverse { entry =>
@@ -992,21 +1056,22 @@ private[stm] trait TxnLogContext[F[_]] {
     //
     // This used to sort the LOG ENTRIES by their log key, which is NOT the same
     // thing and did not order the locks at all: a map entry for a key that does
-    // not yet exist is logged under the existential id hashed from (mapId, key)
+    // not yet exist is logged under the existential id allocated for (map, key)
     // but locks the MAP's structural commitLock. Sorting by the log key
-    // therefore ordered acquisitions by a hash of the KEY while the locks
-    // acquired belonged to the MAPS — two unrelated id spaces. Two transactions
-    // inserting fresh keys into two maps have COMPATIBLE footprints, so the
-    // scheduler runs them concurrently by design; both then hold
-    // {M1.lock, M2.lock}, and hash-derived key order could invert their
-    // acquisition order into a deadlock. specs/commit/CommitH2.cfg pins it.
+    // therefore ordered acquisitions by the KEYS' ids (hashes, at the time)
+    // while the locks acquired belonged to the MAPS — two unrelated id spaces.
+    // Two transactions inserting fresh keys into two maps have COMPATIBLE
+    // footprints, so the scheduler runs them concurrently by design; both then
+    // hold {M1.lock, M2.lock}, and key-id order could invert their acquisition
+    // order into a deadlock. specs/commit/CommitH2.cfg pins it.
     //
     // .distinct dedupes on the (owner id, Semaphore) pair, so the two entries
     // of a double insert into ONE map — which alias to that map's single lock —
     // collapse to one acquisition rather than self-deadlocking a 1-permit
-    // Semaphore. It compares the Semaphore by reference, so distinct locks that
-    // suffered a runtime-id hash collision are both still acquired (id
-    // collisions are assumed away — see specs/README.md).
+    // Semaphore. Owner ids are unique by construction (every id comes from the
+    // one global allocator), so equal ids imply the same entity and the sort
+    // below can never tie between distinct locks; comparing the Semaphore by
+    // reference in the dedup is belt and braces, not a collision hedge.
     override private[stm] def withLock[A](fa: F[A]): F[A] =
       for {
         locks <- log.values.toList.traverse(_.lock)
@@ -1096,5 +1161,14 @@ private[stm] trait TxnLogContext[F[_]] {
   }
 
   private[stm] case class TxnRetryException(validLog: TxnLogValid) extends RuntimeException
+
+  // The error twin of TxnRetryException: raised to short-circuit the free
+  // compiler recursion at the first transaction error, carrying the USER'S
+  // exception. TxnHandleError catches it and runs recovery against the
+  // pre-block state; getTxnLogResult unwraps it, so the original exception —
+  // never this carrier — is what reaches a caller. NoStackTrace because the
+  // carrier's own trace is noise: the wrapped exception keeps its trace, and
+  // the carrier is allocated on every abort/failed-effect, handled or not.
+  private[stm] case class TxnErrorException(ex: Throwable) extends RuntimeException with NoStackTrace
 
 }
