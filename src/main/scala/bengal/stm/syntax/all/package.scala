@@ -115,11 +115,24 @@ package object all {
   /** Syntax for `Txn` with `commit`, error handling, and F-variant error recovery. */
   implicit class TxnOps[F[_]: STM, V](txn: => Txn[V]) {
 
-    /** Commits the transaction, executing it against the STM runtime and lifting the result into `F`. */
+    /** Commits the transaction, executing it against the STM runtime and lifting the result into `F`.
+      *
+      * CANCELLATION ABANDONS THE TRANSACTION. Cancelling the returned `F` (a `timeout`, a lost `race`, supervisor
+      * shutdown) is safe and prompt: once the cancellation completes, the transaction never begins executing again,
+      * never parks or retries, and holds no scheduler state — a parked `waitFor` transaction in particular can never be
+      * woken by a later commit and run after its caller has gone. One carve-out: the atomic commit window itself is
+      * uncancelable, so a window already executing when cancellation arrives runs to completion and its writes may be
+      * published; cancellation does not interrupt a window in flight — it prevents every future one, without waiting on
+      * the in-flight one.
+      */
     def commit: F[V] =
       STM[F].commitTxn(txn)
 
-    /** Recovers from transaction errors/aborts by mapping the throwable to a fallback transaction. */
+    /** Recovers from transaction errors and aborts by mapping the throwable to a fallback transaction.
+      *
+      * It does NOT absorb a `waitFor` retry. A retry is re-raised past this handler by design, so wrapping a blocking
+      * transaction in `handleErrorWith` does not make it stop blocking.
+      */
     def handleErrorWith(f: Throwable => Txn[V]): Txn[V] =
       STM[F].handleErrorWithInternal(txn)(f)
 

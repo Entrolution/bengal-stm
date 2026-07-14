@@ -130,11 +130,14 @@ final class TxnVarMap[F[_]: STM: Async, K, V] private[stm] (
   // per-key ids a whole-map read expands into at run time (its coverage check,
   // the H6 fix). Both tests are one hop; see TxnVarRuntimeId.
   //
-  // For a key that already EXISTS, the first call for it typically happens at
-  // commit time, inside the locked region (the log entry's idFootprint under
-  // withLock): a one-time allocate-and-publish per key, lock-free on the
-  // registry, a plain lookup ever after. A putIfAbsent race between two fibers
-  // burns one counter value; gaps in the sequence are meaningless.
+  // First registration is a one-time allocate-and-publish per key — lock-free
+  // on the registry, a plain lookup ever after. When it happens varies by
+  // path: a keyed op normally registers during the static-analysis pass,
+  // before any lock (a throwing key thunk or an earlier erratum defers it to
+  // the run); a key reached only through whole-map ops registers during the
+  // log run if it is fresh (resolveMapKey) or at commit under withLock if it
+  // already exists (the entry's idFootprint). A putIfAbsent race between two
+  // fibers burns one counter value; gaps in the sequence are meaningless.
   private[stm] def getRuntimeId(
     key: K
   ): F[TxnVarRuntimeId] =

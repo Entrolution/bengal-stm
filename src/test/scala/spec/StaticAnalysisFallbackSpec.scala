@@ -215,8 +215,9 @@ class StaticAnalysisFallbackSpec extends AnyFreeSpec with Matchers {
      *
      * If this ever goes red again, the fallback lost its flag somewhere — check
      * that getValidated still copies it through and that every under-approximating
-     * handler still calls markUnderApproximated (TxnRuntime.commit has two, and
-     * TxnCompilerContext has three that swallow silently).
+     * handler still calls markUnderApproximated (analyseFootprint in
+     * TxnRuntimeContext has two, and TxnCompilerContext has three that swallow
+     * silently).
      */
     "no rep skews" in {
       val maxReps = 1000

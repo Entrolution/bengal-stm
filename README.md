@@ -36,8 +36,8 @@ semantic blocking and scheduling.
 
 The commit and scheduling protocols are specified in TLA+ and model-checked in CI. That work
 found eight concurrency defects in the shipped library — several of which no test could have
-caught, and one of which it later proved a whole commit-time check was unreachable and could be
-deleted. See [Correctness](#correctness).
+caught — and later proved a whole commit-time check unreachable, so it was deleted. See
+[Correctness](#correctness).
 
 ## Requirements
 
@@ -443,6 +443,9 @@ Bengals are a very playful and active cat breed. The name fits a library built o
 ## Contributing
 
 Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+
+For security vulnerabilities, use the process in [SECURITY.md](SECURITY.md) rather than a
+public issue.
 
 ## License
 

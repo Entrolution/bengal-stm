@@ -274,8 +274,8 @@ class StmThroughputBench {
     * window trick per map keeping the inserts real), so its sorted acquisition set holds FOUR owners — both maps'
     * structural locks and both removed entries' own locks. Two transactions inserting fresh keys into two maps is the
     * shape whose acquisition order the H2 fix makes globally total (specs/commit/CommitH2.cfg); before it, this
-    * deadlocked. No published baseline exists for this benchmark — it lands with the harness rework and gets its first
-    * numbers at the next dedicated-box session.
+    * deadlocked. First measured with the harness rework on the dedicated box — see the crossMapInsert row in
+    * benchmarks/README.md (no before-column: the pre-H2 library deadlocked here, as above).
     */
   @Benchmark
   @OperationsPerInvocation(32)

@@ -60,9 +60,11 @@ private[stm] trait TxnCompilerContext[F[_]] {
 
   // @nowarn on BOTH FunctionK.apply methods below, and not for exhaustivity.
   // What the annotation suppresses is the free-monad interpreter's unavoidable
-  // Unit casts. A FunctionK must produce a V for every op, including the ops
-  // whose result genuinely is Unit — the setters, the no-ops, the errata — so
-  // those arms hand back ().asInstanceOf[V], and Scala 2.13 flags every one as
+  // Unit casts. A FunctionK must produce a V for every op; where a walk ends
+  // on a Unit-valued path — the no-op catch-alls, the errata arms, the
+  // analysis walker's TxnHandleError recovery — those arms hand back
+  // ().asInstanceOf[V] (the setter arms need no cast: their pattern match
+  // refines V = Unit), and Scala 2.13 flags every one as
   // a "dubious usage of asInstanceOf with unit value". Scala 3 instead flags
   // the opposite: the trailing `case _ =>` in txnLogCompiler's erratum match is
   // UNREACHABLE, TxnRetry and TxnError having already exhausted TxnErratum. CI
@@ -322,15 +324,11 @@ private[stm] trait TxnCompilerContext[F[_]] {
                 }
               case adt: TxnGetVarMap[_, _] =>
                 StateT[F, TxnLog, V] { s =>
-                  s.getVarMap(adt.txnVarMap).map { stateAndValue =>
-                    (stateAndValue._1, stateAndValue._2)
-                  }
+                  s.getVarMap(adt.txnVarMap)
                 }
               case adt: TxnGetVarMapValue[_, _] =>
                 StateT[F, TxnLog, V] { s =>
-                  s.getVarMapValue(adt.key, adt.txnVarMap).map { stateAndValue =>
-                    (stateAndValue._1, stateAndValue._2)
-                  }
+                  s.getVarMapValue(adt.key, adt.txnVarMap)
                 }
               case adt: TxnSetVarMap[_, _] =>
                 StateT[F, TxnLog, V] { s =>

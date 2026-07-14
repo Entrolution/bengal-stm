@@ -123,7 +123,7 @@ Same code either way; the *only* difference was the check.
 
 | benchmark | with the check | without | gain | |
 |---|---:|---:|---:|:-:|
-| `wholeMapReadPlusInsert` | 837 ± 39 | 1,020 | **+22.0%** | ● |
+| `wholeMapReadPlusInsert` | 837 ± 39 | 1,020 | **+21.9%** | ● |
 | `uncontendedCommit` | 16,292 ± 498 | 18,415 | **+13.0%** | ● |
 | `underDeclaredConcurrent` | 4,424 ± 182 | 4,759 | **+7.6%** | ● |
 | `dataDependentKey` | 3,800 ± 252 | 3,983 | **+4.8%** | ● |

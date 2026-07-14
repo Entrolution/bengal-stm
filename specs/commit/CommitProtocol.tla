@@ -83,7 +83,7 @@
  * into two maps could take {M1.lock, M2.lock} in opposite orders. Their
  * footprints are compatible, so the scheduler ran them concurrently by design.
  *
- * FIXED (2026-07-11). TxnLogEntry.lock now returns the lock PAIRED WITH ITS
+ * FIXED. TxnLogEntry.lock now returns the lock PAIRED WITH ITS
  * OWNER'S runtime id, and withLock sorts on the owner:
  *
  *     locks <- log.values.toList.traverse(_.lock)                  // POST-FIX

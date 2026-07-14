@@ -4,8 +4,9 @@
 
 **Scope**: correctness, concurrency, and API-contract bugs. Full main source (runtime, compiler,
 model), the serializability oracle and soak harness, both TLA+ specs (spec↔code parity), and the
-throughput benchmark. 15 specialist agents over 2 batches, ~7,150 lines. Cycle artifacts:
-`.claude/reviews/bug-hunt-cycle-2/` (findings JSONL, manifest, structural risks, execution checklist).
+throughput benchmark. 15 specialist agents over 2 batches, ~7,150 lines. Cycle artifacts
+(findings JSONL, manifest, structural risks, execution checklist) are untracked working files,
+not part of the repository.
 
 - **Modules reviewed**: 6 covering ~7,150 lines
 - **Specialist agents**: 15 (across 2 batches; 0 rate-limited)
@@ -185,3 +186,40 @@ Worth recording, because the corrections came from adversarial review rather tha
 - 143 → **207** tests, none ignored (the two `TxnLogDirtySpec` park/wake tests, disabled as
   "flaky" in v0.12.0, were reporting H1; they are back and pass 80/80 under load).
 - **12** CI-pinned TLC expectations: ten expected-clean, two pinned-red.
+
+## Quality Cycle 3 — 2026-07-14 (quality hunt)
+
+**Scope**: quality debt, not correctness — architecture (coupling/cohesion + abstraction audit),
+code hygiene (reuse, simplification, idiom, efficiency), comment hygiene (accuracy, why-test,
+timelessness, AI-tell density), and documentation (coverage, structure, accuracy, prose). Full
+main source, full test suite, both TLA+ specs + harness, benchmark, and all six active docs.
+Cycle artifacts (raw agent outputs, collated findings JSONL, manifest, architecture review,
+execution checklist) are untracked working files, not part of the repository.
+
+- **Dimensions**: all four | **Modules**: 7 code/spec groups + 3 doc clusters | **Agents**: 32 across 4 batches (0 rate-limited)
+- **Findings**: 113 total (0 Critical / 8 High / 30 Medium / 75 Low) — architecture 4 / hygiene 62 / comments 21 / docs 26
+- **Remediation classes**: mechanical 61 / local-refactor 46 / design-change 6
+- **Gate-rejected**: 0 | **Suppressed by baseline**: 0 (first quality cycle) | **Cross-validated**: 13 merged groups | **Contradictions**: 1 (+1 impact-rating disagreement, both recorded)
+- **Out-of-scope correctness discoveries**: 1 (AbsentKeyParkSpec probe-or-vestige, routed to the checklist's in-situ list)
+- **Trend**: first quality cycle — no prior quality baseline. Against bug-hunt cycle 2's meta-result
+  ("stale prose is an active bug vector"): the vector persists in the exact class predicted — the
+  cycle found stale spec narration describing pre-fix behaviour in present tense (the H1 absent-key
+  negative control), a CONTRIBUTING gate teaching `CI=true` after this very file recorded that gate
+  as theatre, and the SSoT's `writeSeq` row describing the NC-1 mutant ordering instead of the H2 fix.
+
+The eight Highs in one breath: the TLA+-verified submission scaffold exists as two hand-synced
+copies; three hot-path efficiency shapes the codebase itself already measured and fixed once
+(fiber-per-trivial-op in the commit and submit scans, triple list materialization) survive at
+seven other sites; benchmark figures
+are duplicated into the README and have drifted; CONTRIBUTING's pre-push gate does not enable
+fatal warnings; specs/README's writeSeq mapping states the reverted-bug sort order; and the
+scheduler spec narrates deleted code behaviour in present tense above a deliberate negative
+control.
+
+Two meta-results. First, the strongest positive: adversarial fresh-eyes verification affirmed the
+load-bearing structures — the cake pattern, the conflict-detection algebra's spec↔code mapping
+(CommitProtocol.tla matches the code verbatim), all 12 expectation pins, all 10 negative controls,
+and zero AI-tell density anywhere — so the codebase's foundations survived a 32-agent audit with
+its design decisions intact. Second, every High traces to the same root: a fact stated in two
+places where only one is checked. The checklist's fixes are mostly single-sourcing operations —
+extract the scaffold, dedupe the figures, name the constant, delete the copy.

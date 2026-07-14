@@ -76,7 +76,7 @@ class HistorySpec extends AnyFreeSpec with Matchers with TimeLimits {
 
   "catches the anomalies this project fixed" - {
 
-    "WRITE SKEW (G2) — each read what the other then wrote: H3, H6" in {
+    "WRITE SKEW (G2) — each read what the other then wrote: H3" in {
       // T1: read y (empty), append x.   T2: read x (empty), append y.
       // Neither saw the other's write, so each must precede the other. Cycle.
       val t1x        = tagFor(1, 0)

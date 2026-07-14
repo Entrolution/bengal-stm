@@ -108,7 +108,7 @@ class StmRuntimeSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers with S
         _ <- txnVarQueue.modify(_.enqueue(27))
         _ <- txnVarQueue.modify(_.enqueue(18))
         _ <- txnVarQueue.modify(_.enqueue(28))
-      } yield () // -6
+      } yield ()
 
       withRuntime { implicit stm =>
         for {

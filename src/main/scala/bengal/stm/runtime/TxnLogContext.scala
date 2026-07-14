@@ -1012,9 +1012,11 @@ private[stm] trait TxnLogContext[F[_]] {
 
     // The park path's read-inclusive staleness check (H1 fix): TRUE iff any
     // entry — read-only entries included — no longer matches the live value
-    // it was built from. Contrast isDirty, which validates the write set
-    // only. Same walk, no short-circuit machinery: see isDirty above for why
-    // that machinery would not pay for itself here either.
+    // it was built from. Contrast the per-entry isDirty, which validates a
+    // write entry only. No short-circuit machinery — the aggregate dirty
+    // check that carried such machinery is gone (it could never fire:
+    // CoverageSubsumesDirty; see the NoLocksWithoutWrites note at the top of
+    // this file).
     private[stm] lazy val anyReadChangedSinceRead: F[Boolean] =
       log.values.toList
         .parTraverse(_.hasChangedSinceRead)
@@ -1109,6 +1111,13 @@ private[stm] trait TxnLogContext[F[_]] {
             .asInstanceOf[Map[K, V]]
         )
 
+      // The gate: the map's own runtimeId in the log is the whole-map
+      // STRUCTURE entry. Structure entry present => every live key has a
+      // per-key entry (getVarMap establishes it on read, setVarMap's diff on
+      // write — see writeVarMapValueEntry's note), so the log alone is the
+      // view; merging live state back in would resurrect keys this
+      // transaction deleted. Absent => only single keys were touched, and
+      // the live map fills in the rest.
       Async[F].ifM(Async[F].delay(log.contains(txnVarMap.runtimeId)))(
         logEntriesF,
         for {

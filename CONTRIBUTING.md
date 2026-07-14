@@ -10,6 +10,8 @@ This project adheres to a [Code of Conduct](CODE_OF_CONDUCT.md). By participatin
 
 ### Reporting Issues
 
+Do not report security vulnerabilities as public issues — see [SECURITY.md](SECURITY.md) for the disclosure process.
+
 Before creating an issue, please check if a similar issue already exists. When reporting bugs, include:
 
 - A clear, descriptive title

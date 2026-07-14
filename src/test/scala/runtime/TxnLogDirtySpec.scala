@@ -26,18 +26,11 @@ import bengal.stm.STM
 import bengal.stm.model._
 import bengal.stm.syntax.all._
 
-/** THE TWO PARK/WAKE TESTS HERE WERE DISABLED FOR FOUR MONTHS, AND THEY WERE RIGHT.
-  *
-  * They were tagged Flaky and ignored in v0.12.0 because they "intermittently time out under CI load". A timeout is not
-  * a flake here — a lost wakeup does not corrupt anything, it HANGS, so a timeout is the only symptom it can have. They
-  * were reporting H1, and "under CI load" is the preemption H1 needs to open its window.
-  *
-  * H1 was fixed four months later (submitTxnForRetry re-checks the read set and scans activeTransactions inside the
-  * retry-semaphore region before parking). Re-enabled after 80/80 clean reps of each body — 40 idle, 40 under heavy
-  * scheduling pressure — with no hang and no wrong value.
-  *
-  * The lesson worth keeping: an intermittently-timing-out concurrency test is evidence, not noise. Disabling one throws
-  * away the only signal the defect was ever going to produce.
+/** The two park/wake tests here regression-guard H1 (the lost wakeup). A lost wakeup corrupts nothing — it HANGS, so a
+  * timeout is the only symptom it can produce. A timeout here is a report, not a flake: a parked reader missed the wake
+  * it was owed. The window needs scheduling pressure to open, so load makes these tests more informative, not less.
+  * (The fix under guard: submitTxnForRetry re-checks the read set and scans activeTransactions inside the
+  * retry-semaphore region before parking.)
   */
 class TxnLogDirtySpec extends AsyncFreeSpec with AsyncIOSpec with Matchers with StmSuite {
 

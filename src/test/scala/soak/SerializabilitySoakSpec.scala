@@ -293,6 +293,11 @@ class SerializabilitySoakSpec extends AnyFreeSpec with Matchers {
             // ordinary "move something from here to there". Accurately declared,
             // so it is correct in itself; it is the counterpart a data-dependent
             // reader can tear.
+            //
+            // The +500000L keeps the second append a distinct tag attributed to
+            // the SAME writer: History.writerOf is tag / TagStride (1,000,000),
+            // so seq + offset must stay in [opsPerTxn, TagStride) -- above the
+            // sibling tagFor slots, below the next writer's id.
             val k1 = KeyPool(i)
             val k2 = KeyPool((i + 1) % KeyPool.size)
             for {
