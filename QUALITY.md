@@ -38,6 +38,38 @@ vector: one stale comment produced two false bug reports inside this very hunt, 
 carry narration describing deleted code (Scheduler.tla's commit action still models the removed
 dirty check).
 
+### Execution Results — 2026-07-14
+
+Six phases, **15 commits** on `fix/harden-cycle-2` (73ca304 → 3844a77), every checklist item
+executed through plan-mode + critique ratchet, revert-checked tests, and per-commit review-fix.
+
+- **Items fixed**: every fix checkbox across all six phases — committed-data correctness,
+  error/cancellation contract, liveness, model-layer sealing, documentation truth, and the
+  instrumentation cluster (both TLA+ specs, the soak meters, the JMH harness).
+- **Regression tests added**: 57 (212 → **269**, none ignored), each red-checked against the
+  unfixed code where the fix changes behaviour (doc-promise pins noted as green-on-current).
+  Plus 10 CI-level negative-control mutation checks (a new `negative-controls` job runs committed
+  spec-mutation patches on every push; a mutant that stays green fails the build).
+- **Deferrals**: 1, user-approved — the benchmark re-run/re-publication (dedicated-box A→B→C→A
+  protocol; the harness rework changed three workloads and the id cost model changed under the
+  published table, which is now annotated as historical).
+- **In-situ discoveries**: 2 recorded in the checklist (the failure-path coverage-gate limitation,
+  documented; the wake-time re-analysis design lesson). The review loops additionally caught and
+  fixed errors in the hardening itself before commit — a wrong lock-span justification in spec
+  prose, a wrong negative-control retirement (NC-2 reinstated as the H3-fix revert), and a
+  vocabulary misuse (erratum vs short-circuit) that would have misdescribed the H3 benchmark's
+  premise.
+- **Review-fix cycles**: every commit gated; the larger commits took full multi-agent loops with
+  independent verification (Phase 4's sealing: 5 reviewers + 3 verifiers; the Scheduler.tla
+  coverage remodel: 3 reviewers), the doc/instrumentation commits took focused loops.
+- **Spec-model debt cleared**: Spec B's commit step now models the coverage gate over `LoggedFP`
+  (state space 846k → 1.90M distinct, every pinned verdict reproduced including the
+  SchedulerAbsentKey deadlock), the DirtyRestart narrative is history everywhere, and the
+  negative controls are executable.
+- **Final counts**: 269 tests; 12 CI-pinned TLC expectations (unchanged: ten clean, two red) plus
+  10 automated negative controls; MiMa vacuous on the 0.15 line throughout (re-confirmed at every
+  commit).
+
 - **Trend**: first full-scope bug hunt (Cycle 1 was prose-scoped: 2 live defects found).
   Critical: flat (0 → 0). The live-defect count (7 High) reflects scope expansion, not
   regression — none of the 7 were reachable by Cycle 1's methods.
