@@ -17,8 +17,8 @@
 package ai.entrolution
 package bengal.stm.model.runtime
 
-sealed trait ExecutionStatus
+sealed private[stm] trait ExecutionStatus
 
-case object Scheduled extends ExecutionStatus
-case object Running extends ExecutionStatus
-case object NotScheduled extends ExecutionStatus
+private[stm] case object Scheduled extends ExecutionStatus
+private[stm] case object Running extends ExecutionStatus
+private[stm] case object NotScheduled extends ExecutionStatus

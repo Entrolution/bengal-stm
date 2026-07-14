@@ -38,8 +38,10 @@ import bengal.stm.model.runtime._
   * lifetime of this `TxnVarMap`. Workloads streaming unboundedly many distinct keys through one map will grow that
   * registry without bound; prefer bounded key spaces, or fresh maps per epoch.
   *
-  * Do not use the case-class `copy` method: a copy shares this map's state but not its key-id registry, and the two
-  * handles will disagree about key identity in ways that silently break conflict detection.
+  * Construction is factory-only: [[TxnVarMap.of]] draws the map's identity from the runtime's allocator, and the sealed
+  * constructor is what makes that identity trustworthy. It also makes a second handle over this map's state
+  * unrepresentable in user code — the map's internal key-id registry is per-instance, so a copied handle would disagree
+  * with the original about key identity in ways that silently break conflict detection.
   *
   * @tparam F
   *   the effect type
@@ -48,7 +50,7 @@ import bengal.stm.model.runtime._
   * @tparam V
   *   the value type
   */
-case class TxnVarMap[F[_]: STM: Async, K, V](
+final class TxnVarMap[F[_]: STM: Async, K, V] private[stm] (
   private[stm] val id: TxnVarId,
   protected val value: Ref[F, VarIndex[F, K, V]],
   private[stm] val commitLock: Semaphore[F],
@@ -106,9 +108,10 @@ case class TxnVarMap[F[_]: STM: Async, K, V](
   // registry entry (and a strong reference to the key) per distinct key ever
   // referenced, for the lifetime of the map; the class scaladoc states it.
   //
-  // Per-instance on purpose (it shares the map's lifetime and GCs with it), so a
-  // case-class `copy` would carry the state but NOT this registry — see the
-  // scaladoc warning.
+  // Per-instance on purpose (it shares the map's lifetime and GCs with it). A
+  // second handle sharing the state Ref but not this registry would disagree
+  // about key identity — which is why the constructor is sealed and copy no
+  // longer exists: that handle is now unrepresentable (class scaladoc).
   private val existentialIds: TrieMap[K, TxnVarRuntimeId] =
     TrieMap.empty[K, TxnVarRuntimeId]
 
@@ -191,5 +194,5 @@ object TxnVarMap {
       valuesRef             <- Async[F].ref(values.toMap: VarIndex[F, K, V])
       lock                  <- Semaphore[F](1)
       internalStructureLock <- Semaphore[F](1)
-    } yield TxnVarMap(id, valuesRef, lock, internalStructureLock)
+    } yield new TxnVarMap(id, valuesRef, lock, internalStructureLock)
 }
