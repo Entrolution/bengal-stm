@@ -1,0 +1,21 @@
+--- a/specs/scheduler/Scheduler.tla
++++ b/specs/scheduler/Scheduler.tla
+@@ -934,17 +934,17 @@
+    in that gap sees the parker in neither structure. *)
+ ---------------------------------------------------------------------------
+ 
+ (* retrySemaphore.permit acquire for the park region *)
+ ExecParkAcq(t, s) ==
+     /\ exec[<<t, s>>].pc = "parkAcq"
+     /\ retrySem = NoHolder
+     /\ retrySem' = [kind |-> "park", t |-> t]
+-    /\ exec'     = [exec EXCEPT ![<<t, s>>].pc = "parkScan"]
++    /\ exec'     = [exec EXCEPT ![<<t, s>>].pc = "parkInsert"]
+     /\ UNCHANGED <<txnVars, submitVars, unsubW, active, graphSem, version,
+                    parked, sweep, droppedSweep, truncatedWake, parkChk>>
+ 
+ (* Park region, split in CODE ORDER — NOT collapsed. The retry semaphore
+    serializes this region against SWEEPS but NOT against commits or
+    completions, so each read is its own step and a conflictor can move
+    between the reads. THE ORDER IS LOAD-BEARING (H1):
+ 

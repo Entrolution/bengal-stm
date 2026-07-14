@@ -108,3 +108,31 @@ jobs:
       - name: Model-check dispatch-gated expectations
         if: github.event_name == 'workflow_dispatch'
         run: ./specs/expectations.sh --all
+
+  # A GREEN CONFIG ONLY MEANS SOMETHING IF IT CAN GO RED. The negative
+  # controls break one fix each (committed patches under specs/nc/) and
+  # require the documented counterexample to come back; a control that
+  # stays green fails the job, because the config it guards has stopped
+  # witnessing that fix. The mutations target the seconds-fast configs,
+  # not the exhaustive Scheduler run.
+  negative-controls:
+    runs-on: ubuntu-latest
+    needs: verify-anchors
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-java@v5
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Download TLA+ tools
+        run: |
+          curl -fsSL --retry 3 -o specs/tla2tools.jar \
+            https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
+          echo "TLC version:"
+          java -cp specs/tla2tools.jar tlc2.TLC -h 2>&1 | head -3
+
+      - name: Run the negative-control mutations
+        run: ./specs/negative_controls.sh

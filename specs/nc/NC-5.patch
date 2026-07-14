@@ -1,0 +1,23 @@
+--- a/specs/commit/CommitProtocol.tla
++++ b/specs/commit/CommitProtocol.tla
+@@ -832,19 +832,17 @@
+    deadlocking on a 1-permit Semaphore. *)
+ ---------------------------------------------------------------------------
+ 
+ ResolveOne(t) ==
+     /\ pc[t] = "resolve"
+     /\ resIdx[t] < Len(writeSeq[t])
+     /\ LET e == writeSeq[t][resIdx[t] + 1]
+            l == LockOfWrite(e, IF e \in MapEntries THEN keyExists[e] ELSE TRUE)
+-       IN  lockSeq' = [lockSeq EXCEPT ![t] =
+-                          IF l \in Range(lockSeq[t]) THEN lockSeq[t]
+-                                                     ELSE Append(lockSeq[t], l)]
++       IN  lockSeq' = [lockSeq EXCEPT ![t] = Append(lockSeq[t], l)]
+     /\ resIdx' = [resIdx EXCEPT ![t] = resIdx[t] + 1]
+     /\ UNCHANGED <<pc, inc, declared, readPend, snapVer, snapEx, writeSeq,
+                    lockIdx, lockHolder, version, keyExists, readValid,
+                    pubCount, truncated>>
+ 
+ ResolveDone(t) ==
+     /\ pc[t] = "resolve"
+     /\ resIdx[t] = Len(writeSeq[t])

@@ -1,0 +1,11 @@
+--- a/specs/common/Footprint.tla	2026-07-14 12:57:13
++++ b/specs/common/Footprint.tla	2026-07-14 12:57:13
+@@ -91,8 +91,6 @@
+  * others and runs alone, which makes its unvalidated reads trivially safe.
+  *)
+ IsCompatible(f, g) ==
+-    /\ ~f.under
+-    /\ ~g.under
+     /\ AsymCompat(f, g)
+     /\ AsymCompat(g, f)
+ 

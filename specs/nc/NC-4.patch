@@ -1,0 +1,40 @@
+--- a/specs/commit/CommitProtocol.tla
++++ b/specs/commit/CommitProtocol.tla
+@@ -763,18 +763,16 @@
+      threw. The guard admits the overlap it would admit for any accurate pair,
+      and it is right to: it has no evidence of a conflict. Nothing HERE stops
+      that transaction. The commit-time coverage check does, under the locks,
+      before the publish (CoverageOk). *)
+ ---------------------------------------------------------------------------
+ 
+ TxnEnter(t) ==
+     /\ pc[t] = "start"
+-    /\ \A u \in Txns \ {t} :
+-           InWindow(u) => IsCompatible(declared[t], declared[u])
+     /\ pc'       = [pc       EXCEPT ![t] = "read"]
+     /\ readPend' = [readPend EXCEPT ![t] = Accessed(t)]
+     /\ UNCHANGED <<inc, declared, snapVer, snapEx, writeSeq, resIdx, lockSeq,
+                    lockIdx, lockHolder, version, keyExists, readValid,
+                    pubCount, truncated>>
+ 
+ ---------------------------------------------------------------------------
+ (* Read phase — getTxnLogResult. One step per accessed entity (A1): the log
+@@ -1125,17 +1123,14 @@
+         pc[t] \in {"resolve", "acquire"} =>
+             \A e \in Writes(t) :
+                 e \in MapEntries => (snapEx[t][e] = keyExists[e])
+ 
+ (* Contract C is ASSUMED here (TxnEnter's guard) and CHECKED by Spec B.
+    Asserting it costs nothing and pins the assumption in place — if a later
+    edit ever weakens the guard, this goes red instead of silently widening
+    the model's concurrency. *)
+-ContractCHolds ==
+-    \A t, u \in Txns :
+-        (t /= u /\ InWindow(t) /\ InWindow(u))
+-            => IsCompatible(declared[t], declared[u])
++ContractCHolds == TRUE
+ 
+ (* The exploration horizon never bound: no verdict here is clipped. *)
+ BoundsNeverBind == ~truncated
+ 
+ ===============================================================================

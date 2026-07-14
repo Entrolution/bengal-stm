@@ -16,6 +16,12 @@
 #         expected-red invariant, for defects whose symptom is a dead end
 #         rather than a violated predicate.
 #
+#   ./specs/check_expected.sh <config.cfg> <module.tla> ASSUMPTION:<Name>
+#       — require a named ASSUME in the module to fail (lemma modules have
+#         no state graph; TLC evaluates their ASSUMEs at startup). TLC
+#         reports the failure by LOCATION, not name, so the match is
+#         module-granular; the name documents the caller's intent.
+#
 # Run from the repository root. TLC's jar is expected at specs/tla2tools.jar.
 
 # NOTE: deliberately NO `set -e` — TLC exits nonzero on expected violations
@@ -23,9 +29,9 @@
 # interpreted below instead. Adding -e would kill every pinned-red check.
 set -uo pipefail
 
-CFG="${1:?usage: check_expected.sh <cfg> <tla> <NONE|InvariantName|DEADLOCK> [ALLOW_DEADLOCK]}"
-TLA="${2:?usage: check_expected.sh <cfg> <tla> <NONE|InvariantName|DEADLOCK> [ALLOW_DEADLOCK]}"
-EXPECTED="${3:?usage: check_expected.sh <cfg> <tla> <NONE|InvariantName|DEADLOCK> [ALLOW_DEADLOCK]}"
+CFG="${1:?usage: check_expected.sh <cfg> <tla> <NONE|InvariantName|DEADLOCK|ASSUMPTION:Name> [ALLOW_DEADLOCK]}"
+TLA="${2:?usage: check_expected.sh <cfg> <tla> <NONE|InvariantName|DEADLOCK|ASSUMPTION:Name> [ALLOW_DEADLOCK]}"
+EXPECTED="${3:?usage: check_expected.sh <cfg> <tla> <NONE|InvariantName|DEADLOCK|ASSUMPTION:Name> [ALLOW_DEADLOCK]}"
 # Optional 4th arg ALLOW_DEADLOCK passes TLC's -deadlock flag (suppresses
 # deadlock detection). Default is detection ON: specs with legitimate
 # terminal states model them as an explicit Terminating stutter, so any
@@ -75,6 +81,25 @@ if [[ "$EXPECTED" == "DEADLOCK" ]]; then
   echo "specs/README.md's verdict table. @expect is the ONLY place the verdict is" >&2
   echo "declared -- do NOT restate it in the config's prose. specs/expectations.sh" >&2
   echo "--list rejects that: a restatement is a thing that can rot, and did." >&2
+  tail -40 "$OUT" >&2
+  exit 1
+fi
+
+# EXPECTED=ASSUMPTION:<Name> pins a failed named ASSUME (FootprintLemmas is
+# checked this way — the lemma modules have no state graph; TLC evaluates
+# their ASSUMEs at startup). TLC reports a failed assumption by LOCATION,
+# never by name ("Error: Assumption line N ... of module M is false"), so
+# this pin is MODULE-granular: any failed assumption in the checked module
+# matches. The name after the colon documents which lemma the caller means;
+# TLC stops at the first failure, so a registry entry stays honest as long
+# as its mutation breaks the named lemma's subject.
+if [[ "$EXPECTED" == ASSUMPTION:* ]]; then
+  MODULE_NAME="$(basename "$TLA" .tla)"
+  if grep -Eq "Assumption line .* of module ${MODULE_NAME} is false" "$OUT"; then
+    echo "OK: $TLA ($CFG) — reproduced the pinned assumption failure (${EXPECTED#ASSUMPTION:})."
+    exit 0
+  fi
+  echo "UNEXPECTED: $TLA ($CFG) did not reproduce the pinned assumption failure (exit $TLC_EXIT)." >&2
   tail -40 "$OUT" >&2
   exit 1
 fi

@@ -1,0 +1,21 @@
+--- a/specs/common/Footprint.tla
++++ b/specs/common/Footprint.tla
+@@ -122,17 +122,17 @@
+ (* footprints, rather than trusting the argument above.                      *)
+ (*****************************************************************************)
+ Covers(declared, actual) ==
+     /\ \A id \in actual.reads :
+             \/ id.val \in CombinedRawIds(declared)
+             \/ (id.par /= NoParent /\ id.par \in CombinedRawIds(declared))
+     /\ \A id \in actual.updates :
+             \/ id.val \in UpdateRawIds(declared)
+-            \/ (id.par /= NoParent /\ id.par \in UpdateRawIds(declared))
++            \/ (id.par /= NoParent /\ id.par \in CombinedRawIds(declared))
+ 
+ (*
+  * getValidated:
+  *   readIds := (readIds -- updatedIds)
+  *                .filter(id => id.parent.forall(pid => !updateRawIds.contains(pid.value)))
+  * i.e. drop reads that this footprint also updates (structural id equality),
+  * and drop reads whose parent's raw value is among this footprint's updates.
+  *)

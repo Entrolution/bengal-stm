@@ -961,9 +961,10 @@ ExecParkAcq(t, s) ==
 
    The reverse order (stale, then scan) LOSES WAKEUPS: a conflictor can commit
    after the stale read and leave activeTransactions before the scan, escaping
-   both. That is not a hypothetical — reverse the two actions' pc transitions
-   on a scratch copy and SchedulerRetry.cfg deadlocks in a 36-state trace, with
-   tw's ExecCommit and ExecRegComplete landing in exactly the gap between tr's
+   both. That is not a hypothetical — negative control NC-A commits exactly
+   that reversal as a patch (specs/nc/, run by negative_controls.sh on every
+   push) and SchedulerRetry.cfg deadlocks in a 36-state trace, with tw's
+   ExecCommit and ExecRegComplete landing in exactly the gap between tr's
    stale read and tr's scan. *)
 ExecParkStale(t, s) ==
     /\ exec[<<t, s>>].pc = "parkStale"

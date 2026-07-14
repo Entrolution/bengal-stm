@@ -1,0 +1,43 @@
+# Negative-control registry — consumed by specs/negative_controls.sh.
+# One row per control, TAB-separated:
+#
+#   <id>  <patch>  <module.tla>  <config.cfg>  <expected red>
+#
+# Column 3 is the module TLC CHECKS, which is not always the file the patch
+# MUTATES (the patch records its own target): NC-3's patch breaks
+# specs/common/Footprint.tla but is witnessed by CommitProtocol against
+# CommitAccurate.cfg. The staging must therefore propagate a patched
+# specs/common/Footprint.tla into specs/commit/ and specs/scheduler/ (in the
+# repo those are symlinks; a scratch copy that materializes them BEFORE
+# patching leaves the commit-local copy pristine and NC-3 stays green).
+#
+# Expected-red values: an invariant name (check_expected.sh greps
+# "Invariant <Name> is violated"), DEADLOCK ("Deadlock reached"), or
+# ASSUMPTION:<Name> — a named ASSUME that fails at TLC startup with no state
+# graph. TLC reports an assumption failure by LOCATION, not by name; the
+# current phrasing for NC-7 is:
+#
+#   Error: Assumption line 155, col 5 to line 156, col 66 of module FootprintLemmas is false.
+#
+# (the line span is LemmaCoverageIsSound's body in FootprintLemmas.tla —
+# derive it from the file rather than hardcoding if that file is edited).
+#
+# Patches are cut against the current specs tree with >=5 context lines and
+# apply with either `git apply` (repo root) or `patch -p1`. Regenerate any
+# patch whose mutation site is edited: re-break a fresh copy, `diff -U8`.
+#
+# Not here, by design: NC-8 (structural — the dirty-check deletion itself,
+# pinned as the CoverageSubsumesDirty invariant on every push). NC-2's
+# ORIGINAL oracle (the DirtyRestart action-coverage count) died with the
+# dirty check, but its break — reverting the H3 fix — lives on below with a
+# red-verdict oracle instead.
+NC-1	NC-1.patch	specs/commit/CommitProtocol.tla	specs/commit/CommitH2.cfg	NoWaitsForCycle
+NC-2	NC-2.patch	specs/commit/CommitProtocol.tla	specs/commit/CommitH3.cfg	CommitSnapshotValid
+NC-3	NC-3.patch	specs/commit/CommitProtocol.tla	specs/commit/CommitAccurate.cfg	CommitSnapshotValid
+NC-4	NC-4.patch	specs/commit/CommitProtocol.tla	specs/commit/CommitAccurate.cfg	CommitSnapshotValid
+NC-5	NC-5.patch	specs/commit/CommitProtocol.tla	specs/commit/CommitH2.cfg	DEADLOCK
+NC-6	NC-6.patch	specs/commit/CommitProtocol.tla	specs/commit/CommitH6.cfg	CommitSnapshotValid
+NC-7	NC-7.patch	specs/common/FootprintLemmas.tla	specs/common/FootprintLemmas.cfg	ASSUMPTION:LemmaCoverageIsSound
+NC-A	NC-A.patch	specs/scheduler/Scheduler.tla	specs/scheduler/SchedulerRetry.cfg	DEADLOCK
+NC-B	NC-B.patch	specs/scheduler/Scheduler.tla	specs/scheduler/SchedulerRetry.cfg	DEADLOCK
+NC-C	NC-C.patch	specs/scheduler/Scheduler.tla	specs/scheduler/SchedulerRetry.cfg	BoundsNeverBind
