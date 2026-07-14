@@ -112,9 +112,7 @@ private[stm] trait TxnLogContext[F[_]] {
       Async[F].pure(None)
 
     override private[stm] lazy val idFootprint: F[IdFootprint] =
-      Async[F].delay(txnVar.runtimeId).map { rid =>
-        IdFootprint(readIds = Set(rid), updatedIds = Set())
-      }
+      Async[F].delay(txnVar.runtimeId).map(IdFootprint.readOnly)
   }
 
   private[stm] case class TxnLogUpdateVarEntry[V](
@@ -153,9 +151,7 @@ private[stm] trait TxnLogContext[F[_]] {
       Async[F].delay(Some((txnVar.runtimeId, txnVar.commitLock)))
 
     override private[stm] lazy val idFootprint: F[IdFootprint] =
-      Async[F].delay(txnVar.runtimeId).map { rid =>
-        IdFootprint(readIds = Set(), updatedIds = Set(rid))
-      }
+      Async[F].delay(txnVar.runtimeId).map(IdFootprint.writeOnly)
   }
 
   // See above comment for RO entry
@@ -191,9 +187,7 @@ private[stm] trait TxnLogContext[F[_]] {
       Async[F].pure(None)
 
     override private[stm] lazy val idFootprint: F[IdFootprint] =
-      Async[F].delay(txnVarMap.runtimeId).map { rid =>
-        IdFootprint(readIds = Set(rid), updatedIds = Set())
-      }
+      Async[F].delay(txnVarMap.runtimeId).map(IdFootprint.readOnly)
   }
 
   private[stm] case class TxnLogUpdateVarMapStructureEntry[K, V](
@@ -202,7 +196,7 @@ private[stm] trait TxnLogContext[F[_]] {
     txnVarMap: TxnVarMap[F, K, V]
   ) extends TxnLogEntry[Map[K, V]] {
 
-    override private[stm] lazy val get: Map[K, V] =
+    override private[stm] def get: Map[K, V] =
       current
 
     override private[stm] def set(value: Map[K, V]): TxnLogEntry[Map[K, V]] =
@@ -232,9 +226,7 @@ private[stm] trait TxnLogContext[F[_]] {
       Async[F].delay(Some((txnVarMap.runtimeId, txnVarMap.commitLock)))
 
     override private[stm] lazy val idFootprint: F[IdFootprint] =
-      Async[F].delay(txnVarMap.runtimeId).map { rid =>
-        IdFootprint(readIds = Set(), updatedIds = Set(rid))
-      }
+      Async[F].delay(txnVarMap.runtimeId).map(IdFootprint.writeOnly)
   }
 
   // See above comment for RO entry
@@ -244,7 +236,7 @@ private[stm] trait TxnLogContext[F[_]] {
     txnVarMap: TxnVarMap[F, K, V]
   ) extends TxnLogEntry[Option[V]] {
 
-    override private[stm] lazy val get: Option[V] =
+    override private[stm] def get: Option[V] =
       initial
 
     override private[stm] def set(value: Option[V]): TxnLogEntry[Option[V]] =
@@ -272,12 +264,7 @@ private[stm] trait TxnLogContext[F[_]] {
       Async[F].pure(None)
 
     override private[stm] lazy val idFootprint: F[IdFootprint] =
-      txnVarMap.getRuntimeId(key).map { rid =>
-        IdFootprint(
-          readIds    = Set(rid),
-          updatedIds = Set()
-        )
-      }
+      txnVarMap.getRuntimeId(key).map(IdFootprint.readOnly)
   }
 
   private[stm] case class TxnLogUpdateVarMapEntry[K, V](
@@ -287,7 +274,7 @@ private[stm] trait TxnLogContext[F[_]] {
     txnVarMap: TxnVarMap[F, K, V]
   ) extends TxnLogEntry[Option[V]] {
 
-    override private[stm] lazy val get: Option[V] =
+    override private[stm] def get: Option[V] =
       current
 
     override private[stm] def set(value: Option[V]): TxnLogEntry[Option[V]] =
@@ -340,32 +327,28 @@ private[stm] trait TxnLogContext[F[_]] {
       )
 
     override private[stm] lazy val idFootprint: F[IdFootprint] =
-      txnVarMap.getRuntimeId(key).map { rid =>
-        IdFootprint(
-          readIds    = Set(),
-          updatedIds = Set(rid)
-        )
-      }
+      txnVarMap.getRuntimeId(key).map(IdFootprint.writeOnly)
   }
 
   sealed private[stm] trait TxnLog { self =>
 
     private[stm] def getVar[V](txnVar: TxnVar[F, V]): F[(TxnLog, V)]
 
-    // Base TxnLog methods: DEFENSIVE TOTALITY ONLY. Terminal log states
-    // (TxnLogRetry, TxnLogError) inherit these defaults, but an intact
-    // interpreter can no longer reach them mid-fold: a retry THROWS
-    // TxnRetryException (scheduleRetry) and an error THROWS TxnErrorException
-    // (raiseError, TxnLogValid.delay's handler), so the fold stops at the
-    // first terminal event and no continuation ever runs against a terminal
-    // state. TxnLogValid overrides all of these with real logic.
+    // Base TxnLog methods: DEFENSIVE TOTALITY ONLY (raiseError is the
+    // exception — it is the live short-circuit for valid logs too; see its
+    // note). Terminal log states (TxnLogRetry, TxnLogError) inherit these
+    // defaults, but an intact interpreter can no longer reach them mid-fold: a
+    // retry THROWS TxnRetryException (scheduleRetry) and an error THROWS
+    // TxnErrorException (raiseError, TxnLogValid.delay's handler), so the fold
+    // stops at the first terminal event and no continuation ever runs against
+    // a terminal state. TxnLogValid overrides all of these with real logic.
     //
     // @nowarn where a default still ignores its parameter; `delay` keeps the
     // Unit cast because it must not run the effect and has no value to give —
     // acceptable only BECAUSE the arm is unreachable.
     @nowarn
     private[stm] def delay[V](value: F[V]): F[(TxnLog, V)] =
-      Async[F].delay(self, ().asInstanceOf[V])
+      Async[F].delay((self, ().asInstanceOf[V]))
 
     private[stm] def pure[V](value: V): F[(TxnLog, V)] =
       Async[F].pure((self, value))
@@ -388,7 +371,7 @@ private[stm] trait TxnLogContext[F[_]] {
     private[stm] def getVarMap[K, V](
       txnVarMap: TxnVarMap[F, K, V]
     ): F[(TxnLog, Map[K, V])] =
-      Async[F].pure(self, Map())
+      Async[F].pure((self, Map()))
 
     @nowarn
     private[stm] def setVarMap[K, V](
@@ -420,10 +403,18 @@ private[stm] trait TxnLogContext[F[_]] {
     ): F[TxnLog] =
       Async[F].pure(self)
 
-    // The one base default whose no-op form would be actively unsafe if the
-    // mid-fold invariant (state is always TxnLogValid) were ever broken:
-    // swallowing an error silently. Raise instead — unreachable today, loud if
-    // that ever changes.
+    // The LIVE error short-circuit for valid logs — TxnLogValid's write ops
+    // funnel here via handleErrorWith(raiseError), delay inlines the same
+    // wrapping, and getVarMapValue routes here on the read side — doubling as
+    // the defensive default for terminal states. Errors SHORT-CIRCUIT the
+    // fold, exactly as retries do: past the first error there is no value to
+    // hand any continuation, so none may run. TxnHandleError catches the
+    // carrier and
+    // runs its recovery branch against the PRE-BLOCK state (rollback of
+    // everything the failed block staged), and getTxnLogResult unwraps it at
+    // the boundary, so the user always sees the ORIGINAL exception.
+    // Already-wrapped carriers pass through untouched — a re-wrap would bury
+    // the original one level deeper at every enclosing handler.
     private[stm] def raiseError(ex: Throwable): F[TxnLog] =
       ex match {
         case e: TxnRetryException => Async[F].raiseError(e)
@@ -490,15 +481,12 @@ private[stm] trait TxnLogContext[F[_]] {
       value: F[V]
     ): F[(TxnLog, V)] =
       value
-        .map((this.asInstanceOf[TxnLog], _))
+        .map((this: TxnLog, _))
         .handleErrorWith {
           case e: TxnRetryException => Async[F].raiseError(e)
           case e: TxnErrorException => Async[F].raiseError(e)
           case ex => Async[F].raiseError(TxnErrorException(ex))
         }
-
-    override private[stm] def pure[V](value: V): F[(TxnLog, V)] =
-      Async[F].pure((this, value))
 
     override private[stm] def getVar[V](
       txnVar: TxnVar[F, V]
@@ -537,15 +525,14 @@ private[stm] trait TxnLogContext[F[_]] {
                        case Some(entry) =>
                          Async[F]
                            .delay(
-                             log + (txnVar.runtimeId -> entry
+                             log + (rId -> entry
                                .asInstanceOf[TxnLogEntry[V]]
                                .set(materializedValue))
                            )
                            .map(TxnLogValid(_))
                        case _ =>
                          for {
-                           v   <- txnVar.get
-                           rId <- Async[F].delay(txnVar.runtimeId)
+                           v <- txnVar.get
                            newValue <- Async[F].delay(
                                          TxnLogUpdateVarEntry(
                                            v,
@@ -556,7 +543,7 @@ private[stm] trait TxnLogContext[F[_]] {
                            newLog <- Async[F].delay(log + (rId -> newValue))
                          } yield TxnLogValid(newLog)
                      }
-        result <- Async[F].delay(rawResult.asInstanceOf[TxnLog])
+        result <- Async[F].delay(rawResult: TxnLog)
       } yield result).handleErrorWith(raiseError)
 
     // A LOOKUP, not a read: it answers "is there an entry for this key?" and does not
@@ -597,7 +584,7 @@ private[stm] trait TxnLogContext[F[_]] {
               for {
                 oldMap <- txnVarMap.get
                 preTxn <-
-                  oldMap.keySet.toList.parTraverse { ks =>
+                  oldMap.keySet.toList.traverse { ks =>
                     getVarMapValueEntry(ks, txnVarMap)
                   }
               } yield preTxn,
@@ -606,7 +593,7 @@ private[stm] trait TxnLogContext[F[_]] {
               )
             )
           currentEntries <- extractMap(txnVarMap, log)
-          reads <- currentEntries.keySet.toList.parTraverse { ks =>
+          reads <- currentEntries.keySet.toList.traverse { ks =>
                      getVarMapValueEntry(ks, txnVarMap)
                    }
         } yield (preTxnEntries ::: reads).flatten.toMap
@@ -761,11 +748,11 @@ private[stm] trait TxnLogContext[F[_]] {
       ): F[Map[TxnVarRuntimeId, TxnLogEntry[Option[V]]]] = for {
         currentMap <- extractMap(txnVarMap, log)
         deletions <-
-          (currentMap.keySet -- materializedNewMap.keySet).toList.parTraverse { ks =>
+          (currentMap.keySet -- materializedNewMap.keySet).toList.traverse { ks =>
             writeVarMapValueEntry(ks, None, txnVarMap)
           }
-        updates <- materializedNewMap.toList.parTraverse { kv =>
-                     writeVarMapValueEntry(kv._1, Some(kv._2), txnVarMap)
+        updates <- materializedNewMap.toList.traverse { case (k, v) =>
+                     writeVarMapValueEntry(k, Some(v), txnVarMap)
                    }
       } yield (deletions ::: updates).flatten.toMap
 
@@ -808,7 +795,7 @@ private[stm] trait TxnLogContext[F[_]] {
                                Async[F].delay(TxnLogValid(newLog + newEntry))
                            } yield i2Result
                        }
-      } yield innerResult.asInstanceOf[TxnLog]
+      } yield (innerResult: TxnLog)
 
       result.handleErrorWith(raiseError)
     }
@@ -988,21 +975,6 @@ private[stm] trait TxnLogContext[F[_]] {
     ): F[TxnLog] =
       writeVarMapValue[K, V](key, None, txnVarMap)
 
-    // Errors SHORT-CIRCUIT the fold, exactly as retries do below: past the
-    // first error there is no value to hand any continuation, so none may
-    // run. TxnHandleError catches the carrier and runs its recovery branch
-    // against the PRE-BLOCK state (rollback of everything the failed block
-    // staged), and getTxnLogResult unwraps it at the boundary, so the user
-    // always sees the ORIGINAL exception. Already-wrapped carriers pass
-    // through untouched — a re-wrap would bury the original one level deeper
-    // at every enclosing handler.
-    override private[stm] def raiseError(ex: Throwable): F[TxnLog] =
-      ex match {
-        case e: TxnRetryException => Async[F].raiseError(e)
-        case e: TxnErrorException => Async[F].raiseError(e)
-        case e => Async[F].raiseError(TxnErrorException(e))
-      }
-
     // We throw here to short-circuit the Free compiler recursion.
     // There is no point in processing anything else beyond the retry,
     // which could lead to impossible casts being attempted, which would
@@ -1019,7 +991,7 @@ private[stm] trait TxnLogContext[F[_]] {
     // this file).
     private[stm] lazy val anyReadChangedSinceRead: F[Boolean] =
       log.values.toList
-        .parTraverse(_.hasChangedSinceRead)
+        .traverse(_.hasChangedSinceRead)
         .map(_.exists(identity))
 
     // foldLeft from empty, NOT reduce: an EMPTY log is perfectly ordinary — a
@@ -1099,13 +1071,11 @@ private[stm] trait TxnLogContext[F[_]] {
       val logEntriesF =
         Async[F].delay(
           log.values
-            .flatMap {
+            .collect {
               case TxnLogReadOnlyVarMapEntry(key, Some(initial), entryMap) if txnVarMap.id == entryMap.id =>
-                Some(key -> initial)
+                key -> initial
               case TxnLogUpdateVarMapEntry(key, _, Some(current), entryMap) if txnVarMap.id == entryMap.id =>
-                Some(key -> current)
-              case _ =>
-                None
+                key -> current
             }
             .toMap
             .asInstanceOf[Map[K, V]]

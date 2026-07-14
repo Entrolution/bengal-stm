@@ -212,7 +212,6 @@ DeclaredBase(t) ==
    against the fiber's SNAPSHOT (the log's read values), exactly as the
    code's log run decides TxnLogRetry — a write committed after the
    snapshot does not rescue a stale decision (that gap is H1's home). *)
-IsRetryTxn(t) == t \in {"tr", "tm"}
 RetryPred(t, versionsFn) ==
     IF t \in {"tr", "tm"} THEN versionsFn[V1] >= 1 ELSE TRUE
 

@@ -48,12 +48,6 @@ private[stm] trait TxnRuntimeContext[F[_]] {
 
   private[stm] case class TxnResultFailure(ex: Throwable) extends TxnResult
 
-  private[stm] object TxnResultFailure {
-
-    private[stm] def apply(logFailure: TxnLogError): TxnResultFailure =
-      TxnResultFailure(logFailure.ex)
-  }
-
   // THE one entry point to the static-analysis pass, used by TxnRuntime.commit.
   // The wake closure deliberately does NOT re-analyse — a wake fires from the
   // conflictor's pre-publish submission sweep, so a wake-time analysis would
@@ -191,12 +185,12 @@ private[stm] trait TxnRuntimeContext[F[_]] {
         for {
           triggered <-
             Async[F].delay(
-              retryMap.toList.filter { case (parkedId, (parkedFootprint, _)) =>
+              retryMap.iterator.filter { case (parkedId, (parkedFootprint, _)) =>
                 parkedId != submitterId && !idFootprint.isCompatibleWith(parkedFootprint)
-              }
+              }.toList
             )
-          _ <- triggered.parTraverse { case (_, (_, wake)) => wake }
-          _ <- triggered.traverse { case (parkedId, _) => Async[F].delay(retryMap.remove(parkedId)) }
+          _ <- triggered.traverse_ { case (_, (_, wake)) => wake }
+          _ <- triggered.traverse_ { case (parkedId, _) => Async[F].delay(retryMap.remove(parkedId)) }
         } yield ()
       }
 
@@ -551,7 +545,7 @@ private[stm] trait TxnRuntimeContext[F[_]] {
     private[stm] def subscribeDownstreamDependency(
       txn: AnalysedTxn[_]
     ): F[Unit] =
-      Async[F].ifM(Async[F].delay(unsubSpecs.keys.toSet.contains(txn.id)))(
+      Async[F].ifM(Async[F].delay(unsubSpecs.contains(txn.id)))(
         Async[F].unit,
         for {
           _ <- txn.subscribeUpstreamDependency
@@ -574,7 +568,7 @@ private[stm] trait TxnRuntimeContext[F[_]] {
         Async[F].unit,
         Async[F].ifM(Async[F].delay(unsubSpecs.nonEmpty))(
           for {
-            _ <- unsubSpecs.values.toList.parTraverse(unsubSpec => unsubSpec)
+            _ <- unsubSpecs.values.toList.sequence_
             _ <- Async[F].delay(unsubSpecs.clear())
           } yield (),
           Async[F].unit
@@ -681,13 +675,10 @@ private[stm] trait TxnRuntimeContext[F[_]] {
                         .flatMap { s =>
                           s.map(v =>
                             Async[F]
-                              .delay(TxnResultSuccess(v).asInstanceOf[TxnResult])
+                              .delay(TxnResultSuccess(v): TxnResult)
                           ).getOrElse(
                             log.idFootprint
-                              .map(footprint =>
-                                TxnResultLogDirty(footprint)
-                                  .asInstanceOf[TxnResult]
-                              )
+                              .map(footprint => TxnResultLogDirty(footprint): TxnResult)
                           )
                         }
                     // The park path needs the same coverage check. A parked
@@ -739,7 +730,7 @@ private[stm] trait TxnRuntimeContext[F[_]] {
                     // in the error result and refine instead of failing when
                     // coverage does not hold — is deliberately not taken here.
                     case err @ TxnLogError(_) =>
-                      Async[F].delay(TxnResultFailure(err))
+                      Async[F].delay(TxnResultFailure(err.ex))
                   }
       } yield result
 
@@ -846,7 +837,7 @@ private[stm] trait TxnRuntimeContext[F[_]] {
         completionSignal  <- Deferred[F, Either[Throwable, V]]
         dependencyTally   <- Ref[F].of(0)
         hasDownstream     <- Ref[F].of(false)
-        executionStatus   <- Ref[F].of(NotScheduled.asInstanceOf[ExecutionStatus])
+        executionStatus   <- Ref[F].of[ExecutionStatus](NotScheduled)
         cascadeFired      <- Ref[F].of(false)
         abandoned         <- Ref[F].of(false)
         id                <- txnIdGen.getAndUpdate(_ + 1)

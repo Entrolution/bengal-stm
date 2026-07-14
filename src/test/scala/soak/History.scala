@@ -54,12 +54,8 @@ object History {
   type TxnId = Int
   type Tag   = Long
 
-  /** A transaction appends `id * TagStride + seq`, so a tag names its writer. Transaction ids start at 1; id 0 is the
-    * virtual transaction that established the initial state.
-    */
+  /** A transaction appends `id * TagStride + seq`, so a tag names its writer. Transaction ids start at 1. */
   val TagStride: Long = 1000000L
-
-  val InitTxn: TxnId = 0
 
   def tagFor(txn: TxnId, seq: Int): Tag = txn.toLong * TagStride + seq.toLong
   def writerOf(tag: Tag): TxnId         = (tag / TagStride).toInt

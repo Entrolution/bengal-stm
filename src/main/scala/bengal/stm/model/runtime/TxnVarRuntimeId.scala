@@ -39,7 +39,7 @@ package bengal.stm.model.runtime
 // the only parent anyone assigns is a map's own runtimeId and maps do not nest.
 // A nested-map feature would type-check against this class and silently lose
 // conflicts; it needs multi-hop coverage in IdFootprint first.
-private[stm] case class TxnVarRuntimeId(
+final private[stm] case class TxnVarRuntimeId(
   value: Long,
   parent: Option[TxnVarRuntimeId] = None
 )

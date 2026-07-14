@@ -94,7 +94,9 @@ class StmThroughputBench {
 
   private final val Batch = 32
 
-  private val Keys    = (0 until 64).map(i => s"k$i").toVector
+  // Sized to exactly two windows: WindowB below spans (Batch until 2 * Batch),
+  // so raising Batch alone must grow the keyspace with it.
+  private val Keys    = (0 until 2 * Batch).map(i => s"k$i").toVector
   private val counter = new AtomicInteger(0)
 
   // Every var-writing benchmark adds its known per-invocation write count

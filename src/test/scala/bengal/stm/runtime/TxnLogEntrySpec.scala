@@ -664,42 +664,36 @@ class TxnLogEntrySpec extends AsyncFreeSpec with AsyncIOSpec with Matchers with 
 
     "is recorded in the log, so the park-time staleness check can see it" in withRuntime { implicit stm =>
       import stm._
-      TxnVarMap
-        .of[IO, String, Int](Map.empty)
-        .flatMap { map =>
-          for {
-            res <- TxnLogValid.empty.getVarMapValue(IO.pure("ghost"), map)
-            (log, value) = res
-            valid        = log.asInstanceOf[TxnLogValid]
-          } yield {
-            value shouldBe None
-            // The read of a key that is not there is still a READ, and it must be logged
-            // like any other. This is the entire fix.
-            valid.log should not be empty
-          }
-        }
+      for {
+        map <- TxnVarMap.of[IO, String, Int](Map.empty)
+        res <- TxnLogValid.empty.getVarMapValue(IO.pure("ghost"), map)
+        (log, value) = res
+        valid        = log.asInstanceOf[TxnLogValid]
+      } yield {
+        value shouldBe None
+        // The read of a key that is not there is still a READ, and it must be logged
+        // like any other. This is the entire fix.
+        valid.log should not be empty
+      }
     }
 
     "reports as changed once the key it looked for appears" in withRuntime { implicit stm =>
       import stm._
-      TxnVarMap
-        .of[IO, String, Int](Map.empty)
-        .flatMap { map =>
-          for {
-            res <- TxnLogValid.empty.getVarMapValue(IO.pure("ghost"), map)
-            valid = res._1.asInstanceOf[TxnLogValid]
-            // Nothing has moved yet.
-            before <- valid.anyReadChangedSinceRead
-            // A conflicting writer creates the key underneath us.
-            _     <- map.set("ghost", 1).commit
-            after <- valid.anyReadChangedSinceRead
-          } yield {
-            before shouldBe false
-            // ...and THIS is what has to be true, or a transaction parked on that key
-            // is never woken. It was false for the whole of the H1 workstream.
-            after shouldBe true
-          }
-        }
+      for {
+        map <- TxnVarMap.of[IO, String, Int](Map.empty)
+        res <- TxnLogValid.empty.getVarMapValue(IO.pure("ghost"), map)
+        valid = res._1.asInstanceOf[TxnLogValid]
+        // Nothing has moved yet.
+        before <- valid.anyReadChangedSinceRead
+        // A conflicting writer creates the key underneath us.
+        _     <- map.set("ghost", 1).commit
+        after <- valid.anyReadChangedSinceRead
+      } yield {
+        before shouldBe false
+        // ...and THIS is what has to be true, or a transaction parked on that key
+        // is never woken. It was false for the whole of the H1 workstream.
+        after shouldBe true
+      }
     }
   }
 }

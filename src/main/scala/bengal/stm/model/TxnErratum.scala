@@ -21,5 +21,5 @@ sealed private[stm] trait TxnErratum
 
 object TxnErratum {
   private[stm] case object TxnRetry extends TxnErratum
-  private[stm] case class TxnError(ex: Throwable) extends TxnErratum
+  final private[stm] case class TxnError(ex: Throwable) extends TxnErratum
 }

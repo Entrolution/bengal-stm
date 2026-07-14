@@ -17,7 +17,7 @@
 package ai.entrolution
 package bengal.stm.model.runtime
 
-private[stm] case class IdFootprint(
+final private[stm] case class IdFootprint(
   readIds: Set[TxnVarRuntimeId],
   updatedIds: Set[TxnVarRuntimeId],
   isValidated: Boolean = false,
@@ -189,4 +189,13 @@ private[stm] case class IdFootprint(
 
 private[stm] object IdFootprint {
   private[stm] val empty: IdFootprint = IdFootprint(Set(), Set())
+
+  // Named single-id constructors: the read/write slots are positional, and a
+  // hand-written literal that swaps them logs a write as a read — a silent
+  // conflict-detection hole. These name the intent once.
+  private[stm] def readOnly(id: TxnVarRuntimeId): IdFootprint =
+    IdFootprint(readIds = Set(id), updatedIds = Set())
+
+  private[stm] def writeOnly(id: TxnVarRuntimeId): IdFootprint =
+    IdFootprint(readIds = Set(), updatedIds = Set(id))
 }

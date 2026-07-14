@@ -36,11 +36,15 @@ private[stm] trait TxnCompilerContext[F[_]] {
   private[stm] type TxnLogStore[T]      = StateT[F, TxnLog, T]
 
   private def noOp[S]: StateT[F, S, Unit] =
-    StateT[F, S, Unit](s => Async[F].delay((s, ())))
+    StateT.pure[F, S, Unit](())
+
+  private def shortCircuit[A](s: IdFootprint): F[A] =
+    Async[F].raiseError(StaticAnalysisShortCircuitException(s))
 
   private[stm] case class StaticAnalysisShortCircuitException(
     idFootprint: IdFootprint
   ) extends RuntimeException
+      with NoStackTrace
 
   // The walker reached a terminal erratum — a waitFor retry or an abort — and
   // STOPPED. Unlike StaticAnalysisShortCircuitException above, the carried
@@ -65,10 +69,8 @@ private[stm] trait TxnCompilerContext[F[_]] {
   // analysis walker's TxnHandleError recovery — those arms hand back
   // ().asInstanceOf[V] (the setter arms need no cast: their pattern match
   // refines V = Unit), and Scala 2.13 flags every one as
-  // a "dubious usage of asInstanceOf with unit value". Scala 3 instead flags
-  // the opposite: the trailing `case _ =>` in txnLogCompiler's erratum match is
-  // UNREACHABLE, TxnRetry and TxnError having already exhausted TxnErratum. CI
-  // compiles both, with warnings fatal.
+  // a "dubious usage of asInstanceOf with unit value". CI compiles both Scala
+  // versions, with warnings fatal.
   //
   // BOTH walkers stop at a terminal erratum, each in its own way. txnLogCompiler
   // enumerates the errata — TxnRetry schedules a retry (which throws), TxnError
@@ -94,7 +96,7 @@ private[stm] trait TxnCompilerContext[F[_]] {
   // the woken run can see the satisfied predicate — the refinement lap is the
   // structural price of the stop, bounded at one per wake.
   private[stm] def staticAnalysisCompiler: FunctionK[TxnOrErr, IdFootprintStore] =
-    new (FunctionK[TxnOrErr, IdFootprintStore]) {
+    new FunctionK[TxnOrErr, IdFootprintStore] {
 
       @nowarn
       def apply[V](fa: TxnOrErr[V]): IdFootprintStore[V] =
@@ -109,12 +111,10 @@ private[stm] trait TxnCompilerContext[F[_]] {
                     .map { materializedValue =>
                       (s, materializedValue)
                     }
-                    .handleErrorWith { _ =>
-                      Async[F].raiseError(StaticAnalysisShortCircuitException(s))
-                    }
+                    .handleErrorWith(_ => shortCircuit(s))
                 }
               case TxnPure(value) =>
-                StateT[F, IdFootprint, V](s => Async[F].pure((s, value)))
+                StateT.pure[F, IdFootprint, V](value)
               case TxnGetVar(txnVar) =>
                 StateT[F, IdFootprint, V] { s =>
                   for {
@@ -148,9 +148,7 @@ private[stm] trait TxnCompilerContext[F[_]] {
                           Async[F].delay(s.addReadId(eRId)).map((_, valueAsV))
                       } yield result
                     }
-                    .handleErrorWith { _ =>
-                      Async[F].raiseError(StaticAnalysisShortCircuitException(s))
-                    }
+                    .handleErrorWith(_ => shortCircuit(s))
                 }
               case adt: TxnSetVar[_] =>
                 StateT[F, IdFootprint, V] { s =>
@@ -296,7 +294,7 @@ private[stm] trait TxnCompilerContext[F[_]] {
     }
 
   private[stm] lazy val txnLogCompiler: FunctionK[TxnOrErr, TxnLogStore] =
-    new (FunctionK[TxnOrErr, TxnLogStore]) {
+    new FunctionK[TxnOrErr, TxnLogStore] {
 
       @nowarn
       def apply[V](fa: TxnOrErr[V]): TxnLogStore[V] =
@@ -332,10 +330,8 @@ private[stm] trait TxnCompilerContext[F[_]] {
                 }
               case adt: TxnSetVarMap[_, _] =>
                 StateT[F, TxnLog, V] { s =>
-                  for {
-                    newState <-
-                      s.setVarMap(adt.newMap, adt.txnVarMap)
-                  } yield (newState, ())
+                  s.setVarMap(adt.newMap, adt.txnVarMap)
+                    .map((_, ()))
                 }
               case adt: TxnSetVarMapValue[_, _] =>
                 StateT[F, TxnLog, V] { s =>
@@ -398,8 +394,6 @@ private[stm] trait TxnCompilerContext[F[_]] {
                 StateT[F, TxnLog, V](
                   _.raiseError(ex).map((_, ().asInstanceOf[V]))
                 )
-              case _ =>
-                noOp[TxnLog].map(_.asInstanceOf[V])
             }
         }
     }

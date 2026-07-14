@@ -17,7 +17,6 @@
 package ai.entrolution
 package model
 
-import cats.effect.implicits._
 import cats.effect.testing.scalatest.AsyncIOSpec
 import cats.syntax.all._
 import org.scalatest.EitherValues

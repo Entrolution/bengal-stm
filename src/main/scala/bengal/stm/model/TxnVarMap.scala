@@ -57,13 +57,13 @@ final class TxnVarMap[F[_]: STM: Async, K, V] private[stm] (
   private val internalStructureLock: Semaphore[F]
 ) extends TxnStateEntity[F, VarIndex[F, K, V]] {
 
-  private def withLock[A](semaphore: Semaphore[F])(fa: F[A]): F[A] = semaphore.permit.use(_ => fa)
+  private def withStructureLock[A](fa: F[A]): F[A] = internalStructureLock.permit.use(_ => fa)
 
   private[stm] lazy val get: F[Map[K, V]] =
     for {
       txnVarMap <- value.get
-      valueMap <- txnVarMap.toList.traverse { kv =>
-                    kv._2.get.map(v => kv._1 -> v)
+      valueMap <- txnVarMap.toList.traverse { case (k, txnVar) =>
+                    txnVar.get.map(v => k -> v)
                   }
     } yield valueMap.toMap
 
@@ -73,15 +73,7 @@ final class TxnVarMap[F[_]: STM: Async, K, V] private[stm] (
     } yield txnVarMap.get(key)
 
   private[stm] def get(key: K): F[Option[V]] =
-    for {
-      oTxnVar <- getTxnVar(key)
-      result <- oTxnVar match {
-                  case Some(txnVar) =>
-                    txnVar.get.map(v => Some(v))
-                  case _ =>
-                    Async[F].pure(None)
-                }
-    } yield result
+    getTxnVar(key).flatMap(_.traverse(_.get))
 
   // The EXISTENTIAL id registry: one stable id per distinct key, whether or not
   // the key exists. An id that does not need a TxnVar names a slot that may hold
@@ -152,7 +144,7 @@ final class TxnVarMap[F[_]: STM: Async, K, V] private[stm] (
     }
 
   private[stm] def addOrUpdate(key: K, newValue: V): F[Unit] =
-    withLock(internalStructureLock) {
+    withStructureLock {
       for {
         txnVarMap <- value.get
         _ <- txnVarMap.get(key) match {
@@ -168,7 +160,7 @@ final class TxnVarMap[F[_]: STM: Async, K, V] private[stm] (
     }
 
   private[stm] def delete(key: K): F[Unit] =
-    withLock(internalStructureLock) {
+    withStructureLock {
       for {
         txnVarMap <- value.get
         _ <- txnVarMap.get(key) match {
@@ -191,8 +183,8 @@ object TxnVarMap {
   def of[F[_]: STM: Async, K, V](valueMap: Map[K, V]): F[TxnVarMap[F, K, V]] =
     for {
       id <- STM[F].txnVarIdGen.updateAndGet(_ + 1)
-      values <- valueMap.toList.traverse { kv =>
-                  TxnVar.of(kv._2).map(txv => kv._1 -> txv)
+      values <- valueMap.toList.traverse { case (k, v) =>
+                  TxnVar.of(v).map(txv => k -> txv)
                 }
       valuesRef             <- Async[F].ref(values.toMap: VarIndex[F, K, V])
       lock                  <- Semaphore[F](1)
