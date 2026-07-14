@@ -17,7 +17,8 @@
 package ai.entrolution
 package soak
 
-import java.util.concurrent.atomic.AtomicIntegerArray
+import java.util.concurrent.TimeoutException
+import java.util.concurrent.atomic.{ AtomicInteger, AtomicIntegerArray }
 
 import scala.concurrent.duration._
 
@@ -102,7 +103,7 @@ class RetrySoakSpec extends AnyFreeSpec with Matchers {
 
   private case class Outcome(consumed: List[Long], execs: Vector[Int])
 
-  private def runRound(round: Int): Outcome = {
+  private def runRound(round: Int, maxBufSeen: AtomicInteger): Outcome = {
     // One slot per TRANSACTION (not per producer/consumer): each producer runs
     // PerProducer of them and each consumer several, so counting by id would
     // conflate them and the mean would be meaningless.
@@ -126,6 +127,16 @@ class RetrySoakSpec extends AnyFreeSpec with Matchers {
             for {
               _ <- count(id)
               b <- buf.get
+              // Sampled BEFORE the waitFor, so it fires on every body
+              // execution (both passes, and every wake lap) — a thunk placed
+              // after the waitFor runs in NEITHER pass while parked. max is
+              // pass-invariant and the delay adds no footprint entry, so the
+              // parking behaviour under test is unperturbed. Every sample is
+              // a committed buffer size as seen at the park-decision point.
+              _ <- STM[IO].delay {
+                     maxBufSeen.accumulateAndGet(b.size, Math.max(_, _))
+                     ()
+                   }
               _ <- STM[IO].waitFor(b.size < Capacity)
               _ <- buf.set(b :+ tag)
             } yield ()
@@ -171,12 +182,32 @@ class RetrySoakSpec extends AnyFreeSpec with Matchers {
   "producer/consumer under a bounded buffer" - {
 
     "every transaction completes, and every item is consumed exactly once" in {
-      val rounds   = 8
-      val allExecs = Vector.newBuilder[Int]
+      val rounds         = 8
+      val allExecs       = Vector.newBuilder[Int]
+      val maxBufSeen     = new AtomicInteger(0)
+      var producerReRuns = 0
 
       (1 to rounds).foreach { round =>
-        val out = runRound(round)
+        // A lost wakeup or a lock cycle hangs rather than fails; the timeout
+        // fires inside runRound and would otherwise surface as a bare
+        // TimeoutException with no reproduction key. The round index IS that
+        // key here (the item tags fold it in), so attach it.
+        val out =
+          try runRound(round, maxBufSeen)
+          catch {
+            case _: TimeoutException =>
+              fail(
+                s"round $round timed out — a lost wakeup or a lock cycle; replay with this round index"
+              )
+          }
         allExecs ++= out.execs
+        // Producer transactions occupy ids 0 until Total; floor is 2 (one
+        // analysis pass + one run), so > 2 means the producer went around
+        // again — a wake lap, or the refinement lap that follows an analysis
+        // pass stopped at a full buffer. Every no-wake path to > 2 begins
+        // with that full-buffer stop, so either way the full direction was
+        // exercised.
+        producerReRuns += out.execs.take(Total).count(_ > 2)
 
         val expected = (0 until Producers).flatMap { p =>
           (0 until PerProducer).map(k => (round.toLong * 100000L) + (p.toLong * 100L) + k.toLong)
@@ -192,6 +223,40 @@ class RetrySoakSpec extends AnyFreeSpec with Matchers {
       val max   = execs.max
 
       info(f"body executions across $rounds rounds: mean $mean%.1f, max $max")
+      info(
+        s"max buffer size observed by producers: ${maxBufSeen.get} (capacity $Capacity); " +
+          s"producer re-runs: $producerReRuns"
+      )
+
+      // The capacity contract, observed from inside the producer bodies: all
+      // buffer transactions read AND write buf, so fully-declared ones are
+      // pairwise incompatible and Contract C serializes them — and a lap
+      // whose analysis stopped at the waitFor (declaring read-only) is caught
+      // by the commit-time coverage gate, refined, and re-run serialized.
+      // Either way a committing producer saw size < Capacity at its
+      // serialization point, so no committed size can exceed Capacity. A
+      // neutered capacity waitFor lets producers append unconditionally, and
+      // this reads past Capacity.
+      withClue(
+        s"a producer body observed a buffer of ${maxBufSeen.get} items (capacity $Capacity) — the " +
+          "producer-side waitFor is not actually bounding the buffer: "
+      ) {
+        maxBufSeen.get should be <= Capacity
+      }
+
+      // The suite's premise is a buffer that parks in BOTH directions, and
+      // the consumer/empty direction is implicitly protected (head/tail throw
+      // on empty). This is the producer/full direction's evidence: 12
+      // producers pushing 72 items through 4 slots park with near-certainty
+      // in aggregate, so zero re-runs across all rounds means the park direction
+      // was never exercised at all. Aggregated across rounds so one round's
+      // scheduling luck cannot flake it.
+      withClue(
+        "no producer ever re-ran — the full-buffer park direction was never exercised, so this " +
+          "suite is not testing producer wakeups: "
+      ) {
+        producerReRuns should be > 0
+      }
 
       withClue(
         s"a transaction body ran $max times. Parking accounts for a lot of that, but not this much — suspect a " +
@@ -199,6 +264,16 @@ class RetrySoakSpec extends AnyFreeSpec with Matchers {
           "re-running and re-parking without bound): "
       ) {
         max should be <= MaxBodyRuns
+      }
+
+      // Mean is the moderate-regression tripwire the max bound cannot be
+      // (MaxBodyRuns is a spin detector). Observed baseline: mean ~11.3 with
+      // floor 2 (analysis + run; legitimate parking re-runs push it up). The
+      // bound allows ~4x the observed excess-over-floor (9.3 -> 38) before
+      // going red — machine headroom in the HistorySpec tradition, while a
+      // wake-storm regression that multiplies re-execution still trips it.
+      withClue(f"mean body executions $mean%.1f — re-execution has grown well past the observed baseline: ") {
+        mean should be <= 40.0
       }
     }
   }

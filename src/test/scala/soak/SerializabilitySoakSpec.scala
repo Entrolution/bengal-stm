@@ -17,6 +17,7 @@
 package ai.entrolution
 package soak
 
+import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicIntegerArray
 
 import scala.concurrent.duration._
@@ -88,15 +89,20 @@ import soak.History._
   * run and bounded, so a livelock shows up as a red test rather than as a slow one.
   */
 private object DivergenceMeter {
-  private val seen = new java.util.concurrent.ConcurrentHashMap[(Int, Int), java.util.Set[String]]()
+  private val seen = new java.util.concurrent.ConcurrentHashMap[(Int, Int, Int), java.util.Set[String]]()
 
   /** Called from inside the transaction body, so it fires once in the static-analysis pass and once per admitted run.
-    * If the two passes computed DIFFERENT keys from the same source value, the declared footprint named an entry the
+    * If the passes computed DIFFERENT keys from the same source value, the declared footprint named an entry the
     * transaction did not touch — H6's divergence, measured rather than assumed.
+    *
+    * The ROUND is part of the key. Every round rebuilds txnIds 1..N and opIdx 0..k with a different seed, so without it
+    * the same slot accumulates keys across rounds and cross-round seed churn counts as "divergence" — the meter then
+    * inflates with round count while its denominator stays capped at one round's worth of slots. Round-scoped keys make
+    * each bucket exactly one execution instance's observations (analysis + every admitted lap).
     */
-  def observe(txn: Int, op: Int, key: String): Unit = {
+  def observe(round: Int, txn: Int, op: Int, key: String): Unit = {
     seen
-      .computeIfAbsent((txn, op), _ => java.util.concurrent.ConcurrentHashMap.newKeySet[String]())
+      .computeIfAbsent((round, txn, op), _ => java.util.concurrent.ConcurrentHashMap.newKeySet[String]())
       .add(key)
     ()
   }
@@ -162,6 +168,7 @@ class SerializabilitySoakSpec extends AnyFreeSpec with Matchers {
   // ---------------------------------------------------------------------------
 
   private def toTxn(
+    round: Int,
     txnId: TxnId,
     ops: List[Op],
     vars: List[TxnVar[IO, Vector[Tag]]],
@@ -237,7 +244,7 @@ class SerializabilitySoakSpec extends AnyFreeSpec with Matchers {
               v <- vars(src).get
               _ <- STM[IO].fromF(IO.sleep(2.millis))
               k = KeyPool(v.length % KeyPool.size)
-              _   <- STM[IO].delay(DivergenceMeter.observe(txnId, opIdx, k))
+              _   <- STM[IO].delay(DivergenceMeter.observe(round, txnId, opIdx, k))
               cur <- maps(m).get(k)
               _   <- maps(m).set(k, cur.getOrElse(Vector.empty) :+ tag)
             } yield rec.copy(
@@ -266,6 +273,11 @@ class SerializabilitySoakSpec extends AnyFreeSpec with Matchers {
               i  = v.length % KeyPool.size
               k1 = KeyPool(i)
               k2 = KeyPool((i + 1) % KeyPool.size)
+              // ONE representative key: k1 and k2 are adjacent-distinct by
+              // construction, so recording both under one instance key would
+              // make every DataDepRead read as "diverged" and re-break the
+              // meter. k1 alone captures whether the passes disagreed.
+              _  <- STM[IO].delay(DivergenceMeter.observe(round, txnId, opIdx, k1))
               c1 <- maps(m).get(k1)
               _  <- STM[IO].fromF(IO.sleep(2.millis))
               c2 <- maps(m).get(k2)
@@ -325,7 +337,7 @@ class SerializabilitySoakSpec extends AnyFreeSpec with Matchers {
     executions: Vector[Int]
   )
 
-  private def runRound(seed: Long): RoundResult = {
+  private def runRound(round: Int, seed: Long): RoundResult = {
     val rnd      = new Random(seed)
     val workload = List.fill(txnsPerRun)(genOps(rnd))
     val execs    = new AtomicIntegerArray(txnsPerRun + 1)
@@ -338,7 +350,7 @@ class SerializabilitySoakSpec extends AnyFreeSpec with Matchers {
           maps <- (0 until NumMaps).toList.traverse(_ => TxnVarMap.of[IO, String, Vector[Tag]](Map.empty))
 
           records <- workload.zipWithIndex.parTraverse { case (ops, i) =>
-                       toTxn(i + 1, ops, vars, maps, execs).commit
+                       toTxn(round, i + 1, ops, vars, maps, execs).commit
                      }
 
           finalVars <- vars.zipWithIndex.traverse { case (v, i) =>
@@ -356,7 +368,11 @@ class SerializabilitySoakSpec extends AnyFreeSpec with Matchers {
         )
       }
       // A lost wakeup or a lock cycle would hang rather than fail; the timeout
-      // turns either into a red test with the round's seed in the message.
+      // turns either into a TimeoutException, and the soak loop converts THAT
+      // into a red test carrying the round and seed. A raw TimeoutException
+      // bypasses withClue (ScalaTest only decorates its own exceptions), so
+      // it takes an explicit catch, which lives in the loop beside the other
+      // keyed assertions.
       .timeout(if (longMode) 5.minutes else 90.seconds)
       .unsafeRunSync()
   }
@@ -369,8 +385,15 @@ class SerializabilitySoakSpec extends AnyFreeSpec with Matchers {
     val allExecs = Vector.newBuilder[Int]
 
     (1 to rounds).foreach { round =>
-      val seed   = 0xbe9a1L * round
-      val result = runRound(seed)
+      val seed = 0xbe9a1L * round
+      val result =
+        try runRound(round, seed)
+        catch {
+          case _: TimeoutException =>
+            fail(
+              s"round $round (seed $seed) timed out — a lost wakeup or a lock cycle; replay with this seed"
+            )
+        }
       allExecs ++= result.executions
 
       val violations = History.check(result.finalState, result.records)
@@ -412,6 +435,18 @@ class SerializabilitySoakSpec extends AnyFreeSpec with Matchers {
         "on the H6 coverage-abort path (refine, re-run, diverge again) or a spurious-wakeup spin: "
     ) {
       max should be <= 25
+    }
+
+    // Mean is the moderate-regression tripwire the max bound cannot be (25 is
+    // a storm detector). Observed baseline: mean ~2.32 against the floor of 2
+    // — most transactions run exactly analysis + once. The bound allows ~8x
+    // the observed excess-over-floor (0.32 -> 2.5) before going red; stated
+    // in excess terms because the floor dominates the raw mean, so "4.5"
+    // sounds tighter than it is. Machine headroom in the HistorySpec
+    // tradition, while a coverage-abort or spurious-wake regression that
+    // multiplies re-execution across the population still trips it.
+    withClue(f"mean body executions $mean%.2f — population-wide re-execution has grown well past baseline: ") {
+      mean should be <= 4.5
     }
   }
 }
