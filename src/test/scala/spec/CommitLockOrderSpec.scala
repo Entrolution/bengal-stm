@@ -21,7 +21,6 @@ import scala.concurrent.duration._
 
 import cats.effect.IO
 import cats.effect.implicits._
-import cats.effect.unsafe.implicits.global
 import cats.syntax.all._
 import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.should.Matchers
@@ -64,7 +63,7 @@ import bengal.stm.syntax.all._
   * it must be long enough not to fire spuriously under load, because the cost of it firing is a leaked fiber.
   * `KeyIdentitySpec` pins the first-touch allocation-order property the pre-touch relies on.
   */
-class CommitLockOrderSpec extends AnyFreeSpec with Matchers {
+class CommitLockOrderSpec extends AnyFreeSpec with Matchers with StmSuite {
 
   /** 24 keys give the racing transactions plenty of overlapping commit windows. Which acquisition ORDER a key produces
     * under the pre-fix sort is not left to chance, though: existential ids are allocated in first-touch order, and a
@@ -119,38 +118,30 @@ class CommitLockOrderSpec extends AnyFreeSpec with Matchers {
     } yield ()
 
   "two fresh keys inserted into ONE map alias to one lock and must not self-deadlock" in {
-    val result = STM
-      .runtime[IO]
-      .flatMap { implicit stm =>
-        for {
-          m <- TxnVarMap.of[IO, String, Int](Map.empty)
-          _ <- KeyPairs.parTraverse { case (k1, k2) => insertTwoKeysIntoOneMap(m, k1, k2).commit }
-          r <- m.get.commit
-        } yield r
-      }
-      .timeout(60.seconds)
-      .unsafeRunSync()
+    val result = withRuntimeSync(60.seconds) { implicit stm =>
+      for {
+        m <- TxnVarMap.of[IO, String, Int](Map.empty)
+        _ <- KeyPairs.parTraverse { case (k1, k2) => insertTwoKeysIntoOneMap(m, k1, k2).commit }
+        r <- m.get.commit
+      } yield r
+    }
 
     result.keySet shouldBe Keys.toSet
   }
 
   "H2 regression — concurrent new-key inserts across two maps do not deadlock" in {
-    val (finalM1, finalM2) = STM
-      .runtime[IO]
-      .flatMap { implicit stm =>
-        for {
-          m1 <- TxnVarMap.of[IO, String, Int](Map.empty)
-          m2 <- TxnVarMap.of[IO, String, Int](Map.empty)
-          // Sequential, before the race: allocate odd keys' (m2, key) ids first so the
-          // pre-fix log-key sort would order their lock acquisitions m2-before-m1.
-          _  <- PreTouchViaM2.traverse(k => m2.get(k).commit)
-          _  <- Keys.parTraverse(k => insertIntoBoth(m1, m2, k).commit)
-          r1 <- m1.get.commit
-          r2 <- m2.get.commit
-        } yield (r1, r2)
-      }
-      .timeout(60.seconds)
-      .unsafeRunSync()
+    val (finalM1, finalM2) = withRuntimeSync(60.seconds) { implicit stm =>
+      for {
+        m1 <- TxnVarMap.of[IO, String, Int](Map.empty)
+        m2 <- TxnVarMap.of[IO, String, Int](Map.empty)
+        // Sequential, before the race: allocate odd keys' (m2, key) ids first so the
+        // pre-fix log-key sort would order their lock acquisitions m2-before-m1.
+        _  <- PreTouchViaM2.traverse(k => m2.get(k).commit)
+        _  <- Keys.parTraverse(k => insertIntoBoth(m1, m2, k).commit)
+        r1 <- m1.get.commit
+        r2 <- m2.get.commit
+      } yield (r1, r2)
+    }
 
     finalM1 shouldBe Keys.map(_ -> 1).toMap
     finalM2 shouldBe Keys.map(_ -> 2).toMap

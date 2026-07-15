@@ -41,6 +41,31 @@ private[stm] trait TxnCompilerContext[F[_]] {
   private def shortCircuit[A](s: IdFootprint): F[A] =
     Async[F].raiseError(StaticAnalysisShortCircuitException(s))
 
+  // The one analysis arm for a keyed WRITE (set/modify/delete of a map key):
+  // materialize the key, register its existential id as a write. The key thunk
+  // throwing means this write's id was never recorded. Unlike the read paths,
+  // the handler does NOT short-circuit: analysis carries on and the resulting
+  // footprint silently omits a write, never reaching TxnRuntime.commit's
+  // handleErrorWith. Flag it here or the omission is invisible. (An undeclared
+  // WRITE is not benign: it invalidates a correctly-declared peer's reads —
+  // specs/commit/CommitH3Writer.cfg.)
+  private def analyzeKeyedWrite[K, V](
+    key: F[K],
+    txnVarMap: TxnVarMap[F, K, V]
+  ): IdFootprintStore[Unit] =
+    StateT[F, IdFootprint, Unit] { s =>
+      key
+        .flatMap { materializedKey =>
+          for {
+            eRId   <- txnVarMap.getRuntimeId(materializedKey)
+            result <- Async[F].delay(s.addWriteId(eRId)).map((_, ()))
+          } yield result
+        }
+        .handleErrorWith { _ =>
+          Async[F].delay((s.markUnderApproximated, ()))
+        }
+    }
+
   private[stm] case class StaticAnalysisShortCircuitException(
     idFootprint: IdFootprint
   ) extends RuntimeException
@@ -65,12 +90,11 @@ private[stm] trait TxnCompilerContext[F[_]] {
   // @nowarn on BOTH FunctionK.apply methods below, and not for exhaustivity.
   // What the annotation suppresses is the free-monad interpreter's unavoidable
   // Unit casts. A FunctionK must produce a V for every op; where a walk ends
-  // on a Unit-valued path — the no-op catch-alls, the errata arms, the
-  // analysis walker's TxnHandleError recovery — those arms hand back
-  // ().asInstanceOf[V] (the setter arms need no cast: their pattern match
-  // refines V = Unit), and Scala 2.13 flags every one as
-  // a "dubious usage of asInstanceOf with unit value". CI compiles both Scala
-  // versions, with warnings fatal.
+  // on a Unit-valued path — the errata arms and the analysis walker's
+  // TxnHandleError recovery — those arms hand back ().asInstanceOf[V] (the
+  // setter arms need no cast: their pattern match refines V = Unit), and
+  // Scala 2.13 flags every one as a "dubious usage of asInstanceOf with unit
+  // value". CI compiles both Scala versions, with warnings fatal.
   //
   // BOTH walkers stop at a terminal erratum, each in its own way. txnLogCompiler
   // enumerates the errata — TxnRetry schedules a retry (which throws), TxnError
@@ -117,19 +141,11 @@ private[stm] trait TxnCompilerContext[F[_]] {
                 StateT.pure[F, IdFootprint, V](value)
               case TxnGetVar(txnVar) =>
                 StateT[F, IdFootprint, V] { s =>
-                  for {
-                    rId    <- Async[F].delay(txnVar.runtimeId)
-                    v      <- txnVar.get
-                    result <- Async[F].delay(s.addReadId(rId))
-                  } yield (result, v)
+                  txnVar.get.map(v => (s.addReadId(txnVar.runtimeId), v))
                 }
               case adt: TxnGetVarMap[_, _] =>
                 StateT[F, IdFootprint, V] { s =>
-                  for {
-                    rId    <- Async[F].delay(adt.txnVarMap.runtimeId)
-                    v      <- adt.txnVarMap.get
-                    result <- Async[F].delay(s.addReadId(rId))
-                  } yield (result, v)
+                  adt.txnVarMap.get.map(v => (s.addReadId(adt.txnVarMap.runtimeId), v))
                 }
               case adt: TxnGetVarMapValue[_, _] =>
                 StateT[F, IdFootprint, V] { s =>
@@ -142,7 +158,14 @@ private[stm] trait TxnCompilerContext[F[_]] {
                           oTxnVar
                             .map(_.get.map(Some(_)))
                             .getOrElse(Async[F].pure(None))
-                        eRId     <- adt.txnVarMap.getRuntimeId(materializedKey)
+                        eRId <- adt.txnVarMap.getRuntimeId(materializedKey)
+                        // A statically-safe re-assertion, not a runtime coercion:
+                        // TxnGetVarMapValue[K, V] extends TxnAdt[Option[V]], so this
+                        // arm's V IS Option[v] — but the [_, _] wildcard pattern
+                        // erases that equality, and 2.13's GADT inference cannot
+                        // recover it from named type variables either (tried; it
+                        // infers a bounded existential instead). The cast is what
+                        // keeps this arm compiling on both Scala versions.
                         valueAsV <- Async[F].delay(value.asInstanceOf[V])
                         result <-
                           Async[F].delay(s.addReadId(eRId)).map((_, valueAsV))
@@ -163,70 +186,11 @@ private[stm] trait TxnCompilerContext[F[_]] {
                   )
                 }
               case adt: TxnSetVarMapValue[_, _] =>
-                StateT[F, IdFootprint, Unit] { s =>
-                  adt.key
-                    .flatMap { materializedKey =>
-                      for {
-                        eRId   <- adt.txnVarMap.getRuntimeId(materializedKey)
-                        result <- Async[F].delay(s.addWriteId(eRId)).map((_, ()))
-                      } yield result
-                    }
-                    // The key thunk threw, so this write's id was never
-                    // recorded. Unlike the read paths, this handler does NOT
-                    // short-circuit: analysis carries on and the resulting
-                    // footprint silently omits a write, never reaching
-                    // TxnRuntime.commit's handleErrorWith. Flag it here or the
-                    // omission is invisible. (An undeclared WRITE is not benign:
-                    // it invalidates a correctly-declared peer's reads —
-                    // specs/commit/CommitH3Writer.cfg.)
-                    .handleErrorWith { _ =>
-                      Async[F].delay((s.markUnderApproximated, ()))
-                    }
-                }
+                analyzeKeyedWrite(adt.key, adt.txnVarMap)
               case adt: TxnModifyVarMapValue[_, _] =>
-                StateT[F, IdFootprint, Unit] { s =>
-                  adt.key
-                    .flatMap { materializedKey =>
-                      for {
-                        eRId <- adt.txnVarMap.getRuntimeId(materializedKey)
-                        result <- Async[F]
-                                    .delay(s.addWriteId(eRId))
-                                    .map((_, ()))
-                      } yield result
-                    }
-                    // The key thunk threw, so this write's id was never
-                    // recorded. Unlike the read paths, this handler does NOT
-                    // short-circuit: analysis carries on and the resulting
-                    // footprint silently omits a write, never reaching
-                    // TxnRuntime.commit's handleErrorWith. Flag it here or the
-                    // omission is invisible. (An undeclared WRITE is not benign:
-                    // it invalidates a correctly-declared peer's reads —
-                    // specs/commit/CommitH3Writer.cfg.)
-                    .handleErrorWith { _ =>
-                      Async[F].delay((s.markUnderApproximated, ()))
-                    }
-                }
+                analyzeKeyedWrite(adt.key, adt.txnVarMap)
               case adt: TxnDeleteVarMapValue[_, _] =>
-                StateT[F, IdFootprint, Unit] { s =>
-                  adt.key
-                    .flatMap { materializedKey =>
-                      for {
-                        eRId   <- adt.txnVarMap.getRuntimeId(materializedKey)
-                        result <- Async[F].delay(s.addWriteId(eRId)).map((_, ()))
-                      } yield result
-                    }
-                    // The key thunk threw, so this write's id was never
-                    // recorded. Unlike the read paths, this handler does NOT
-                    // short-circuit: analysis carries on and the resulting
-                    // footprint silently omits a write, never reaching
-                    // TxnRuntime.commit's handleErrorWith. Flag it here or the
-                    // omission is invisible. (An undeclared WRITE is not benign:
-                    // it invalidates a correctly-declared peer's reads —
-                    // specs/commit/CommitH3Writer.cfg.)
-                    .handleErrorWith { _ =>
-                      Async[F].delay((s.markUnderApproximated, ()))
-                    }
-                }
+                analyzeKeyedWrite(adt.key, adt.txnVarMap)
               // The error-swallowing handler in this walker that neither
               // short-circuits nor flags — read it against the three write-arm
               // handlers above, which call the flag mandatory.
@@ -279,8 +243,10 @@ private[stm] trait TxnCompilerContext[F[_]] {
                         Async[F].delay((s, ().asInstanceOf[V]))
                     }
                 }
-              case _ =>
-                noOp[IdFootprint].map(_.asInstanceOf[V])
+              case unhandled =>
+                StateT.liftF[F, IdFootprint, V](
+                  Async[F].raiseError(new MatchError(unhandled))
+                )
             }
           case Left(erratum) =>
             // A terminal erratum: the walk STOPS, carrying the accumulated
@@ -381,8 +347,10 @@ private[stm] trait TxnCompilerContext[F[_]] {
                       adt.f(ex).flatMap(_.foldMap(txnLogCompiler).run(s))
                   }
                 }
-              case _ =>
-                noOp[TxnLog].map(_.asInstanceOf[V])
+              case unhandled =>
+                StateT.liftF[F, TxnLog, V](
+                  Async[F].raiseError(new MatchError(unhandled))
+                )
             }
           case Left(erratum) =>
             erratum match {

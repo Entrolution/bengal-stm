@@ -55,7 +55,7 @@ final class TxnVarMap[F[_]: STM: Async, K, V] private[stm] (
   protected val value: Ref[F, VarIndex[F, K, V]],
   private[stm] val commitLock: Semaphore[F],
   private val internalStructureLock: Semaphore[F]
-) extends TxnStateEntity[F, VarIndex[F, K, V]] {
+) extends TxnStateEntity[F] {
 
   private def withStructureLock[A](fa: F[A]): F[A] = internalStructureLock.permit.use(_ => fa)
 

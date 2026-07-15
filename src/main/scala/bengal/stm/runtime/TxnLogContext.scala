@@ -20,7 +20,6 @@ package bengal.stm.runtime
 import scala.annotation.nowarn
 import scala.util.control.NoStackTrace
 
-import cats.effect.implicits._
 import cats.effect.kernel.{ Async, Resource }
 import cats.effect.std.Semaphore
 import cats.syntax.all._
@@ -436,6 +435,13 @@ private[stm] trait TxnLogContext[F[_]] {
 
     import TxnLogValid._
 
+    // Materialized once per log instance: a commit forces idFootprint, withLock
+    // AND commit, and the park path adds anyReadChangedSinceRead — four
+    // independent walks that each rebuilt this list. The log Map is immutable,
+    // so per-instance iteration order is stable and every consumer is
+    // order-insensitive (withLock sorts; the others are commutative folds).
+    private lazy val entries: List[TxnLogEntry[_]] = log.values.toList
+
     private def getLogEntry[V](rId: TxnVarRuntimeId): F[Option[TxnLogEntry[V]]] =
       Async[F].delay(log.get(rId).map(_.asInstanceOf[TxnLogEntry[V]]))
 
@@ -654,10 +660,7 @@ private[stm] trait TxnLogContext[F[_]] {
                        // TxnLogEntrySpec asserts the entry is here.
                        case None =>
                          for {
-                           initial <- oTxnVar match {
-                                        case Some(txnVar) => txnVar.get.map(v => Some(v): Option[V])
-                                        case None => Async[F].pure(Option.empty[V])
-                                      }
+                           initial <- oTxnVar.traverse(_.get)
                            newLog <- Async[F].delay(
                                        TxnLogValid(
                                          log + (rid -> TxnLogReadOnlyVarMapEntry(
@@ -715,10 +718,7 @@ private[stm] trait TxnLogContext[F[_]] {
 
         case (rid, oTxnVar, None) =>
           for {
-            initial <- oTxnVar match {
-                         case Some(txnVar) => txnVar.get.map(v => Some(v): Option[V])
-                         case None => Async[F].pure(Option.empty[V])
-                       }
+            initial <- oTxnVar.traverse(_.get)
           } yield
             if (initial == newOpt) {
               Some(
@@ -830,7 +830,7 @@ private[stm] trait TxnLogContext[F[_]] {
       // for both absent shapes below, so the policy and message cannot drift.
       def raiseRemoveAbsent(materializedKey: K): F[TxnLog] =
         Async[F].raiseError[TxnLog](
-          new RuntimeException(
+          TxnRuntimeFailureException(
             s"Tried to remove non-existent key $materializedKey in transactional map"
           )
         )
@@ -918,6 +918,15 @@ private[stm] trait TxnLogContext[F[_]] {
       f: V => F[V],
       txnVarMap: TxnVarMap[F, K, V]
     ): F[TxnLog] = {
+      // One def for both absent shapes below, so the policy and message cannot
+      // drift — the same rule raiseRemoveAbsent enforces for remove.
+      def raiseModifyAbsent(materializedKey: K): F[TxnLog] =
+        Async[F].raiseError[TxnLog](
+          TxnRuntimeFailureException(
+            s"Key $materializedKey not found for modification"
+          )
+        )
+
       val resultSpec = for {
         materializedKey <- key
         resolved        <- resolveMapKey[K, V](materializedKey, txnVarMap)
@@ -932,11 +941,7 @@ private[stm] trait TxnLogContext[F[_]] {
                             TxnLogValid(log + (rid -> entry.set(Some(evaluation)))): TxnLog
                           }
                         case None =>
-                          Async[F].raiseError[TxnLog](
-                            new RuntimeException(
-                              s"Key $materializedKey not found for modification"
-                            )
-                          )
+                          raiseModifyAbsent(materializedKey)
                       }
 
                     // Not in the log yet. If the key exists, read it live and modify it;
@@ -957,11 +962,7 @@ private[stm] trait TxnLogContext[F[_]] {
                           ): TxnLog
 
                         case None =>
-                          Async[F].raiseError[TxnLog](
-                            new RuntimeException(
-                              s"Key $materializedKey not found for modification"
-                            )
-                          )
+                          raiseModifyAbsent(materializedKey)
                       }
                   }
       } yield result
@@ -990,16 +991,16 @@ private[stm] trait TxnLogContext[F[_]] {
     // CoverageSubsumesDirty; see the NoLocksWithoutWrites note at the top of
     // this file).
     private[stm] lazy val anyReadChangedSinceRead: F[Boolean] =
-      log.values.toList
+      entries
         .traverse(_.hasChangedSinceRead)
         .map(_.exists(identity))
 
-    // foldLeft from empty, NOT reduce: an EMPTY log is perfectly ordinary — a
-    // transaction of pure/delay steps touches nothing, and reading an absent map
-    // key records no entry at all — and `reduce` throws on an empty list. The
-    // bug was latent while this was only forced on the dirty path (where the log
-    // is non-empty by construction); the H6 coverage check forces it on every
-    // commit, which is what brought it out.
+    // Folded from empty accumulators, NOT reduced: an EMPTY log is perfectly
+    // ordinary — a transaction of pure/delay steps touches nothing, and reading
+    // an absent map key records no entry at all — and `reduce` throws on an
+    // empty list. The bug was latent while this was only forced on the dirty
+    // path (where the log is non-empty by construction); the H6 coverage check
+    // forces it on every commit, which is what brought it out.
     // `traverse`, NOT `parTraverse`. Every entry's idFootprint is trivial — a
     // cached runtimeId for a var, a registry lookup (one-time allocation on
     // first touch) for a map entry — so there is nothing to overlap and a fiber
@@ -1015,12 +1016,21 @@ private[stm] trait TxnLogContext[F[_]] {
     // and reported the exact opposite. (Those figures predate the removal of the
     // per-entry UUID/MD5 hash from this fold, which only lowers the per-entry
     // cost further and strengthens the same conclusion.)
+    //
+    // The single constructor at the end replaces a mergeWith-per-entry fold that
+    // allocated an intermediate IdFootprint per element. It is exact: per-entry
+    // footprints come from readOnly/writeOnly, whose validation flags default
+    // false — the same flags the mergeWith chain produced.
     override private[stm] lazy val idFootprint: F[IdFootprint] =
-      log.values.toList
-        .traverse { entry =>
-          entry.idFootprint
+      entries
+        .traverse(_.idFootprint)
+        .map { footprints =>
+          val (reads, writes) =
+            footprints.foldLeft((Set.empty[TxnVarRuntimeId], Set.empty[TxnVarRuntimeId])) { case ((rs, ws), fp) =>
+              (rs ++ fp.readIds, ws ++ fp.updatedIds)
+            }
+          IdFootprint(readIds = reads, updatedIds = writes)
         }
-        .map(_.foldLeft(IdFootprint.empty)(_ mergeWith _))
 
     // SPEC: NoWaitsForCycle — the H2 fix. Acquire the write set's commitLocks
     // in ascending order of THE ID OF THE ENTITY THAT OWNS EACH LOCK. Because
@@ -1048,7 +1058,7 @@ private[stm] trait TxnLogContext[F[_]] {
     // reference in the dedup is belt and braces, not a collision hedge.
     override private[stm] def withLock[A](fa: F[A]): F[A] =
       for {
-        locks <- log.values.toList.traverse(_.lock)
+        locks <- entries.traverse(_.lock)
         result <-
           locks.flatten.distinct
             .sortBy(_._1.value)
@@ -1057,8 +1067,15 @@ private[stm] trait TxnLogContext[F[_]] {
             .use(_ => fa)
       } yield result
 
+    // Sequential on purpose: read-only entries commit as unit, and a write
+    // commit is a Ref.set for a var, or addOrUpdate/delete under the map's
+    // brief structural lock for a map entry — a fiber per entry was pure
+    // overhead (the idFootprint fold above carries the measurement for this
+    // exact shape). Interleaving is unobservable: serializability rests on
+    // Contract C plus the commit locks this whole call runs under, not on
+    // commit order.
     override private[stm] lazy val commit: F[Unit] =
-      log.values.toList.parTraverse(_.commit).void
+      entries.traverse_(_.commit)
   }
 
   private[stm] object TxnLogValid {
@@ -1138,6 +1155,15 @@ private[stm] trait TxnLogContext[F[_]] {
     override private[stm] lazy val idFootprint: F[IdFootprint] =
       Async[F].pure(IdFootprint.empty)
   }
+
+  // User-facing transaction failures raised inside the log interpreter (the
+  // absent-key remove/modify contract). A RuntimeException subtype because that
+  // is the documented public shape of these failures; NoStackTrace because they
+  // are control flow — the trace would point into the interpreter, never at
+  // user code, and the message carries everything the caller can act on.
+  private[stm] case class TxnRuntimeFailureException(message: String)
+      extends RuntimeException(message)
+      with NoStackTrace
 
   private[stm] case class TxnRetryException(validLog: TxnLogValid) extends RuntimeException
 

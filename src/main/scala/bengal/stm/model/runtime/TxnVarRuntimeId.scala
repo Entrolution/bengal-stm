@@ -32,14 +32,24 @@ package bengal.stm.model.runtime
 // THE HIERARCHY IS TWO LEVELS DEEP, AND EVERY CONSUMER ASSUMES SO. The type says
 // otherwise — `parent` is recursive and nothing stops constructing a chain of
 // any depth — but nothing reads one. IdFootprint's compatibility relation and
-// its coverage check both do ONE-HOP parent tests, as does getValidated, so an
-// id nested two containers down would have a parent the relation looks at and a
-// grandparent it never does: a conflict on the outer container would be missed
-// and the pair judged compatible. Today the depth is 2 by construction, because
-// the only parent anyone assigns is a map's own runtimeId and maps do not nest.
-// A nested-map feature would type-check against this class and silently lose
-// conflicts; it needs multi-hop coverage in IdFootprint first.
+// its coverage check both do ONE-HOP parent tests (parentIn/coveredBy below), as
+// does getValidated, so an id nested two containers down would have a parent the
+// relation looks at and a grandparent it never does: a conflict on the outer
+// container would be missed and the pair judged compatible. Today the depth is 2
+// by construction, because the only parent anyone assigns is a map's own
+// runtimeId and maps do not nest. A nested-map feature would type-check against
+// this class and silently lose conflicts; it needs multi-hop coverage in
+// IdFootprint first.
 final private[stm] case class TxnVarRuntimeId(
   value: Long,
   parent: Option[TxnVarRuntimeId] = None
-)
+) {
+
+  // The one-hop parent test every conflict/coverage relation turns on. If maps
+  // ever nest, this is the seam that must become multi-hop.
+  private[stm] def parentIn(rawIds: Set[Long]): Boolean =
+    parent.exists(p => rawIds.contains(p.value))
+
+  private[stm] def coveredBy(rawIds: Set[Long]): Boolean =
+    rawIds.contains(value) || parentIn(rawIds)
+}

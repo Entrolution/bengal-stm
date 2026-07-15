@@ -19,7 +19,6 @@ package spec
 
 import scala.concurrent.duration._
 
-import cats.effect.unsafe.implicits.global
 import cats.effect.{ Deferred, IO, Ref }
 import cats.syntax.all._
 import org.scalatest.freespec.AnyFreeSpec
@@ -66,63 +65,59 @@ import bengal.stm.syntax.all._
   * Which is why the observable below is a sum of 0 and not an absence of tearing: the tear still happens, and is thrown
   * away.
   */
-class DataDependentFootprintSpec extends AnyFreeSpec with Matchers {
+class DataDependentFootprintSpec extends AnyFreeSpec with Matchers with StmSuite {
 
   /** Observed sum of the two map entries the data-dependent reader actually read. The transfer preserves a + b = 0 in
     * every committed state, so any value other than 0 is an outcome no serial order can produce.
     */
   private def observedSum: Int =
-    STM
-      .runtime[IO]
-      .flatMap { implicit stm =>
-        for {
-          // Parks the ANALYSIS pass after it has read the key sources but before it
-          // has decided which map entries it will touch.
-          analysisGate <- Deferred[IO, Unit]
-          // Parks the LOG RUN between its two map reads, so the transfer can land
-          // in the middle. Counting passes is what distinguishes the two: the
-          // analysis is pass 1 and sails through; the log run is pass 2 and waits.
-          readGate <- Deferred[IO, Unit]
-          passes   <- Ref[IO].of(0)
+    withRuntimeSync(60.seconds) { implicit stm =>
+      for {
+        // Parks the ANALYSIS pass after it has read the key sources but before it
+        // has decided which map entries it will touch.
+        analysisGate <- Deferred[IO, Unit]
+        // Parks the LOG RUN between its two map reads, so the transfer can land
+        // in the middle. Counting passes is what distinguishes the two: the
+        // analysis is pass 1 and sails through; the log run is pass 2 and waits.
+        readGate <- Deferred[IO, Unit]
+        passes   <- Ref[IO].of(0)
 
-          m   <- TxnVarMap.of[IO, String, Int](Map("a" -> 0, "b" -> 0, "c" -> 0, "d" -> 0))
-          kv1 <- TxnVar.of[IO, String]("c")
-          kv2 <- TxnVar.of[IO, String]("d")
-          obs <- TxnVar.of[IO, Int](0)
+        m   <- TxnVarMap.of[IO, String, Int](Map("a" -> 0, "b" -> 0, "c" -> 0, "d" -> 0))
+        kv1 <- TxnVar.of[IO, String]("c")
+        kv2 <- TxnVar.of[IO, String]("d")
+        obs <- TxnVar.of[IO, Int](0)
 
-          reader = for {
-                     k1 <- kv1.get
-                     k2 <- kv2.get
-                     _  <- STM[IO].fromF(analysisGate.get)
-                     v1 <- m.get(k1)
-                     _ <- STM[IO].fromF(
-                            passes.updateAndGet(_ + 1).flatMap(n => IO.whenA(n >= 2)(readGate.get))
-                          )
-                     v2 <- m.get(k2)
-                     _  <- obs.set(v1.getOrElse(0) + v2.getOrElse(0))
+        reader = for {
+                   k1 <- kv1.get
+                   k2 <- kv2.get
+                   _  <- STM[IO].fromF(analysisGate.get)
+                   v1 <- m.get(k1)
+                   _ <- STM[IO].fromF(
+                          passes.updateAndGet(_ + 1).flatMap(n => IO.whenA(n >= 2)(readGate.get))
+                        )
+                   v2 <- m.get(k2)
+                   _  <- obs.set(v1.getOrElse(0) + v2.getOrElse(0))
+                 } yield ()
+
+        // Moves 1 from entry "a" to entry "b". a + b is 0 in every committed state.
+        transfer = for {
+                     a <- m.get("a")
+                     b <- m.get("b")
+                     _ <- m.set("a", a.getOrElse(0) - 1)
+                     _ <- m.set("b", b.getOrElse(0) + 1)
                    } yield ()
 
-          // Moves 1 from entry "a" to entry "b". a + b is 0 in every committed state.
-          transfer = for {
-                       a <- m.get("a")
-                       b <- m.get("b")
-                       _ <- m.set("a", a.getOrElse(0) - 1)
-                       _ <- m.set("b", b.getOrElse(0) + 1)
-                     } yield ()
-
-          readerFiber <- reader.commit.start
-          _           <- IO.sleep(100.millis) // let the analysis read kv1/kv2 and park
-          _           <- (kv1.set("a") >> kv2.set("b")).commit
-          _           <- analysisGate.complete(()) // analysis resumes and declares "c"/"d"
-          _           <- IO.sleep(100.millis) // let the log run read entry "a" and park
-          _           <- transfer.commit // slips through: judged compatible with "c"/"d"
-          _           <- readGate.complete(()) // log run resumes and reads entry "b"
-          _           <- readerFiber.joinWithNever
-          result      <- obs.get.commit
-        } yield result
-      }
-      .timeout(60.seconds)
-      .unsafeRunSync()
+        readerFiber <- reader.commit.start
+        _           <- IO.sleep(100.millis) // let the analysis read kv1/kv2 and park
+        _           <- (kv1.set("a") >> kv2.set("b")).commit
+        _           <- analysisGate.complete(()) // analysis resumes and declares "c"/"d"
+        _           <- IO.sleep(100.millis) // let the log run read entry "a" and park
+        _           <- transfer.commit // slips through: judged compatible with "c"/"d"
+        _           <- readGate.complete(()) // log run resumes and reads entry "b"
+        _           <- readerFiber.joinWithNever
+        result      <- obs.get.commit
+      } yield result
+    }
 
   "H6 regression — a data-dependent footprint cannot expose a torn read" in {
     val reps     = 20

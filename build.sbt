@@ -50,9 +50,7 @@ lazy val commonSettings = Seq(
           "-Ywarn-dead-code"
         )
       case Some((3, _)) =>
-        Seq(
-          "-Wconf:cat=unchecked:s"
-        )
+        Seq()
       case _ => Seq()
     }
   }

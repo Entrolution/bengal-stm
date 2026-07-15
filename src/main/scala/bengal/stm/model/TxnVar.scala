@@ -44,7 +44,7 @@ final class TxnVar[F[_], T] private[stm] (
   private[stm] val id: TxnVarId,
   protected val value: Ref[F, T],
   private[stm] val commitLock: Semaphore[F]
-) extends TxnStateEntity[F, T] {
+) extends TxnStateEntity[F] {
 
   private[stm] lazy val get: F[T] = value.get
 
