@@ -1067,13 +1067,14 @@ private[stm] trait TxnLogContext[F[_]] {
             .use(_ => fa)
       } yield result
 
-    // Sequential on purpose: read-only entries commit as unit, and a write
-    // commit is a Ref.set for a var, or addOrUpdate/delete under the map's
-    // brief structural lock for a map entry — a fiber per entry was pure
-    // overhead (the idFootprint fold above carries the measurement for this
-    // exact shape). Interleaving is unobservable: serializability rests on
-    // Contract C plus the commit locks this whole call runs under, not on
-    // commit order.
+    // Sequential on purpose: read-only entries commit as unit (so does the
+    // map-structure write entry — the per-key entries alongside it carry the
+    // real writes), and a write commit is a Ref.set for a var, or
+    // addOrUpdate/delete under the map's brief structural lock for a map
+    // entry — a fiber per entry was pure overhead (the idFootprint fold above
+    // carries the measurement for this exact shape). Interleaving is
+    // unobservable: serializability rests on Contract C plus the commit locks
+    // this whole call runs under, not on commit order.
     override private[stm] lazy val commit: F[Unit] =
       entries.traverse_(_.commit)
   }

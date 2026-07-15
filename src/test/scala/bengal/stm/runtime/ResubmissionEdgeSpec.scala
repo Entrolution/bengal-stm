@@ -30,9 +30,9 @@ import bengal.stm.model.runtime._
 
 /** Protocol-level pins for dependency-edge DIRECTION, driven against a standalone scheduler.
   *
-  * The two submit paths share one scaffold (`registerAndSweep`) and differ only in how an edge to an incompatible
-  * peer is directed. `submitTxn` always points the edge forward (the newcomer waits); the resubmission path reverses
-  * it for peers that have not started — the anti-starvation half of the dirty-refinement story, narrated on
+  * The two submit paths share one scaffold (`registerAndSweep`) and differ only in how an edge to an incompatible peer
+  * is directed. `submitTxn` always points the edge forward (the newcomer waits); the resubmission path reverses it for
+  * peers that have not started — the anti-starvation half of the dirty-refinement story, narrated on
   * `submitTxnForImmediateRetry`. These pin the direction itself — whose tally rises, who holds the release closure —
   * which no public API observes.
   *
