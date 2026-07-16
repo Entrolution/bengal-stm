@@ -17,6 +17,14 @@
 package ai.entrolution
 package bengal.stm.model
 
+// SEALED, so an ADT case can only be declared in this file: the interpreters in
+// TxnCompilerContext are matches over this hierarchy, and a case they have no
+// arm for is a transaction operation that silently does nothing — the exact
+// soundness-hole class the footprint machinery exists to close. The cases are
+// not final because they nest in a trait: 2.13's -Xlint outer-reference check
+// rejects final there.
+sealed private[stm] trait TxnAdt[V]
+
 private[stm] trait TxnAdtContext[F[_]] {
 
   private[stm] case object TxnUnit extends TxnAdt[Unit]
