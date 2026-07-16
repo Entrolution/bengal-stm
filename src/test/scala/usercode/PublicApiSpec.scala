@@ -173,5 +173,22 @@ class PublicApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
       assertTypeError("(??? : ai.entrolution.bengal.stm.model.runtime.ExecutionStatus)")
       assertTypeError("ai.entrolution.bengal.stm.model.runtime.Scheduled")
     }
+
+    // The factories bound on TxnIdAllocator, not STM. A home-made allocator
+    // would mint entity ids from an independent counter, and id aliasing across
+    // counters silently breaks conflict detection — so the type is an abstract
+    // class whose CONSTRUCTOR is private to the library, and these probes are
+    // what notice that seal being relaxed. The constructor is the guard on
+    // purpose: its access is checked at the subclassing site (a typer error
+    // these probes can see), where a private[stm] abstract MEMBER would merely
+    // be invisible outside the package — an anonymous subclass with a
+    // same-named val instantiated, linked, and forged ids from a user counter.
+    "a home-made TxnIdAllocator cannot be built to forge entity ids" in {
+      assertTypeError("new ai.entrolution.bengal.stm.model.runtime.TxnIdAllocator[IO] {}")
+      assertTypeError(
+        "new ai.entrolution.bengal.stm.model.runtime.TxnIdAllocator[IO] { val txnVarIdGen: cats.effect.Ref[IO, Long] = null }"
+      )
+      assertTypeError("ai.entrolution.bengal.stm.model.runtime.TxnIdAllocator.apply[IO]")
+    }
   }
 }

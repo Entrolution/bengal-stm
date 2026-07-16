@@ -19,6 +19,11 @@ package bengal.stm.model
 
 import cats.effect.kernel.Async
 
+import bengal.stm.model.runtime.TxnIdAllocator
+
+// Extends TxnIdAllocator because both are CLASSES and STM has one superclass
+// slot: the allocator must be constructor-sealed (see its scaladoc), this is
+// the class edge STM already uses, so the capability rides it.
 abstract private[stm] class AsyncImplicits[F[_]](implicit
   private[stm] val asyncF: Async[F]
-)
+) extends TxnIdAllocator[F]

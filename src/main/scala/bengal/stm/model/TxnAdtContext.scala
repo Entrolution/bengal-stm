@@ -19,8 +19,10 @@ package bengal.stm.model
 
 // SEALED, so an ADT case can only be declared in this file: the interpreters in
 // TxnCompilerContext are matches over this hierarchy, and a case they have no
-// arm for is a transaction operation that silently does nothing — the exact
-// soundness-hole class the footprint machinery exists to close. The cases are
+// arm for would otherwise be a transaction operation that silently does
+// nothing — the exact soundness-hole class the footprint machinery exists to
+// close. Sealing keeps every case where those arms can see it; the walkers'
+// raising defaults turn the in-file miss into a failed commit. The cases are
 // not final because they nest in a trait: 2.13's -Xlint outer-reference check
 // rejects final there.
 sealed private[stm] trait TxnAdt[V]

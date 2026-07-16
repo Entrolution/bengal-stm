@@ -21,8 +21,11 @@ The effect type `F` never appears in `Txn`. The ADT cases are path-dependent mem
 each case captures `F`-typed content (a `TxnVar[F, _]`, an `F[K]` key thunk) while the
 `TxnAdt[V]` supertype erases it. That is what lets `Txn` values compose freely without
 threading `F` through user signatures. The hierarchy is sealed: an ADT case can only be
-declared in the file the interpreters live against, so an operation the interpreters do not
-handle is a compile error, not a silent no-op.
+declared alongside the others in `TxnAdtContext.scala`, so a rogue case anywhere else in
+the library is a compile error. For a case added in that file without interpreter arms, the
+walkers keep raising defaults — the exhaustiveness checker cannot verify matches over
+path-dependent case members — so the failure is a loudly failed commit, never a silently
+skipped operation.
 
 `STM[F]` itself is a cake ([`STM.scala`](../src/main/scala/bengal/stm/STM.scala)) mixing
 the ADT, log, compiler, runtime, and API contexts over one `F` — path-dependent types are
@@ -37,7 +40,9 @@ stands alone without a scheduler.
 ## The two interpreters, and why a transaction runs twice
 
 [`runtime/TxnCompilerContext.scala`](../src/main/scala/bengal/stm/runtime/TxnCompilerContext.scala)
-defines two `FunctionK` walks over the same program, and every commit attempt runs both:
+defines two `FunctionK` walks over the same program. A fresh submission runs both; wake and
+refinement re-runs repeat only the log walk, taking their footprint from the park-time set
+or the actual log rather than a re-analysis:
 
 1. **The static-analysis walker** folds the program into an `IdFootprint` — the set of ids
    the transaction reads and writes. Reads execute for real during this pass (a

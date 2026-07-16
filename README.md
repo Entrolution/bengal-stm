@@ -91,8 +91,8 @@ one, because the runtime's own `private[stm]` members shadow the extension metho
 |:--------|-------------|:---------------|:------|
 | `STM.runtime[F]` | Creates a runtime in an `F[_]` container whose transaction results can be lifted into a container `F[_]` via `commit` | `def runtime[F[_]: Async]: F[STM[F]]` | |
 | `txnVar.get.commit` | Commits a transaction and lifts the result into `F[_]` | `def commit: F[V]` | |
-| `TxnVar.of[IO, List[Int]](List())` | Creates a transactional variable | `def of[F[_]: STM: Async, T](value: T): F[TxnVar[F, T]]` | |
-| `TxnVarMap.of[IO, String, Int](Map())` | Creates a transactional map | `def of[F[_]: STM: Async, K, V](valueMap: Map[K, V]): F[TxnVarMap[F, K, V]]` | |
+| `TxnVar.of[IO, List[Int]](List())` | Creates a transactional variable | `def of[F[_]: TxnIdAllocator: Async, T](value: T): F[TxnVar[F, T]]` | The implicit `STM[F]` runtime satisfies the allocator bound |
+| `TxnVarMap.of[IO, String, Int](Map())` | Creates a transactional map | `def of[F[_]: TxnIdAllocator: Async, K, V](valueMap: Map[K, V]): F[TxnVarMap[F, K, V]]` | The implicit `STM[F]` runtime satisfies the allocator bound |
 | `txnVar.get` | Retrieves value of transactional variable | `def get: Txn[V]` | |
 | `txnVarMap.get` | Retrieves an immutable map (i.e. a view) representing transactional map state | `def get: Txn[Map[K, V]]` | Performance-wise it is better to retrieve individual keys instead of acquiring the entire map |
 | `txnVarMap.get("David")` | Retrieves the value for a key, if present | `def get(key: => K): Txn[Option[V]]` | Returns `None` when the key does not exist — whether it was never created, or was deleted earlier in this transaction. It does **not** raise. |

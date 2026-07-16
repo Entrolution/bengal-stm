@@ -21,16 +21,18 @@ import cats.effect.Ref
 
 /** The id-allocation capability [[bengal.stm.model.TxnVar.of]] and [[bengal.stm.model.TxnVarMap.of]] require.
   *
-  * An `STM[F]` runtime is a `TxnIdAllocator[F]`, so user code never names this trait: the implicit runtime already in
+  * An `STM[F]` runtime is a `TxnIdAllocator[F]`, so user code never names this type: the implicit runtime already in
   * scope satisfies the bound. It exists so the model does not depend on the runtime cake — a `TxnVar` needs one
   * counter, not a scheduler — which is also what makes the model unit-testable against a stub.
   *
-  * The member is `private[stm]`, so the trait cannot be usefully implemented outside the library: a deferred
-  * `private[stm]` member is not overridable from outside the package. Every allocator a user can obtain is therefore an
-  * `STM` runtime, and id uniqueness keeps its single-source guarantee (one global counter per runtime — TxnVarMap's
-  * id-registry comment explains why that uniqueness is load-bearing).
+  * An abstract CLASS with a library-private constructor, not a trait, and that is load-bearing: every allocator a user
+  * can obtain must be an `STM` runtime, or two counters could issue aliasing ids and conflict detection would silently
+  * judge overlapping transactions independent (TxnVarMap's id-registry comment walks the argument). A trait with a
+  * `private[stm]` member does not seal that: the member is invisible outside the package rather than required, so an
+  * anonymous subclass with a same-named `val` instantiates — and links — from anywhere. Constructor access is checked
+  * where subclassing happens, which makes outside implementation a compile error instead of a loophole.
   */
-trait TxnIdAllocator[F[_]] {
+abstract class TxnIdAllocator[F[_]] private[stm] () {
   private[stm] val txnVarIdGen: Ref[F, TxnVarId]
 }
 
