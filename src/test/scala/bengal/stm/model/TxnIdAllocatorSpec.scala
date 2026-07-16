@@ -60,13 +60,14 @@ class TxnIdAllocatorSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
     stubAllocator
       .flatMap { implicit allocator =>
         for {
-          txnVar   <- TxnVar.of(0)
-          map      <- TxnVarMap.of(Map("a" -> 1))
-          xFirst   <- map.getRuntimeId("x")
-          xSecond  <- map.getRuntimeId("x")
-          yFirst   <- map.getRuntimeId("y")
-          aTxnVar  <- map.getTxnVar("a")
-          allRawIds = Set(txnVar.runtimeId.value, map.runtimeId.value, aTxnVar.get.runtimeId.value, xFirst.value, yFirst.value)
+          txnVar  <- TxnVar.of(0)
+          map     <- TxnVarMap.of(Map("a" -> 1))
+          xFirst  <- map.getRuntimeId("x")
+          xSecond <- map.getRuntimeId("x")
+          yFirst  <- map.getRuntimeId("y")
+          aTxnVar <- map.getTxnVar("a")
+          allRawIds =
+            Set(txnVar.runtimeId.value, map.runtimeId.value, aTxnVar.get.runtimeId.value, xFirst.value, yFirst.value)
         } yield (xFirst, xSecond, yFirst, map.runtimeId, allRawIds)
       }
       .asserting { case (xFirst, xSecond, yFirst, mapRuntimeId, allRawIds) =>

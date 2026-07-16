@@ -22,8 +22,8 @@ import cats.effect.Ref
 /** The id-allocation capability [[bengal.stm.model.TxnVar.of]] and [[bengal.stm.model.TxnVarMap.of]] require.
   *
   * An `STM[F]` runtime is a `TxnIdAllocator[F]`, so user code never names this trait: the implicit runtime already in
-  * scope satisfies the bound. It exists so the model does not depend on the runtime cake — a `TxnVar` needs one counter,
-  * not a scheduler — which is also what makes the model unit-testable against a stub.
+  * scope satisfies the bound. It exists so the model does not depend on the runtime cake — a `TxnVar` needs one
+  * counter, not a scheduler — which is also what makes the model unit-testable against a stub.
   *
   * The member is `private[stm]`, so the trait cannot be usefully implemented outside the library: a deferred
   * `private[stm]` member is not overridable from outside the package. Every allocator a user can obtain is therefore an
