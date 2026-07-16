@@ -24,7 +24,6 @@ import cats.effect.kernel.Async
 import cats.effect.std.Semaphore
 import cats.syntax.all._
 
-import bengal.stm.STM
 import bengal.stm.model.runtime._
 
 /** A mutable transactional map from keys of type `K` to values of type `V`.
@@ -50,7 +49,7 @@ import bengal.stm.model.runtime._
   * @tparam V
   *   the value type
   */
-final class TxnVarMap[F[_]: STM: Async, K, V] private[stm] (
+final class TxnVarMap[F[_]: TxnIdAllocator: Async, K, V] private[stm] (
   private[stm] val id: TxnVarId,
   protected val value: Ref[F, VarIndex[F, K, V]],
   private[stm] val commitLock: Semaphore[F],
@@ -84,10 +83,11 @@ final class TxnVarMap[F[_]: STM: Async, K, V] private[stm] (
   // declare and nothing to compare, and every waitFor on a key-not-yet-created
   // would be invisible to the conflict relation.
   //
-  // Ids are issued by the runtime's ONE global allocator (STM.txnVarIdGen), the
-  // same counter that numbers TxnVars and maps, so a key id can never alias an
-  // entity id — IdFootprint compares raw values with the parent stripped, so
-  // global uniqueness is load-bearing, not cosmetic. Identity is the key's own
+  // Ids are issued by the runtime's ONE global allocator (the TxnIdAllocator
+  // counter this map holds), the same counter that numbers TxnVars and maps,
+  // so a key id can never alias an entity id — IdFootprint compares raw values
+  // with the parent stripped, so global uniqueness is load-bearing, not
+  // cosmetic. Identity is the key's own
   // equals/hashCode (the TrieMap's), i.e. exactly the equality the value store
   // uses — never a rendering like toString, whose equivalence classes need not
   // match equality in either direction.
@@ -137,7 +137,7 @@ final class TxnVarMap[F[_]: STM: Async, K, V] private[stm] (
       case Some(rid) =>
         Async[F].pure(rid)
       case None =>
-        STM[F].txnVarIdGen.updateAndGet(_ + 1).map { newId =>
+        TxnIdAllocator[F].txnVarIdGen.updateAndGet(_ + 1).map { newId =>
           val candidate = TxnVarRuntimeId(newId, Some(runtimeId))
           existentialIds.putIfAbsent(key, candidate).getOrElse(candidate)
         }
@@ -175,14 +175,15 @@ final class TxnVarMap[F[_]: STM: Async, K, V] private[stm] (
 
 object TxnVarMap {
 
-  /** Creates a new `TxnVarMap` with the given initial entries. Requires an implicit `STM[F]` runtime.
+  /** Creates a new `TxnVarMap` with the given initial entries. Requires an implicit `STM[F]` runtime — the runtime is
+    * the allocator the [[bengal.stm.model.runtime.TxnIdAllocator]] bound asks for.
     *
     * The map belongs to that runtime: all transactions touching it must be committed through the same `STM[F]`
     * instance. Use under a different runtime is undefined — see [[bengal.stm.STM.runtime]].
     */
-  def of[F[_]: STM: Async, K, V](valueMap: Map[K, V]): F[TxnVarMap[F, K, V]] =
+  def of[F[_]: TxnIdAllocator: Async, K, V](valueMap: Map[K, V]): F[TxnVarMap[F, K, V]] =
     for {
-      id <- STM[F].txnVarIdGen.updateAndGet(_ + 1)
+      id <- TxnIdAllocator[F].txnVarIdGen.updateAndGet(_ + 1)
       values <- valueMap.toList.traverse { case (k, v) =>
                   TxnVar.of(v).map(txv => k -> txv)
                 }

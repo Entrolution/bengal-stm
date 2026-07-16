@@ -22,13 +22,12 @@ import cats.effect.kernel.Async
 import cats.effect.std.Semaphore
 import cats.syntax.all._
 
-import bengal.stm.STM
 import bengal.stm.model.runtime._
 
 /** A mutable transactional variable holding a single value of type `T`.
   *
   * `TxnVar` instances are created outside the `Txn` monad via [[TxnVar.of]] and then read/written within transactions
-  * using the syntax extensions provided by the `STM` implicit class or `bengal.stm.syntax.all._`.
+  * using the syntax extensions provided by `bengal.stm.syntax.all._`.
   *
   * Construction is factory-only: [[TxnVar.of]] draws the variable's identity from the runtime's allocator, and the
   * sealed constructor is what makes that identity trustworthy — user-built or copied instances could alias one backing
@@ -53,14 +52,15 @@ final class TxnVar[F[_], T] private[stm] (
 
 object TxnVar {
 
-  /** Creates a new `TxnVar` with the given initial value. Requires an implicit `STM[F]` runtime.
+  /** Creates a new `TxnVar` with the given initial value. Requires an implicit `STM[F]` runtime — the runtime is the
+    * allocator the [[bengal.stm.model.runtime.TxnIdAllocator]] bound asks for.
     *
     * The variable belongs to that runtime: all transactions touching it must be committed through the same `STM[F]`
     * instance. Use under a different runtime is undefined — see [[bengal.stm.STM.runtime]].
     */
-  def of[F[_]: STM: Async, T](value: T): F[TxnVar[F, T]] =
+  def of[F[_]: TxnIdAllocator: Async, T](value: T): F[TxnVar[F, T]] =
     for {
-      id       <- STM[F].txnVarIdGen.updateAndGet(_ + 1)
+      id       <- TxnIdAllocator[F].txnVarIdGen.updateAndGet(_ + 1)
       valueRef <- Async[F].ref(value)
       lock     <- Semaphore[F](1)
     } yield new TxnVar(id, valueRef, lock)

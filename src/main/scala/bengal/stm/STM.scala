@@ -68,7 +68,8 @@ abstract class STM[F[_]: Async]
     with TxnLogContext[F]
     with TxnCompilerContext[F]
     with TxnRuntimeContext[F]
-    with TxnApiContext[F] {
+    with TxnApiContext[F]
+    with TxnIdAllocator[F] {
 
   /** Creates a new transactional variable with the given initial value. */
   def allocateTxnVar[V](value: V): F[TxnVar[F, V]]
