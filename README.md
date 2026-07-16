@@ -213,7 +213,9 @@ object BankTransfer extends IOApp.Simple {
 Bengal's scheduler is what makes it different from a blindly optimistic STM: before a
 transaction runs, it works out that transaction's **footprint** — the set of variables and
 map keys it will touch — and uses it to run only transactions that cannot conflict at the
-same time. That is where the concurrency comes from.
+same time. That is where the concurrency comes from. (How the footprint machinery, the
+scheduler, and the commit protocol fit together is narrated in
+[docs/architecture.md](docs/architecture.md).)
 
 To do that, Bengal runs your transaction through a static-analysis pass. It is a real
 execution: reads happen, so values that later steps depend on are available. But **writes
@@ -440,7 +442,8 @@ differs in:
   transaction's footprint up front and schedules around conflicts.
 - **Maps**: `TxnVarMap` tracks conflicts per key, rather than per map.
 - **Implementation**: [Free monads](https://typelevel.org/cats/datatypes/freemonad.html) with two
-  interpreters — one for the static-analysis pass, one for the transaction log.
+  interpreters — one for the static-analysis pass, one for the transaction log
+  ([docs/architecture.md](docs/architecture.md) walks the whole runtime).
 - **API**: cats-stm has `orElse` to bypass a retry; Bengal omits it (see below).
 - **Verification**: Bengal's commit and scheduling protocols are specified in TLA+ and
   model-checked in CI. See [Correctness](#correctness).
