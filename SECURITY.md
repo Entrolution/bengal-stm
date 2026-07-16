@@ -21,8 +21,8 @@ Please include the following information in your report:
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.14.x  | Yes                |
-| < 0.14  | No                 |
+| 0.15.x  | Yes                |
+| < 0.15  | No                 |
 
 ## Security Updates
 
