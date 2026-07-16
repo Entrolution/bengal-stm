@@ -26,7 +26,10 @@ semantic blocking and scheduling.
 
 - **Transactional maps as a first-class structure.** `TxnVarMap` tracks conflicts per *key*,
   so two transactions writing different keys of the same map run concurrently. Wrapping a
-  `Map` in a `TxnVar` makes every write conflict with every other.
+  `Map` in a `TxnVar` makes every write conflict with every other. One cost to know about:
+  the map retains an internal id-registry entry for every distinct key it has *ever* seen —
+  read, written, deleted, or merely probed — for the map's lifetime. Prefer bounded key
+  spaces; a map keyed by an unbounded stream (session ids, request ids) grows without limit.
 
 - **Semantic blocking.** `waitFor` parks a transaction until its condition can hold, without
   blocking a thread. See [How `waitFor` wakes up](#how-waitfor-wakes-up) — the rule there is
@@ -36,13 +39,16 @@ semantic blocking and scheduling.
 
 The commit and scheduling protocols are specified in TLA+ and model-checked in CI. That work
 found eight concurrency defects in the shipped library — several of which no test could have
-caught, and one of which it later proved a whole commit-time check was unreachable and could be
-deleted. See [Correctness](#correctness).
+caught — and later proved a whole commit-time check unreachable, so it was deleted. See
+[Correctness](#correctness).
 
 ## Requirements
 
 - **Java**: 21 or later
 - **Scala**: 2.13.x or 3.x
+- **Versioning**: pre-1.0 (`0.x`) — minor versions may break source and binary compatibility.
+  Per-release breaks are listed in [CHANGELOG.md](CHANGELOG.md); MiMa checks binary
+  compatibility within a minor line.
 
 ## Installation
 
@@ -115,7 +121,9 @@ one, because the runtime's own `private[stm]` members shadow the extension metho
 members of `STM[F]`, not free functions — call them as `STM[IO].pure(...)`. The extension
 methods (`.get`, `.set`, `.modify`, `.commit`, and the `F`-variants) come from
 `import ai.entrolution.bengal.stm.syntax.all._`. An implicit `STM[F]` in scope is **not**
-enough on its own; you need the import.
+enough on its own; you need the import. (`STM[F]` also exposes `allocateTxnVar` and
+`allocateTxnVarMap` — direct equivalents of `TxnVar.of` / `TxnVarMap.of` for code that holds
+the runtime instance.)
 
 **On effectful arguments.** The `F`-variants (`setF`, `modifyF`, `handleErrorWithF`) and the
 `delay`/`fromF` combinators **must not encapsulate side effects** — but their evaluation
@@ -264,20 +272,20 @@ not make the scheduler slightly less precise — it switches its protection off.
 a transaction on its own is what keeps it correct. (Before this was fixed, a pair of such
 transactions produced non-serializable results in 198 of 200 contended runs.)
 
-Measured cost: **−34.7%** throughput against the same workload before the fix (8,437 → 5,506
-ops/s on the current instrument), roughly two-thirds of what a comparable transaction with a
-fully-known footprint achieves. A data-dependent key (below) is a net **+15%** on the current
-tree — the coverage check costs what it costs, and the id-registry and fold work that landed
-since more than pays for it.
+Measured cost: **−34.7%** throughput against the same workload before the fix, roughly
+two-thirds of what a comparable transaction with a fully-known footprint achieves. A
+data-dependent key (below) is a net gain on the current tree — the coverage check costs what it
+costs, and the id-registry and fold work that landed since more than pays for it.
 
 **Nothing else got slower.** The commit path sits inside its own noise against the pre-fix
 baseline while carrying H6's coverage check on every commit, and a whole-map read plus insert is
-**21% faster** — because the same work that added the coverage check also proved the older
-commit-time *dirty* check could never fire, and deleting that (plus the id-registry and fold
-work) was worth more than the coverage check costs. (Re-measured 2026-07-14 on a dedicated
-Ryzen 9 5950X with the reworked harness — see [benchmarks](benchmarks/README.md).) Read that
-README's opening before trusting any number you produce there yourself: it leads with the two
-ways these measurements have already been got wrong.
+faster — because the same work that added the coverage check also proved the older commit-time
+*dirty* check could never fire, and deleting that (plus the id-registry and fold work) was worth
+more than the coverage check costs. The numbers live in
+[benchmarks/README.md](benchmarks/README.md) (re-measured 2026-07-14 on a dedicated Ryzen 9
+5950X with the reworked harness); read that README's opening before trusting any number you
+produce there yourself — it leads with the two ways these measurements have already been got
+wrong.
 
 ### Avoiding it
 
@@ -378,10 +386,11 @@ application (or per isolated variable set) is the rule.
 Bengal's commit and scheduling protocols are specified in TLA+ and model-checked in CI on
 every change. The specs live in [`specs/`](specs/README.md).
 
-That work found a lock-order deadlock, a write skew, a phantom read, a double execution, two
-distinct lost wakeups, a data-dependent footprint divergence, and an unbounded retry spin —
-all in the shipped library. Every one is fixed, and every one is pinned by a CI expectation,
-so its counterexample would come back if the fix regressed.
+That work found eight concurrency defects in the shipped library — a catalogue that runs from
+a lock-order deadlock and a write skew to two distinct lost wakeups and a data-dependent
+footprint divergence; the authoritative per-defect table, with verdicts and pinned
+expectations, is in [`specs/README.md`](specs/README.md). Every one is fixed, and every one is
+pinned by a CI expectation, so its counterexample would come back if the fix regressed.
 
 The part worth knowing, if you are weighing a library like this one:
 
@@ -395,6 +404,14 @@ re-run to see which would have caught it. The table is in
 [`specs/README.md`](specs/README.md). The conclusion it points to is worth stating plainly —
 **a green test suite is not evidence that these protocols are correct. The pinned models
 are.**
+
+## Benchmarks
+
+A JMH suite measures what the correctness work cost. The headline: one deliberate cliff —
+a transaction whose footprint cannot be fully analysed runs alone, at roughly two-thirds
+throughput — and nothing else got slower. The numbers, the method, and the two ways these
+measurements have already been got wrong are in
+[benchmarks/README.md](benchmarks/README.md).
 
 ## Background
 
@@ -443,6 +460,9 @@ Bengals are a very playful and active cat breed. The name fits a library built o
 ## Contributing
 
 Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+
+For security vulnerabilities, use the process in [SECURITY.md](SECURITY.md) rather than a
+public issue.
 
 ## License
 

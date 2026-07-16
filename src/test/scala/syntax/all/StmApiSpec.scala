@@ -28,6 +28,26 @@ import bengal.stm.syntax.all._
 
 class StmApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers with StmSuite {
 
+  // One body for the absent-key-then-typed-continuation pair: the first op fails
+  // the transaction, and the typed continuation after it must surface the
+  // ORIGINAL absent-key message, not a ClassCastException from the dead branch.
+  // The op is curried over the runtime because the syntax extensions it uses
+  // resolve against the implicit STM[IO] this helper creates.
+  private def absentKeyThenTypedContinuation[A](
+    op: TxnVarMap[IO, String, Int] => STM[IO] => Txn[A]
+  ): IO[org.scalatest.Assertion] =
+    withRuntime { implicit stm =>
+      for {
+        tVarMap <- TxnVarMap.of(Map.empty[String, Int])
+        result <- (for {
+                    _ <- op(tVarMap)(stm)
+                    v <- STM[IO].fromF(IO.pure("x"))
+                    n <- STM[IO].pure(v.length)
+                  } yield n).commit.attempt
+      } yield result
+    }
+      .map(_.left.toOption.get.getMessage should include("missing"))
+
   "delay" - {
     "yield argument value" in {
       withRuntime { implicit stm =>
@@ -188,31 +208,11 @@ class StmApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers with StmSu
     }
 
     "a modify of an absent key followed by a typed fromF surfaces the original message" in {
-      withRuntime { implicit stm =>
-        for {
-          tVarMap <- TxnVarMap.of(Map.empty[String, Int])
-          result <- (for {
-                      _ <- tVarMap.modify("missing", (v: Int) => v + 1)
-                      v <- STM[IO].fromF(IO.pure("x"))
-                      n <- STM[IO].pure(v.length)
-                    } yield n).commit.attempt
-        } yield result
-      }
-        .asserting(_.left.toOption.get.getMessage should include("missing"))
+      absentKeyThenTypedContinuation(m => implicit stm => m.modify("missing", (v: Int) => v + 1))
     }
 
     "a remove of an absent key followed by a typed fromF surfaces the original message" in {
-      withRuntime { implicit stm =>
-        for {
-          tVarMap <- TxnVarMap.of(Map.empty[String, Int])
-          result <- (for {
-                      _ <- tVarMap.remove("missing")
-                      v <- STM[IO].fromF(IO.pure("x"))
-                      n <- STM[IO].pure(v.length)
-                    } yield n).commit.attempt
-        } yield result
-      }
-        .asserting(_.left.toOption.get.getMessage should include("missing"))
+      absentKeyThenTypedContinuation(m => implicit stm => m.remove("missing"))
     }
 
     "a throwing map function is caught by the immediate handleErrorWith" in {

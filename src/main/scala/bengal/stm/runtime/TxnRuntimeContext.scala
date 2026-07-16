@@ -48,12 +48,6 @@ private[stm] trait TxnRuntimeContext[F[_]] {
 
   private[stm] case class TxnResultFailure(ex: Throwable) extends TxnResult
 
-  private[stm] object TxnResultFailure {
-
-    private[stm] def apply(logFailure: TxnLogError): TxnResultFailure =
-      TxnResultFailure(logFailure.ex)
-  }
-
   // THE one entry point to the static-analysis pass, used by TxnRuntime.commit.
   // The wake closure deliberately does NOT re-analyse — a wake fires from the
   // conflictor's pre-publish submission sweep, so a wake-time analysis would
@@ -191,12 +185,12 @@ private[stm] trait TxnRuntimeContext[F[_]] {
         for {
           triggered <-
             Async[F].delay(
-              retryMap.toList.filter { case (parkedId, (parkedFootprint, _)) =>
+              retryMap.iterator.filter { case (parkedId, (parkedFootprint, _)) =>
                 parkedId != submitterId && !idFootprint.isCompatibleWith(parkedFootprint)
-              }
+              }.toList
             )
-          _ <- triggered.parTraverse { case (_, (_, wake)) => wake }
-          _ <- triggered.traverse { case (parkedId, _) => Async[F].delay(retryMap.remove(parkedId)) }
+          _ <- triggered.traverse_ { case (_, (_, wake)) => wake }
+          _ <- triggered.traverse_ { case (parkedId, _) => Async[F].delay(retryMap.remove(parkedId)) }
         } yield ()
       }
 
@@ -281,11 +275,66 @@ private[stm] trait TxnRuntimeContext[F[_]] {
           )
         }
 
+    // The shared submission scaffold, and the order inside the graph semaphore
+    // is load-bearing (Scheduler.tla walks it step by step —
+    // submitPc/scanPending):
+    //
+    //   - The scan snapshots activeTransactions BEFORE we insert ourselves into
+    //     it. A writer's footprint is incompatible with ITSELF
+    //     (LemmaWriterSelfIncompatible), so scanning after the insert would
+    //     subscribe us to ourselves and the tally would never drain.
+    //   - The scan COMPLETES before the readiness test, so the tally is final
+    //     when we test it. Testing earlier could read a zero that an edge
+    //     still forming is about to raise.
+    //   - The readiness test stays under the semaphore, which is what serializes
+    //     it against admitForExecution and against a concurrent scan raising our
+    //     tally.
+    //
+    // The abandoned check lives INSIDE the graph region, where it is serialized
+    // against abandon's own graph region: either this read sees the flag and
+    // nothing registers, or the registration lands first and abandon's sweep
+    // demotes and removes it. Outside the region, an in-flight wake closure
+    // could pass the check while abandon completes, register afterwards, and
+    // run — an abandoned transaction publishing arbitrarily later.
+    //
+    // The wake sweep runs afterwards, on its own fiber: it takes the OTHER
+    // semaphore, and the park window it closes is submitTxnForRetry's.
+    //
+    // What varies between the two submit paths is ONLY how an edge to an
+    // incompatible peer is directed — the linkPeer closure.
+    private def registerAndSweep(
+      analysedTxn: AnalysedTxn[_]
+    )(linkPeer: AnalysedTxn[_] => F[Unit]): F[Unit] =
+      for {
+        _ <- analysedTxn.resetDependencyTally
+        registered <- graphBuilderSemaphore.permit.use { _ =>
+                        Async[F].ifM(analysedTxn.abandoned.get)(
+                          Async[F].pure(false),
+                          for {
+                            // SPEC: ContractC — footprint-incompatible transactions never
+                            // overlap in their execute windows. This scan builds the edges;
+                            // admitForExecution is what makes them BINDING. Both run under
+                            // the graph semaphore, so no peer can be admitted between the
+                            // scan and the insert below (Scheduler.tla checks the guarantee
+                            // itself).
+                            _ <- activeTransactions.values.toList.traverse_(linkPeer)
+                            _ <- analysedTxn.executionStatus.set(Scheduled)
+                            _ <-
+                              Async[F].delay(
+                                activeTransactions.addOne(analysedTxn.id -> analysedTxn)
+                              )
+                            _ <- analysedTxn.checkExecutionReadiness
+                          } yield true
+                        )
+                      }
+        _ <- Async[F].whenA(registered)(checkRetryQueue(analysedTxn.id, analysedTxn.idFootprint).start.void)
+      } yield ()
+
     // The dirty path's resubmission, and its only caller: this transaction ran,
     // found its log stale or its footprint unsound, and is going round again on
-    // a refined one. It repeats submitTxn's sequence exactly — same steps, same
-    // order, same reasons (documented there) — and departs from it in one
-    // respect: the dependency edges are directed by the PEER'S STATUS.
+    // a refined one. It shares submitTxn's scaffold (registerAndSweep) and
+    // departs from it in one respect: the dependency edges are directed by the
+    // PEER'S STATUS.
     //
     //   Running    the peer is already inside its execute window. We cannot get
     //              in front of it, so we take the ordinary edge and wait.
@@ -306,125 +355,42 @@ private[stm] trait TxnRuntimeContext[F[_]] {
     // site carries the same Contract C obligation as submitTxn, where the anchor
     // sits.
     def submitTxnForImmediateRetry(analysedTxn: AnalysedTxn[_]): F[Unit] =
-      for {
-        _ <- analysedTxn.resetDependencyTally
-        registered <- graphBuilderSemaphore.permit.use { _ =>
-                        // Abandoned check INSIDE the graph region — see submitTxn.
-                        Async[F].ifM(analysedTxn.abandoned.get)(
-                          Async[F].pure(false),
-                          for {
-                            testAndLink <- activeTransactions.values.toList.parTraverse { aTxn =>
-                                             (for {
-                                               status <- aTxn.executionStatus.get
-                                               _ <- status match {
-                                                      case Running =>
-                                                        Async[F].ifM(
-                                                          Async[F].delay(
-                                                            analysedTxn.idFootprint
-                                                              .isCompatibleWith(
-                                                                aTxn.idFootprint
-                                                              )
-                                                          )
-                                                        )(
-                                                          Async[F].unit,
-                                                          aTxn.subscribeDownstreamDependency(
-                                                            analysedTxn
-                                                          )
-                                                        )
-                                                      case Scheduled =>
-                                                        Async[F].ifM(
-                                                          Async[F].delay(
-                                                            analysedTxn.idFootprint
-                                                              .isCompatibleWith(
-                                                                aTxn.idFootprint
-                                                              )
-                                                          )
-                                                        )(
-                                                          Async[F].unit,
-                                                          analysedTxn.subscribeDownstreamDependency(
-                                                            aTxn
-                                                          )
-                                                        )
-                                                      case _ =>
-                                                        Async[F].unit
-                                                    }
-                                             } yield ()).start
-                                           }
-                            _ <- analysedTxn.executionStatus.set(Scheduled)
-                            _ <-
-                              Async[F].delay(
-                                activeTransactions.addOne(analysedTxn.id -> analysedTxn)
-                              )
-                            _ <- testAndLink.parTraverse(_.joinWithNever)
-                            _ <- analysedTxn.checkExecutionReadiness
-                          } yield true
-                        )
-                      }
-        _ <- Async[F].whenA(registered)(checkRetryQueue(analysedTxn.id, analysedTxn.idFootprint).start.void)
-      } yield ()
+      registerAndSweep(analysedTxn) { aTxn =>
+        aTxn.executionStatus.get.flatMap {
+          case Running =>
+            Async[F].ifM(
+              Async[F].delay(
+                analysedTxn.idFootprint.isCompatibleWith(aTxn.idFootprint)
+              )
+            )(
+              Async[F].unit,
+              aTxn.subscribeDownstreamDependency(analysedTxn)
+            )
+          case Scheduled =>
+            Async[F].ifM(
+              Async[F].delay(
+                analysedTxn.idFootprint.isCompatibleWith(aTxn.idFootprint)
+              )
+            )(
+              Async[F].unit,
+              analysedTxn.subscribeDownstreamDependency(aTxn)
+            )
+          case _ =>
+            Async[F].unit
+        }
+      }
 
-    // The canonical submission sequence, and the order inside the graph
-    // semaphore is load-bearing (Scheduler.tla walks it step by step —
-    // submitPc/scanPending):
-    //
-    //   - The scan snapshots activeTransactions BEFORE we insert ourselves into
-    //     it. A writer's footprint is incompatible with ITSELF
-    //     (LemmaWriterSelfIncompatible), so scanning after the insert would
-    //     subscribe us to ourselves and the tally would never drain.
-    //   - The scan fibers are JOINED before the readiness test, so the tally is
-    //     final when we test it. Testing earlier could read a zero that an
-    //     edge still forming is about to raise.
-    //   - The readiness test stays under the semaphore, which is what serializes
-    //     it against admitForExecution and against a concurrent scan raising our
-    //     tally.
-    //
-    // The wake sweep runs afterwards, on its own fiber: it takes the OTHER
-    // semaphore, and the park window it closes is submitTxnForRetry's.
+    // The canonical submission sequence — the scaffold and its load-bearing
+    // ordering live on registerAndSweep above. This path's edge rule: an
+    // incompatible active peer gets a forward edge (we wait for it).
     def submitTxn(analysedTxn: AnalysedTxn[_]): F[Unit] =
-      for {
-        _ <- analysedTxn.resetDependencyTally
-        registered <- graphBuilderSemaphore.permit.use { _ =>
-                        // The abandoned check lives INSIDE the graph region,
-                        // where it is serialized against abandon's own graph
-                        // region: either this read sees the flag and nothing
-                        // registers, or the registration lands first and
-                        // abandon's sweep demotes and removes it. Outside the
-                        // region, an in-flight wake closure could pass the
-                        // check while abandon completes, register afterwards,
-                        // and run — an abandoned transaction publishing
-                        // arbitrarily later.
-                        Async[F].ifM(analysedTxn.abandoned.get)(
-                          Async[F].pure(false),
-                          for {
-                            // SPEC: ContractC — footprint-incompatible transactions never
-                            // overlap in their execute windows. This scan builds the edges;
-                            // admitForExecution is what makes them BINDING. Both run under
-                            // the graph semaphore, so no peer can be admitted between the
-                            // scan and the insert below (Scheduler.tla checks the guarantee
-                            // itself).
-                            testAndLink <- activeTransactions.values.toList.parTraverse { aTxn =>
-                                             Async[F]
-                                               .ifM(
-                                                 Async[F].delay(
-                                                   analysedTxn.idFootprint.isCompatibleWith(
-                                                     aTxn.idFootprint
-                                                   )
-                                                 )
-                                               )(Async[F].unit, aTxn.subscribeDownstreamDependency(analysedTxn))
-                                               .start
-                                           }
-                            _ <- analysedTxn.executionStatus.set(Scheduled)
-                            _ <-
-                              Async[F].delay(
-                                activeTransactions.addOne(analysedTxn.id -> analysedTxn)
-                              )
-                            _ <- testAndLink.parTraverse(_.joinWithNever)
-                            _ <- analysedTxn.checkExecutionReadiness
-                          } yield true
-                        )
-                      }
-        _ <- Async[F].whenA(registered)(checkRetryQueue(analysedTxn.id, analysedTxn.idFootprint).start.void)
-      } yield ()
+      registerAndSweep(analysedTxn) { aTxn =>
+        Async[F].ifM(
+          Async[F].delay(
+            analysedTxn.idFootprint.isCompatibleWith(aTxn.idFootprint)
+          )
+        )(Async[F].unit, aTxn.subscribeDownstreamDependency(analysedTxn))
+      }
 
     def registerCompletion(analysedTxn: AnalysedTxn[_]): F[Unit] =
       for {
@@ -551,7 +517,7 @@ private[stm] trait TxnRuntimeContext[F[_]] {
     private[stm] def subscribeDownstreamDependency(
       txn: AnalysedTxn[_]
     ): F[Unit] =
-      Async[F].ifM(Async[F].delay(unsubSpecs.keys.toSet.contains(txn.id)))(
+      Async[F].ifM(Async[F].delay(unsubSpecs.contains(txn.id)))(
         Async[F].unit,
         for {
           _ <- txn.subscribeUpstreamDependency
@@ -574,7 +540,7 @@ private[stm] trait TxnRuntimeContext[F[_]] {
         Async[F].unit,
         Async[F].ifM(Async[F].delay(unsubSpecs.nonEmpty))(
           for {
-            _ <- unsubSpecs.values.toList.parTraverse(unsubSpec => unsubSpec)
+            _ <- unsubSpecs.values.toList.sequence_
             _ <- Async[F].delay(unsubSpecs.clear())
           } yield (),
           Async[F].unit
@@ -670,24 +636,20 @@ private[stm] trait TxnRuntimeContext[F[_]] {
                               // Contract C, which spec/ContractCSpec checks against the
                               // RUNNING code — the dirty check used to be the backstop for a
                               // scheduler bug, and that test is what replaces it.
-                              refine <- Async[F].delay(!coversActualFootprint(actual))
-                              result <- Async[F].ifM[Option[V]](Async[F].pure(refine))(
-                                          Async[F].delay(None),
+                              result <- if (!coversActualFootprint(actual))
+                                          Async[F].pure(Option.empty[V])
+                                        else
                                           log.commit.as(logValue)
-                                        )
                             } yield result
                           }
                         }
                         .flatMap { s =>
                           s.map(v =>
                             Async[F]
-                              .delay(TxnResultSuccess(v).asInstanceOf[TxnResult])
+                              .delay(TxnResultSuccess(v): TxnResult)
                           ).getOrElse(
                             log.idFootprint
-                              .map(footprint =>
-                                TxnResultLogDirty(footprint)
-                                  .asInstanceOf[TxnResult]
-                              )
+                              .map(footprint => TxnResultLogDirty(footprint): TxnResult)
                           )
                         }
                     // The park path needs the same coverage check. A parked
@@ -714,17 +676,10 @@ private[stm] trait TxnRuntimeContext[F[_]] {
                         retry.validLog.withLock {
                           for {
                             actual <- retry.validLog.idFootprint
-                            refine <- Async[F].delay(
-                                        idFootprint.isUnderApproximated || !idFootprint.covers(actual.getValidated)
-                                      )
-                            result <- Async[F].ifM[TxnResult](Async[F].pure(refine))(
-                                        Async[F].delay(
-                                          TxnResultLogDirty(actual).asInstanceOf[TxnResult]
-                                        ),
-                                        Async[F].delay(
-                                          TxnResultRetry(retry.validLog).asInstanceOf[TxnResult]
-                                        )
-                                      )
+                            result <- if (idFootprint.isUnderApproximated || !idFootprint.covers(actual.getValidated))
+                                        Async[F].delay(TxnResultLogDirty(actual): TxnResult)
+                                      else
+                                        Async[F].delay(TxnResultRetry(retry.validLog): TxnResult)
                           } yield result
                         }
                       }
@@ -739,7 +694,7 @@ private[stm] trait TxnRuntimeContext[F[_]] {
                     // in the error result and refine instead of failing when
                     // coverage does not hold — is deliberately not taken here.
                     case err @ TxnLogError(_) =>
-                      Async[F].delay(TxnResultFailure(err))
+                      Async[F].delay(TxnResultFailure(err.ex))
                   }
       } yield result
 
@@ -846,7 +801,7 @@ private[stm] trait TxnRuntimeContext[F[_]] {
         completionSignal  <- Deferred[F, Either[Throwable, V]]
         dependencyTally   <- Ref[F].of(0)
         hasDownstream     <- Ref[F].of(false)
-        executionStatus   <- Ref[F].of(NotScheduled.asInstanceOf[ExecutionStatus])
+        executionStatus   <- Ref[F].of[ExecutionStatus](NotScheduled)
         cascadeFired      <- Ref[F].of(false)
         abandoned         <- Ref[F].of(false)
         id                <- txnIdGen.getAndUpdate(_ + 1)

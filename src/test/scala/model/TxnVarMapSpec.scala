@@ -17,7 +17,6 @@
 package ai.entrolution
 package model
 
-import cats.effect.implicits._
 import cats.effect.testing.scalatest.AsyncIOSpec
 import cats.syntax.all._
 import org.scalatest.EitherValues
@@ -29,6 +28,13 @@ import bengal.stm.syntax.all._
 
 class TxnVarMapSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers with EitherValues with StmSuite {
   val baseMap: Map[String, Int] = Map("foo" -> 42, "bar" -> 27, "baz" -> 18)
+
+  // The shared tail of every failure-path assertion: the documented contract is
+  // a failed F carrying a RuntimeException whose message names the problem.
+  private def assertAbort(result: Either[Throwable, _], substring: String): org.scalatest.Assertion = {
+    result.left.value shouldBe a[RuntimeException]
+    result.left.value.getMessage should include(substring)
+  }
 
   "TxnVarMap.get" - {
     "return the value of a transactional map" in {
@@ -182,8 +188,7 @@ class TxnVarMapSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers with Ei
         } yield (result, mapAfter)
       }
         .asserting { case (result, mapAfter) =>
-          result.left.value shouldBe a[RuntimeException]
-          result.left.value.getMessage should include("not found for modification")
+          assertAbort(result, "not found for modification")
           // The raise fails the whole transaction: the remove rolls back too,
           // rather than the modify resurrecting the deleted key.
           mapAfter shouldBe baseMap
@@ -239,8 +244,7 @@ class TxnVarMapSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers with Ei
         } yield (result, mapAfter)
       }
         .asserting { case (result, mapAfter) =>
-          result.left.value shouldBe a[RuntimeException]
-          result.left.value.getMessage should include("non-existent key")
+          assertAbort(result, "non-existent key")
           // The raise fails the whole transaction: the first remove rolls back too.
           mapAfter shouldBe baseMap
         }
@@ -257,10 +261,7 @@ class TxnVarMapSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers with Ei
                     } yield ()).commit.attempt
         } yield result
       }
-        .asserting { result =>
-          result.left.value shouldBe a[RuntimeException]
-          result.left.value.getMessage should include("non-existent key")
-        }
+        .asserting(assertAbort(_, "non-existent key"))
     }
 
     // remove is documented to fail the transaction when the key is absent (the
@@ -277,10 +278,7 @@ class TxnVarMapSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers with Ei
                     } yield ()).commit.attempt
         } yield result
       }
-        .asserting { result =>
-          result.left.value shouldBe a[RuntimeException]
-          result.left.value.getMessage should include("non-existent key")
-        }
+        .asserting(assertAbort(_, "non-existent key"))
     }
 
     "re-insert a key removed earlier in the same transaction" in {

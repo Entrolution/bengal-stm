@@ -23,7 +23,6 @@ import scala.concurrent.duration._
 
 import cats.effect.IO
 import cats.effect.implicits._
-import cats.effect.unsafe.implicits.global
 import cats.syntax.all._
 import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.should.Matchers
@@ -60,7 +59,7 @@ import bengal.stm.syntax.all._
   * transaction itself just wrote yields the PRE-TRANSACTION value there, and the written value in the real run. The
   * marker is per-transaction, so it adds no conflict of its own.
   */
-class ContractCSpec extends AnyFreeSpec with Matchers {
+class ContractCSpec extends AnyFreeSpec with Matchers with StmSuite {
 
   private val Reps  = 12
   private val Peers = 8
@@ -94,51 +93,47 @@ class ContractCSpec extends AnyFreeSpec with Matchers {
   private def peakOverlap(conflicting: Boolean): Int = {
     val meter = new Meter
 
-    STM
-      .runtime[IO]
-      .flatMap { implicit stm =>
-        for {
-          shared   <- TxnVar.of[IO, Int](0)
-          privates <- (0 until Peers).toList.traverse(_ => TxnVar.of[IO, Int](0))
-          markers  <- (0 until Peers).toList.traverse(_ => TxnVar.of[IO, Int](0))
-          _ <- (0 until Peers).toList.parTraverse { i =>
-                 val target = if (conflicting) shared else privates(i)
-                 val marker = markers(i)
-                 (for {
-                   // The analysis pass records this write but does not apply it...
-                   _ <- marker.set(1)
-                   // ...so `seen` is 0 in analysis and 1 in the real run. Per-peer, so it
-                   // conflicts with nobody and does not perturb what we are measuring.
-                   seen <- marker.get
-                   _    <- STM[IO].delay(if (seen == 1) meter.enter())
-                   v    <- target.get
-                   _    <- target.set(v + 1)
-                   // HOLD THE EXECUTE WINDOW OPEN, AND DO IT BY SUSPENDING RATHER THAN SPINNING.
-                   //
-                   // This started as a busy spin, and a busy spin measures the wrong thing. It never
-                   // yields, so two bodies can only be caught in flight together if the OS genuinely
-                   // runs them on two cores at the same instant — which on CI's 2-vCPU runner it did
-                   // not, so the anti-vacuity arm reported peaks of 1,1,1,... and the Contract C
-                   // assertion below went VACUOUSLY TRUE. It would have passed against a completely
-                   // broken scheduler. (The arm caught that, which is what it is for. Widening the
-                   // spin did not help: the problem was never the width.)
-                   //
-                   // CONTRACT C IS A PROPERTY OF THE SCHEDULER, NOT OF THE THREAD POOL. Two
-                   // transactions are in their execute windows together whether or not the OS happens
-                   // to be running them on two cores. A suspending sleep makes exactly that
-                   // observable: the fiber yields, a second one enters its window, and the meter sees
-                   // both — on any number of cores, including one.
-                   //
-                   // `fromF` runs in BOTH passes, so the sleep is guarded the same way the meter is:
-                   // during static analysis `seen` is 0 and this is IO.unit.
-                   _ <- STM[IO].fromF(if (seen == 1) IO.sleep(Window) else IO.unit)
-                   _ <- STM[IO].delay(if (seen == 1) meter.exit())
-                 } yield ()).commit
-               }
-        } yield ()
-      }
-      .timeout(60.seconds)
-      .unsafeRunSync()
+    withRuntimeSync(60.seconds) { implicit stm =>
+      for {
+        shared   <- TxnVar.of[IO, Int](0)
+        privates <- (0 until Peers).toList.traverse(_ => TxnVar.of[IO, Int](0))
+        markers  <- (0 until Peers).toList.traverse(_ => TxnVar.of[IO, Int](0))
+        _ <- (0 until Peers).toList.parTraverse { i =>
+               val target = if (conflicting) shared else privates(i)
+               val marker = markers(i)
+               (for {
+                 // The analysis pass records this write but does not apply it...
+                 _ <- marker.set(1)
+                 // ...so `seen` is 0 in analysis and 1 in the real run. Per-peer, so it
+                 // conflicts with nobody and does not perturb what we are measuring.
+                 seen <- marker.get
+                 _    <- STM[IO].delay(if (seen == 1) meter.enter())
+                 v    <- target.get
+                 _    <- target.set(v + 1)
+                 // HOLD THE EXECUTE WINDOW OPEN, AND DO IT BY SUSPENDING RATHER THAN SPINNING.
+                 //
+                 // This started as a busy spin, and a busy spin measures the wrong thing. It never
+                 // yields, so two bodies can only be caught in flight together if the OS genuinely
+                 // runs them on two cores at the same instant — which on CI's 2-vCPU runner it did
+                 // not, so the anti-vacuity arm reported peaks of 1,1,1,... and the Contract C
+                 // assertion below went VACUOUSLY TRUE. It would have passed against a completely
+                 // broken scheduler. (The arm caught that, which is what it is for. Widening the
+                 // spin did not help: the problem was never the width.)
+                 //
+                 // CONTRACT C IS A PROPERTY OF THE SCHEDULER, NOT OF THE THREAD POOL. Two
+                 // transactions are in their execute windows together whether or not the OS happens
+                 // to be running them on two cores. A suspending sleep makes exactly that
+                 // observable: the fiber yields, a second one enters its window, and the meter sees
+                 // both — on any number of cores, including one.
+                 //
+                 // `fromF` runs in BOTH passes, so the sleep is guarded the same way the meter is:
+                 // during static analysis `seen` is 0 and this is IO.unit.
+                 _ <- STM[IO].fromF(if (seen == 1) IO.sleep(Window) else IO.unit)
+                 _ <- STM[IO].delay(if (seen == 1) meter.exit())
+               } yield ()).commit
+             }
+      } yield ()
+    }
 
     meter.max
   }

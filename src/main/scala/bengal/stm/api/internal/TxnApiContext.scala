@@ -24,10 +24,9 @@ import cats.free.Free
 
 import bengal.stm.model.TxnErratum._
 import bengal.stm.model._
-import bengal.stm.runtime.TxnRuntimeContext
 
 private[stm] trait TxnApiContext[F[_]] {
-  this: AsyncImplicits[F] with TxnRuntimeContext[F] with TxnAdtContext[F] =>
+  this: AsyncImplicits[F] with TxnAdtContext[F] =>
 
   private def liftSuccess[V](txnAdt: TxnAdt[V]): Txn[V] =
     Free.liftF[TxnOrErr, V](Right(txnAdt))
@@ -104,7 +103,7 @@ private[stm] trait TxnApiContext[F[_]] {
   private[stm] def handleErrorWithInternal[V](fa: => Txn[V])(
     f: Throwable => Txn[V]
   ): Txn[V] =
-    liftSuccess(TxnHandleError(Async[F].delay(fa), ex => Async[F].delay(f(ex))))
+    handleErrorWithInternalF(fa)(ex => Async[F].delay(f(ex)))
 
   private[stm] def handleErrorWithInternalF[V](fa: => Txn[V])(
     f: Throwable => F[Txn[V]]
@@ -118,7 +117,7 @@ private[stm] trait TxnApiContext[F[_]] {
     newValue: => V,
     txnVar: TxnVar[F, V]
   ): Txn[Unit] =
-    liftSuccess(TxnSetVar(Async[F].delay(newValue), txnVar))
+    setTxnVarF(Async[F].delay(newValue), txnVar)
 
   private[stm] def setTxnVarF[V](
     newValue: F[V],
@@ -127,10 +126,7 @@ private[stm] trait TxnApiContext[F[_]] {
     liftSuccess(TxnSetVar(newValue, txnVar))
 
   private[stm] def modifyTxnVar[V](f: V => V, txnVar: TxnVar[F, V]): Txn[Unit] =
-    for {
-      value <- getTxnVar(txnVar)
-      _     <- setTxnVar(f(value), txnVar)
-    } yield ()
+    modifyTxnVarF((v: V) => Async[F].delay(f(v)), txnVar)
 
   private[stm] def modifyTxnVarF[V](
     f: V => F[V],
@@ -150,7 +146,7 @@ private[stm] trait TxnApiContext[F[_]] {
     newValueMap: => Map[K, V],
     txnVarMap: TxnVarMap[F, K, V]
   ): Txn[Unit] =
-    liftSuccess(TxnSetVarMap(Async[F].delay(newValueMap), txnVarMap))
+    setTxnVarMapF(Async[F].delay(newValueMap), txnVarMap)
 
   private[stm] def setTxnVarMapF[K, V](
     newValueMap: F[Map[K, V]],
@@ -162,10 +158,7 @@ private[stm] trait TxnApiContext[F[_]] {
     f: Map[K, V] => Map[K, V],
     txnVarMap: TxnVarMap[F, K, V]
   ): Txn[Unit] =
-    for {
-      value <- getTxnVarMap(txnVarMap)
-      _     <- setTxnVarMap(f(value), txnVarMap)
-    } yield ()
+    modifyTxnVarMapF((m: Map[K, V]) => Async[F].delay(f(m)), txnVarMap)
 
   private[stm] def modifyTxnVarMapF[K, V](
     f: Map[K, V] => F[Map[K, V]],
@@ -187,9 +180,7 @@ private[stm] trait TxnApiContext[F[_]] {
     newValue: => V,
     txnVarMap: TxnVarMap[F, K, V]
   ): Txn[Unit] =
-    liftSuccess(
-      TxnSetVarMapValue(Async[F].delay(key), Async[F].delay(newValue), txnVarMap)
-    )
+    setTxnVarMapValueF(key, Async[F].delay(newValue), txnVarMap)
 
   private[stm] def setTxnVarMapValueF[K, V](
     key: => K,
@@ -205,9 +196,7 @@ private[stm] trait TxnApiContext[F[_]] {
     f: V => V,
     txnVarMap: TxnVarMap[F, K, V]
   ): Txn[Unit] =
-    liftSuccess(
-      TxnModifyVarMapValue(Async[F].delay(key), (v: V) => Async[F].delay(f(v)), txnVarMap)
-    )
+    modifyTxnVarMapValueF(key, (v: V) => Async[F].delay(f(v)), txnVarMap)
 
   private[stm] def modifyTxnVarMapValueF[K, V](
     key: => K,

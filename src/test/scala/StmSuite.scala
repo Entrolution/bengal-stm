@@ -19,6 +19,7 @@ package ai.entrolution
 import scala.concurrent.duration._
 
 import cats.effect.IO
+import cats.effect.unsafe.implicits.global
 
 import bengal.stm.STM
 
@@ -54,4 +55,13 @@ trait StmSuite {
 
   protected def withRuntime[A](timeout: FiniteDuration)(f: STM[IO] => IO[A]): IO[A] =
     STM.runtime[IO].flatMap(f).timeout(timeout)
+
+  // The synchronous sibling, for AnyFreeSpec suites that drive the runtime
+  // with unsafeRunSync: same runtime, same hang-detector timeout, one place
+  // to open both.
+  protected def withRuntimeSync[A](f: STM[IO] => IO[A]): A =
+    withRuntimeSync(DefaultTimeout)(f)
+
+  protected def withRuntimeSync[A](timeout: FiniteDuration)(f: STM[IO] => IO[A]): A =
+    withRuntime(timeout)(f).unsafeRunSync()
 }

@@ -10,6 +10,8 @@ This project adheres to a [Code of Conduct](CODE_OF_CONDUCT.md). By participatin
 
 ### Reporting Issues
 
+Do not report security vulnerabilities as public issues — see [SECURITY.md](SECURITY.md) for the disclosure process.
+
 Before creating an issue, please check if a similar issue already exists. When reporting bugs, include:
 
 - A clear, descriptive title
@@ -44,7 +46,7 @@ sbt headerCreateAll             # Apache header on every new file
 sbt scalafixAll                 # BEFORE scalafmt — it rewrites imports
 sbt scalafmtAll scalafmtSbt     # scalafmtAll does not cover build.sbt; scalafmtSbt does
 
-CI=true sbt scalafmtCheckAll scalafmtSbtCheck headerCheckAll 'scalafixAll --check' +test
+GITHUB_ACTIONS=true sbt scalafmtCheckAll scalafmtSbtCheck headerCheckAll 'scalafixAll --check' +test
 sbt mimaReportBinaryIssues      # binary compatibility against the last release
 ```
 
@@ -56,9 +58,18 @@ deleted), and those rewrites are not formatted. Run `scalafmtAll scalafixAll` in
 that order and you push files that scalafix has left unformatted — `scalafmtCheckAll`
 then fails on a tree you just formatted. This repo has made that mistake.
 
-**`CI=true` is not decoration.** sbt-typelevel keys **fatal warnings** off the `CI`
-environment variable, so a warning that is merely a warning on your machine is an
-**error** on the build. If you want to know what CI will say, ask it the way CI asks.
+**`GITHUB_ACTIONS=true` is not decoration.** sbt-typelevel keys **fatal warnings** off the
+`GITHUB_ACTIONS` environment variable — not `CI`; `CI=true` compiles with warnings
+non-fatal and green-lights a build that real CI fails — so a warning that is merely a
+warning on your machine is an **error** on the build. If you want to know what CI will
+say, ask it the way CI asks.
+
+### Releasing
+
+Releases are tag-driven: pushing a `v*` tag runs the sbt-typelevel release workflow, which
+publishes to Maven Central. There are no snapshots (`tlCiReleaseBranches` is empty — only
+tags release), and MiMa gates binary compatibility against the previous release within the
+minor line as part of the same run.
 
 ## Development Setup
 
@@ -125,6 +136,12 @@ conversion, so they **shadow the public extension methods**. `TxnVar` has a
 - Bug fixes should include a test that would have caught the bug
 - Tests are located in `src/test/scala`
 - Run tests with `sbt test`
+- The suite includes a soak/oracle layer (`src/test/scala/soak/`): randomized
+  serializability rounds checked by a cycle-detecting history oracle (`History`), plus a
+  bounded-buffer retry soak. They run as part of the ordinary suite — no tag, no exclusion —
+  and are the behavioural counterpart to the TLA+ specs; `specs/README.md` leans on them for
+  its fix-reversion evidence
+- A local coverage report: `sbt coverage test coverageReport`
 
 ## Formal Specifications
 

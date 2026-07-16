@@ -25,7 +25,6 @@ import scala.util.Random
 
 import cats.effect.IO
 import cats.effect.implicits._
-import cats.effect.unsafe.implicits.global
 import cats.syntax.all._
 import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.should.Matchers
@@ -116,7 +115,7 @@ private object DivergenceMeter {
   def observed: Int = seen.size()
 }
 
-class SerializabilitySoakSpec extends AnyFreeSpec with Matchers {
+class SerializabilitySoakSpec extends AnyFreeSpec with Matchers with StmSuite {
 
   private val NumVars = 6
   private val NumMaps = 2
@@ -293,6 +292,11 @@ class SerializabilitySoakSpec extends AnyFreeSpec with Matchers {
             // ordinary "move something from here to there". Accurately declared,
             // so it is correct in itself; it is the counterpart a data-dependent
             // reader can tear.
+            //
+            // The +500000L keeps the second append a distinct tag attributed to
+            // the SAME writer: History.writerOf is tag / TagStride (1,000,000),
+            // so seq + offset must stay in [opsPerTxn, TagStride) -- above the
+            // sibling tagFor slots, below the next writer's id.
             val k1 = KeyPool(i)
             val k2 = KeyPool((i + 1) % KeyPool.size)
             for {
@@ -342,39 +346,35 @@ class SerializabilitySoakSpec extends AnyFreeSpec with Matchers {
     val workload = List.fill(txnsPerRun)(genOps(rnd))
     val execs    = new AtomicIntegerArray(txnsPerRun + 1)
 
-    STM
-      .runtime[IO]
-      .flatMap { implicit stm =>
-        for {
-          vars <- (0 until NumVars).toList.traverse(_ => TxnVar.of[IO, Vector[Tag]](Vector.empty))
-          maps <- (0 until NumMaps).toList.traverse(_ => TxnVarMap.of[IO, String, Vector[Tag]](Map.empty))
+    // A lost wakeup or a lock cycle would hang rather than fail; the timeout
+    // turns either into a TimeoutException, and the soak loop converts THAT
+    // into a red test carrying the round and seed. A raw TimeoutException
+    // bypasses withClue (ScalaTest only decorates its own exceptions), so
+    // it takes an explicit catch, which lives in the loop beside the other
+    // keyed assertions.
+    withRuntimeSync(if (longMode) 5.minutes else 90.seconds) { implicit stm =>
+      for {
+        vars <- (0 until NumVars).toList.traverse(_ => TxnVar.of[IO, Vector[Tag]](Vector.empty))
+        maps <- (0 until NumMaps).toList.traverse(_ => TxnVarMap.of[IO, String, Vector[Tag]](Map.empty))
 
-          records <- workload.zipWithIndex.parTraverse { case (ops, i) =>
-                       toTxn(round, i + 1, ops, vars, maps, execs).commit
+        records <- workload.zipWithIndex.parTraverse { case (ops, i) =>
+                     toTxn(round, i + 1, ops, vars, maps, execs).commit
+                   }
+
+        finalVars <- vars.zipWithIndex.traverse { case (v, i) =>
+                       v.get.commit.map(l => (VarKey(i): Key) -> l)
                      }
-
-          finalVars <- vars.zipWithIndex.traverse { case (v, i) =>
-                         v.get.commit.map(l => (VarKey(i): Key) -> l)
+        finalMaps <- maps.zipWithIndex.traverse { case (m, i) =>
+                       m.get.commit.map { mm =>
+                         mm.toList.map { case (k, l) => (EntryKey(i, k): Key) -> l }
                        }
-          finalMaps <- maps.zipWithIndex.traverse { case (m, i) =>
-                         m.get.commit.map { mm =>
-                           mm.toList.map { case (k, l) => (EntryKey(i, k): Key) -> l }
-                         }
-                       }
-        } yield RoundResult(
-          finalState = (finalVars ++ finalMaps.flatten).toMap,
-          records    = records,
-          executions = (1 to txnsPerRun).map(execs.get).toVector
-        )
-      }
-      // A lost wakeup or a lock cycle would hang rather than fail; the timeout
-      // turns either into a TimeoutException, and the soak loop converts THAT
-      // into a red test carrying the round and seed. A raw TimeoutException
-      // bypasses withClue (ScalaTest only decorates its own exceptions), so
-      // it takes an explicit catch, which lives in the loop beside the other
-      // keyed assertions.
-      .timeout(if (longMode) 5.minutes else 90.seconds)
-      .unsafeRunSync()
+                     }
+      } yield RoundResult(
+        finalState = (finalVars ++ finalMaps.flatten).toMap,
+        records    = records,
+        executions = (1 to txnsPerRun).map(execs.get).toVector
+      )
+    }
   }
 
   // ---------------------------------------------------------------------------

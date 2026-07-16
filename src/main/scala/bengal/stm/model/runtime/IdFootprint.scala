@@ -17,7 +17,7 @@
 package ai.entrolution
 package bengal.stm.model.runtime
 
-private[stm] case class IdFootprint(
+final private[stm] case class IdFootprint(
   readIds: Set[TxnVarRuntimeId],
   updatedIds: Set[TxnVarRuntimeId],
   isValidated: Boolean = false,
@@ -62,7 +62,7 @@ private[stm] case class IdFootprint(
       this
     } else {
       this.copy(
-        readIds     = (readIds -- updatedIds).filter(id => id.parent.forall(pid => !updateRawIds.contains(pid.value))),
+        readIds     = (readIds -- updatedIds).filter(id => !id.parentIn(updateRawIds)),
         isValidated = true
       )
     }
@@ -118,9 +118,9 @@ private[stm] case class IdFootprint(
   // are one-hop, and deeper nesting would need multi-hop coverage.
   private def asymmetricCompatibleWith(input: IdFootprint): Boolean =
     combinedRawIds.intersect(input.updateRawIds).isEmpty && !combinedIds.exists(
-      _.parent.exists(p => input.updateRawIds.contains(p.value))
+      _.parentIn(input.updateRawIds)
     ) && !updatedIds.exists(
-      _.parent.exists(p => input.readRawIds.contains(p.value))
+      _.parentIn(input.readRawIds)
     )
 
   // SPEC: CommitSnapshotValid — the H3 fix, first clause. A footprint that
@@ -178,15 +178,19 @@ private[stm] case class IdFootprint(
   // child READ, whereas a parent WRITE covers child reads and writes alike.
   // Reading a map does not announce that you will write a key in it.
   private[stm] def covers(actual: IdFootprint): Boolean =
-    actual.readIds.forall { id =>
-      combinedRawIds.contains(id.value) ||
-      id.parent.exists(p => combinedRawIds.contains(p.value))
-    } && actual.updatedIds.forall { id =>
-      updateRawIds.contains(id.value) ||
-      id.parent.exists(p => updateRawIds.contains(p.value))
-    }
+    actual.readIds.forall(_.coveredBy(combinedRawIds)) &&
+      actual.updatedIds.forall(_.coveredBy(updateRawIds))
 }
 
 private[stm] object IdFootprint {
   private[stm] val empty: IdFootprint = IdFootprint(Set(), Set())
+
+  // Named single-id constructors: the read/write slots are positional, and a
+  // hand-written literal that swaps them logs a write as a read — a silent
+  // conflict-detection hole. These name the intent once.
+  private[stm] def readOnly(id: TxnVarRuntimeId): IdFootprint =
+    IdFootprint(readIds = Set(id), updatedIds = Set())
+
+  private[stm] def writeOnly(id: TxnVarRuntimeId): IdFootprint =
+    IdFootprint(readIds = Set(), updatedIds = Set(id))
 }

@@ -178,17 +178,6 @@ class TxnCompilerContextSpec extends AsyncFreeSpec with AsyncIOSpec with Matcher
   }
 
   "handleErrorWith transaction" - {
-    "correctly handles error recovery" in {
-      withRuntime { implicit stm =>
-        STM[IO]
-          .abort(new RuntimeException("error"))
-          .flatMap(_ => STM[IO].pure("unreachable"))
-          .handleErrorWith(_ => STM[IO].pure("recovered"))
-          .commit
-      }
-        .asserting(_ shouldBe "recovered")
-    }
-
     "retry propagates through handleErrorWith" in {
       withRuntime { implicit stm =>
         for {

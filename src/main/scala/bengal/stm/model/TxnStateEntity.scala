@@ -17,12 +17,11 @@
 package ai.entrolution
 package bengal.stm.model
 
-import cats.effect.Ref
 import cats.effect.std.Semaphore
 
 import bengal.stm.model.runtime._
 
-private[stm] trait TxnStateEntity[F[_], V] {
+private[stm] trait TxnStateEntity[F[_]] {
   private[stm] def id: TxnVarId
 
   // This entity's OWN runtime id, taken directly from its TxnVarId: the key it
@@ -38,6 +37,5 @@ private[stm] trait TxnStateEntity[F[_], V] {
   // two distinct entities.
   final private[stm] lazy val runtimeId: TxnVarRuntimeId =
     TxnVarRuntimeId(id)
-  protected def value: Ref[F, V]
   private[stm] def commitLock: Semaphore[F]
 }

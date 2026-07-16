@@ -65,7 +65,7 @@ class FVariantSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers with Stm
           result  <- tVarMap.get.commit
         } yield result
       }
-        .asserting(_ shouldBe Map("x" -> 1, "y" -> 2))
+        .asserting(_ shouldBe newMap)
     }
   }
 

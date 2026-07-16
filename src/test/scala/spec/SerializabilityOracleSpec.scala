@@ -21,7 +21,6 @@ import scala.concurrent.duration._
 
 import cats.effect.IO
 import cats.effect.implicits._
-import cats.effect.unsafe.implicits.global
 import cats.syntax.all._
 import org.scalacheck.Gen
 import org.scalatest.freespec.AnyFreeSpec
@@ -59,7 +58,7 @@ import bengal.stm.syntax.all._
   *     it never overlaps a peer and can never go dirty. The only divergence left that can open a commit-time window is
   *     the DATA-DEPENDENT kind — which is exactly what the dirty-path test below uses to reach it.
   */
-class SerializabilityOracleSpec extends AnyFreeSpec with ScalaCheckPropertyChecks with Matchers {
+class SerializabilityOracleSpec extends AnyFreeSpec with ScalaCheckPropertyChecks with Matchers with StmSuite {
 
   // -------------------------------------------------------------------
   // Workload model
@@ -124,19 +123,15 @@ class SerializabilityOracleSpec extends AnyFreeSpec with ScalaCheckPropertyCheck
     init: ModelState,
     workload: List[List[Op]]
   ): (ModelState, List[List[Obs]]) =
-    STM
-      .runtime[IO]
-      .flatMap { implicit stm =>
-        for {
-          vars     <- init.vars.traverse(TxnVar.of[IO, Int])
-          map      <- TxnVarMap.of[IO, String, Int](init.map)
-          results  <- workload.parTraverse(ops => toTxn(ops, vars, map).commit)
-          finalVs  <- vars.traverse(_.get.commit)
-          finalMap <- map.get.commit
-        } yield (ModelState(finalVs, finalMap), results)
-      }
-      .timeout(30.seconds)
-      .unsafeRunSync()
+    withRuntimeSync(30.seconds) { implicit stm =>
+      for {
+        vars     <- init.vars.traverse(TxnVar.of[IO, Int])
+        map      <- TxnVarMap.of[IO, String, Int](init.map)
+        results  <- workload.parTraverse(ops => toTxn(ops, vars, map).commit)
+        finalVs  <- vars.traverse(_.get.commit)
+        finalMap <- map.get.commit
+      } yield (ModelState(finalVs, finalMap), results)
+    }
 
   // Serializability: some permutation of the transactions, applied
   // sequentially to the reference model, reproduces every transaction's
@@ -253,34 +248,30 @@ class SerializabilityOracleSpec extends AnyFreeSpec with ScalaCheckPropertyCheck
       val reps = 300
       (1 to reps).foreach { rep =>
         val (finalS, counters, finalMap) =
-          STM
-            .runtime[IO]
-            .flatMap { implicit stm =>
-              for {
-                sel      <- TxnVar.of[IO, Int](0)
-                counters <- List.fill(3)(0).traverse(TxnVar.of[IO, Int])
-                map      <- TxnVarMap.of[IO, String, Int](Map.empty[String, Int])
-                tSelect = for {
-                            _ <- sel.modify(_ + 1)
-                            _ <- counters(0).modify(_ + 1)
-                          } yield ()
-                tKey = for {
-                         s <- sel.get
-                         _ <- map.set("k" + (s % 2), 10)
-                         _ <- counters(1).modify(_ + 1)
-                       } yield ()
-                tDirect = for {
-                            _ <- map.set("k1", 20)
-                            _ <- counters(2).modify(_ + 1)
-                          } yield ()
-                _  <- List(tSelect.commit, tKey.commit, tDirect.commit).parSequence
-                s  <- sel.get.commit
-                cs <- counters.traverse(_.get.commit)
-                m  <- map.get.commit
-              } yield (s, cs, m)
-            }
-            .timeout(30.seconds)
-            .unsafeRunSync()
+          withRuntimeSync(30.seconds) { implicit stm =>
+            for {
+              sel      <- TxnVar.of[IO, Int](0)
+              counters <- List.fill(3)(0).traverse(TxnVar.of[IO, Int])
+              map      <- TxnVarMap.of[IO, String, Int](Map.empty[String, Int])
+              tSelect = for {
+                          _ <- sel.modify(_ + 1)
+                          _ <- counters(0).modify(_ + 1)
+                        } yield ()
+              tKey = for {
+                       s <- sel.get
+                       _ <- map.set("k" + (s % 2), 10)
+                       _ <- counters(1).modify(_ + 1)
+                     } yield ()
+              tDirect = for {
+                          _ <- map.set("k1", 20)
+                          _ <- counters(2).modify(_ + 1)
+                        } yield ()
+              _  <- List(tSelect.commit, tKey.commit, tDirect.commit).parSequence
+              s  <- sel.get.commit
+              cs <- counters.traverse(_.get.commit)
+              m  <- map.get.commit
+            } yield (s, cs, m)
+          }
 
         withClue(s"rep $rep: s=$finalS counters=$counters map=$finalMap") {
           finalS shouldBe 1
@@ -316,23 +307,19 @@ class SerializabilityOracleSpec extends AnyFreeSpec with ScalaCheckPropertyCheck
       val reps = 50
       (1 to reps).foreach { rep =>
         val result =
-          STM
-            .runtime[IO]
-            .flatMap { implicit stm =>
-              for {
-                flag <- TxnVar.of[IO, Int](0)
-                reader = for {
-                           v <- flag.get
-                           _ <- STM[IO].waitFor(v > 0)
-                         } yield v
-                fib <- reader.commit.start
-                _   <- IO.sleep(20.millis)
-                _   <- flag.set(1).commit
-                v   <- fib.joinWithNever
-              } yield v
-            }
-            .timeout(30.seconds)
-            .unsafeRunSync()
+          withRuntimeSync(30.seconds) { implicit stm =>
+            for {
+              flag <- TxnVar.of[IO, Int](0)
+              reader = for {
+                         v <- flag.get
+                         _ <- STM[IO].waitFor(v > 0)
+                       } yield v
+              fib <- reader.commit.start
+              _   <- IO.sleep(20.millis)
+              _   <- flag.set(1).commit
+              v   <- fib.joinWithNever
+            } yield v
+          }
         withClue(s"rep $rep:")(result shouldBe 1)
       }
     }

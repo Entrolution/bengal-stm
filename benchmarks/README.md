@@ -6,9 +6,10 @@ What did the correctness fixes cost?
 sbt 'benchmarks/Jmh/run .*StmThroughputBench.*'
 ```
 
-The defaults in `StmThroughputBench` **are** the protocol used below (`-f5 -wi 5 -i 10`) — but
-the tables themselves are historical since the harness rework; see the banner under Results. The benchmarks module is **not aggregated** into the root
-project, so `sbt test` and CI never build it.
+The defaults in `StmThroughputBench` **are** the protocol used below (`-f5 -wi 5 -i 10`). The
+primary table under Results is the current post-rework measurement (2026-07-14); only the
+dirty-check table further down is historical — see the banners on each. The benchmarks module
+is **not aggregated** into the root project, so `sbt test` and CI never build it.
 
 ## Read this before trusting any number you produce here
 
@@ -35,15 +36,17 @@ reported as real if it clears **twice** that.
 **Forks, not iterations, are the lever.** A single fork measures one JVM's JIT and allocation
 luck; more iterations just measure that same luck more precisely. Going `-f1 → -f5` cut the drift
 from 6.5% to ~3%. And `uncontendedCommit` — the fastest benchmark here, so the most
-JIT-sensitive — still drifted **6.0%** at `-f5`, which cannot support a claim under 12%. It was
-re-run at **`-f20`**, where it drifts **1.6%**. That is the only reason its number below is
-believable.
+JIT-sensitive — still drifted **4.7%** at `-f5` in the published campaign (an earlier campaign
+saw 6.0%), which cannot support a claim under ~9%. It was re-run at **`-f20`**, where it drifts
+**1.6%**. That is the only reason its number below is believable.
 
 A dedicated box costs about $0.13 and an hour.
 
 ## Method
 
-Three trees, four phases, one box: **A → B → C → A**.
+Three trees, one box. The current campaign is **A → B → A** (2026-07-14, reworked harness); the
+**C** comparison is a separate, earlier campaign preserved below (2026-07-13, pre-rework harness
+— its C tree is not reconstructible against the current code).
 
 | | |
 |---|---|
@@ -51,8 +54,9 @@ Three trees, four phases, one box: **A → B → C → A**.
 | **B** | `4b0638d` — H4/H5/H1 fixed, but **not** H2, H3, H6, the absent-key lost wakeup, or the null fixes |
 | **C** | identical to A **except** the commit-time dirty check is still there |
 
-**A vs B** is what the correctness work cost. **A vs C** is what deleting the dirty check bought.
-**A vs A** is the control: if the two A runs disagree, nothing else here means anything.
+**A vs B** is what the correctness work cost. **A vs C** was what deleting the dirty check bought
+(the historical table below). **A vs A** is the control: if the two A runs disagree, nothing else
+here means anything.
 
 Every fix was `private[stm]`, so the same benchmark compiles unchanged against all three, and
 only `src/main` is swapped.
@@ -89,15 +93,21 @@ footprint fold, hash-derived ids), so each row is the fix's cost **net of every 
 | benchmark | before (`4b0638d`) | after | change | | drift |
 |---|---:|---:|---:|:-:|---:|
 | `underDeclaredConcurrent` | 8,437 ± 102 | 5,506 ± 72 | **−34.7%** | ● | 0.0% |
-| `dataDependentKey` | 3,929 ± 424 | 4,518 ± 81 | **+15.0%** | ● | 0.6% |
+| `dataDependentKey` ‡ | 3,929 ± 424 | 4,518 ± 81 | **+15.0%** | ● | 0.6% |
 | `wholeMapReadPlusInsert` | 964 ± 23 | 1,170 ± 26 | **+21.4%** | ● | 0.8% |
 | `mapWriteConcurrent` | 7,337 ± 91 | 7,694 ± 95 | **+4.9%** | ● | 1.0% |
 | `contendedConcurrent` | 5,740 ± 56 | 5,997 ± 80 | **+4.5%** | ● | 0.4% |
-| `uncontendedCommit` | 17,834 ± 760 | 18,324 ± 341 (`-f20`) | +2.2% (`-f5`) | ○ | 4.7% (`-f5`) |
+| `uncontendedCommit` ‡ | 17,834 ± 760 | 18,324 ± 341 (`-f20`) | +2.2% (`-f5`) | ○ | 4.7% (`-f5`) |
 | `disjointConcurrent` | 8,670 ± 163 | 8,638 ± 166 | −0.4% | ○ | 2.6% |
 | `crossMapInsert` | **deadlocks** † | 6,795 ± 93 | — | — | 5.7% |
 
 ● resolved · ○ **within this row's noise — no change detected, and none is claimed**
+
+‡ `uncontendedCommit`'s cells mix protocols by design: `after` is the tighter `-f20` re-run,
+while `change` and `drift` are from the `-f5` A→B→A campaign — the printed before/after
+deliberately do not recompute to the printed change. And `dataDependentKey`'s before-column
+carries a ±10.8% CI (its pre-fix run was noisy): the +15.0% direction is solid — the worst case
+inside that CI still clears twice the row's drift — but the magnitude spans roughly +4% to +29%.
 
 † `crossMapInsert` is the H2 topology — two transactions inserting fresh keys into two maps.
 Run against the pre-H2 library, its **first fork deadlocked** (both fibers holding one
@@ -123,7 +133,7 @@ Same code either way; the *only* difference was the check.
 
 | benchmark | with the check | without | gain | |
 |---|---:|---:|---:|:-:|
-| `wholeMapReadPlusInsert` | 837 ± 39 | 1,020 | **+22.0%** | ● |
+| `wholeMapReadPlusInsert` | 837 ± 39 | 1,020 | **+21.9%** | ● |
 | `uncontendedCommit` | 16,292 ± 498 | 18,415 | **+13.0%** | ● |
 | `underDeclaredConcurrent` | 4,424 ± 182 | 4,759 | **+7.6%** | ● |
 | `dataDependentKey` | 3,800 ± 252 | 3,983 | **+4.8%** | ● |

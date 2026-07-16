@@ -107,7 +107,7 @@ class StmStressSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers with St
   // The waste is inherent to the workload, not to the retry map. (The map used to
   // be keyed by FOOTPRINT, which chained wakes between unrelated transactions
   // that merely shared one; the H1 fix re-keyed it by TxnId, which removed that
-  // amplification. What is left here is the real thing: five readers genuinely
+  // amplification. What is left here is the real thing: three readers genuinely
   // waiting on one counter.)
   "waitFor under contention" in {
     withRuntime(60.seconds) { implicit stm =>

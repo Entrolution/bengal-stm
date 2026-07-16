@@ -83,7 +83,7 @@
  * into two maps could take {M1.lock, M2.lock} in opposite orders. Their
  * footprints are compatible, so the scheduler ran them concurrently by design.
  *
- * FIXED (2026-07-11). TxnLogEntry.lock now returns the lock PAIRED WITH ITS
+ * FIXED. TxnLogEntry.lock now returns the lock PAIRED WITH ITS
  * OWNER'S runtime id, and withLock sorts on the owner:
  *
  *     locks <- log.values.toList.traverse(_.lock)                  // POST-FIX
@@ -933,9 +933,13 @@ Publish(t) ==
    and zero new states across the whole of Spec A — and then deleted; the full
    record lives in CommitDirty.cfg. Only CoverageRestart remains, and a dead
    coverage check reads as CoverageRestart: 0. *)
+(* Clear every lock t holds — the one release mapping, shared by
+   RefineAndRestart, DirtyTruncate and Release so the three exits cannot
+   drift apart. *)
+FreeLocks(t) == [l \in Locks |-> IF lockHolder[l] = t THEN "none" ELSE lockHolder[l]]
+
 RefineAndRestart(t) ==
-    /\ lockHolder' = [l \in Locks |->
-                        IF lockHolder[l] = t THEN "none" ELSE lockHolder[l]]
+    /\ lockHolder' = FreeLocks(t)
     /\ inc'        = [inc      EXCEPT ![t] = inc[t] + 1]
     \* Refined from the ACTUAL log, which is complete by construction (it is built
     \* from real log entries), so the refinement is never flagged and the re-run is
@@ -969,8 +973,7 @@ DirtyTruncate(t) ==
     /\ pc[t] = "validate"
     /\ NeedsRefinement(t)
     /\ inc[t] = MaxInc
-    /\ lockHolder' = [l \in Locks |->
-                        IF lockHolder[l] = t THEN "none" ELSE lockHolder[l]]
+    /\ lockHolder' = FreeLocks(t)
     /\ lockSeq'   = [lockSeq EXCEPT ![t] = << >>]
     /\ lockIdx'   = [lockIdx EXCEPT ![t] = 0]
     /\ pc'        = [pc EXCEPT ![t] = "done"]
@@ -984,8 +987,7 @@ DirtyTruncate(t) ==
    longer a held prefix (LocksHeldConsistent pins that correspondence). *)
 Release(t) ==
     /\ pc[t] = "release"
-    /\ lockHolder' = [l \in Locks |->
-                        IF lockHolder[l] = t THEN "none" ELSE lockHolder[l]]
+    /\ lockHolder' = FreeLocks(t)
     /\ lockSeq' = [lockSeq EXCEPT ![t] = << >>]
     /\ lockIdx' = [lockIdx EXCEPT ![t] = 0]
     /\ pc' = [pc EXCEPT ![t] = "done"]

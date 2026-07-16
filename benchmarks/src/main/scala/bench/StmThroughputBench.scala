@@ -94,7 +94,9 @@ class StmThroughputBench {
 
   private final val Batch = 32
 
-  private val Keys    = (0 until 64).map(i => s"k$i").toVector
+  // Sized to exactly two windows: WindowB below spans (Batch until 2 * Batch),
+  // so raising Batch alone must grow the keyspace with it.
+  private val Keys    = (0 until 2 * Batch).map(i => s"k$i").toVector
   private val counter = new AtomicInteger(0)
 
   // Every var-writing benchmark adds its known per-invocation write count
@@ -252,49 +254,56 @@ class StmThroughputBench {
     * the key's own lock — ~99% of the measured commits at the published protocol exercised a path this benchmark's label
     * denied.)
     */
+  // The remove-previous-window trick, named once: insert this invocation's key,
+  // remove the key the counterpart inserted in the PREVIOUS invocation, so every
+  // set stays a REAL insert and the map stays bounded at the keyspace.
+  private def windowPair(base: Int, i: Int): (String, String) =
+    (Keys((base + i) % Keys.size), Keys((base + i + Batch) % Keys.size))
+
+  // The shared shape of the batched map benchmarks: claim a key window, run one
+  // transaction per batch slot concurrently, sum the results synchronously (the
+  // unsafeRunSync stays inside the timed body — it is part of what is measured).
+  private def batchedCommits(work: (Int, Int) => Txn[Int])(implicit s: STM[IO]): Int = {
+    val base = counter.getAndAdd(Batch)
+    (0 until Batch).toList
+      .parTraverse(i => work(base, i).commit)
+      .map(_.sum)
+      .unsafeRunSync()
+  }
+
   @Benchmark
   @OperationsPerInvocation(32)
   def mapWriteConcurrent(): Int = {
     implicit val s: STM[IO] = stmRef
-    val base = counter.getAndAdd(Batch)
-    (0 until Batch).toList
-      .parTraverse { i =>
-        val kIns = Keys((base + i) % Keys.size)
-        val kDel = Keys((base + i + Batch) % Keys.size)
-        (for {
-          _ <- insMap.remove(kDel)
-          _ <- insMap.set(kIns, i)
-        } yield i).commit
-      }
-      .map(_.sum)
-      .unsafeRunSync()
+    batchedCommits { (base, i) =>
+      val (kIns, kDel) = windowPair(base, i)
+      for {
+        _ <- insMap.remove(kDel)
+        _ <- insMap.set(kIns, i)
+      } yield i
+    }
   }
 
   /** THE H2 TOPOLOGY, cross-map: every transaction inserts a fresh key into TWO maps (with the same remove-previous-
     * window trick per map keeping the inserts real), so its sorted acquisition set holds FOUR owners — both maps'
     * structural locks and both removed entries' own locks. Two transactions inserting fresh keys into two maps is the
     * shape whose acquisition order the H2 fix makes globally total (specs/commit/CommitH2.cfg); before it, this
-    * deadlocked. No published baseline exists for this benchmark — it lands with the harness rework and gets its first
-    * numbers at the next dedicated-box session.
+    * deadlocked. First measured with the harness rework on the dedicated box — see the crossMapInsert row in
+    * benchmarks/README.md (no before-column: the pre-H2 library deadlocked here, as above).
     */
   @Benchmark
   @OperationsPerInvocation(32)
   def crossMapInsert(): Int = {
     implicit val s: STM[IO] = stmRef
-    val base = counter.getAndAdd(Batch)
-    (0 until Batch).toList
-      .parTraverse { i =>
-        val kIns = Keys((base + i) % Keys.size)
-        val kDel = Keys((base + i + Batch) % Keys.size)
-        (for {
-          _ <- mapA.remove(kDel)
-          _ <- mapA.set(kIns, i)
-          _ <- mapB.remove(kDel)
-          _ <- mapB.set(kIns, i)
-        } yield i).commit
-      }
-      .map(_.sum)
-      .unsafeRunSync()
+    batchedCommits { (base, i) =>
+      val (kIns, kDel) = windowPair(base, i)
+      for {
+        _ <- mapA.remove(kDel)
+        _ <- mapA.set(kIns, i)
+        _ <- mapB.remove(kDel)
+        _ <- mapB.set(kIns, i)
+      } yield i
+    }
   }
 
   /** THE H5 FIX'S COST. A whole-map read plus an insert — the phantom idiom. Before the fix these were judged
@@ -305,17 +314,13 @@ class StmThroughputBench {
   @OperationsPerInvocation(32)
   def wholeMapReadPlusInsert(): Int = {
     implicit val s: STM[IO] = stmRef
-    val base = counter.getAndAdd(Batch)
-    (0 until Batch).toList
-      .parTraverse { i =>
-        val k = Keys((base + i) % Keys.size)
-        (for {
-          m <- map.get
-          _ <- map.set(k, m.size)
-        } yield m.size).commit
-      }
-      .map(_.sum)
-      .unsafeRunSync()
+    batchedCommits { (base, i) =>
+      val k = Keys((base + i) % Keys.size)
+      for {
+        m <- map.get
+        _ <- map.set(k, m.size)
+      } yield m.size
+    }
   }
 
   /** THE H6 FIX'S COST UNDER DIVERGENCE. The key is computed from a var that a concurrent transaction is bumping, so

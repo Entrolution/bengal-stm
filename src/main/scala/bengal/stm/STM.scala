@@ -77,8 +77,9 @@ abstract class STM[F[_]: Async]
   def allocateTxnVarMap[K, V](valueMap: Map[K, V]): F[TxnVarMap[F, K, V]]
   private[stm] def commitTxn[V](txn: Txn[V]): F[V]
 
-  /** Transaction operations on `TxnVar`. Requires `import ai.entrolution.bengal.stm.syntax.all._` (or `import stm._`) —
-    * an implicit `STM[F]` alone does not bring these into scope.
+  /** Transaction operations on `TxnVar`. Requires `import ai.entrolution.bengal.stm.syntax.all._` — an implicit
+    * `STM[F]` alone does not bring these into scope. (`import stm._` on an instance exposes the same base operations
+    * but NOT the F-variants `setF`/`modifyF`/`handleErrorWithF`, which exist only in `syntax.all`.)
     */
   implicit class TxnVarOps[V](txnVar: TxnVar[F, V]) {
 
@@ -95,8 +96,9 @@ abstract class STM[F[_]: Async]
       modifyTxnVar(f, txnVar)
   }
 
-  /** Transaction operations on `TxnVarMap`. Requires `import ai.entrolution.bengal.stm.syntax.all._` (or
-    * `import stm._`) — an implicit `STM[F]` alone does not bring these into scope.
+  /** Transaction operations on `TxnVarMap`. Requires `import ai.entrolution.bengal.stm.syntax.all._` — an implicit
+    * `STM[F]` alone does not bring these into scope. (`import stm._` on an instance exposes the same base operations
+    * but NOT the F-variants `setF`/`modifyF`/`handleErrorWithF`, which exist only in `syntax.all`.)
     */
   implicit class TxnVarMapOps[K, V](txnVarMap: TxnVarMap[F, K, V]) {
 

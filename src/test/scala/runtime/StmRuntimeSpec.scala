@@ -108,7 +108,7 @@ class StmRuntimeSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers with S
         _ <- txnVarQueue.modify(_.enqueue(27))
         _ <- txnVarQueue.modify(_.enqueue(18))
         _ <- txnVarQueue.modify(_.enqueue(28))
-      } yield () // -6
+      } yield ()
 
       withRuntime { implicit stm =>
         for {
@@ -128,13 +128,12 @@ class StmRuntimeSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers with S
     }
 
     "transaction error completes rather than hanging" in {
-      withRuntime { implicit stm =>
+      withRuntime(5.seconds) { implicit stm =>
         STM[IO]
           .abort(new RuntimeException("test error"))
           .flatMap(_ => STM[IO].pure("unreachable"))
           .commit
           .attempt
-          .timeout(5.seconds)
       }
         .asserting(_.isLeft shouldBe true)
     }

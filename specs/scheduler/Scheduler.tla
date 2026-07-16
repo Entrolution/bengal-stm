@@ -141,22 +141,26 @@ ActualFP(t) ==
       [] t = "tw" -> FP({}, {V1})
       [] t = "tm" -> FP({V1}, {V2})
 
-(* What the transaction's LOG RECORDS — which is NOT the same thing, and the
-   model conflated the two until now.
+(* What the transaction's LOG RECORDS — which is NOT the same thing as its
+   declared footprint.
 
-   Reading a map key that is ABSENT records no log entry at all: the
-   key-absent branch of TxnLogContext.getVarMapValue returns the log
-   UNCHANGED. The read is still in the DECLARED footprint — the static
-   analysis walker registers the key's existential id unconditionally — so
-   Contract C still keeps conflicting writers out of the execute window, and
-   checkRetryQueue's sweep still matches on it. But every fold over the LOG
-   is blind to it, and there are two:
+   Reading a map key that is ABSENT used to record no log entry at all: the
+   key-absent branch of TxnLogContext.getVarMapValue returned the log
+   UNCHANGED. The code now records the read (the H1 absent-key fix);
+   LoggedFP(tm) keeps the pre-fix shape on purpose — it is the negative
+   control for H1's second guard. The read was still in the DECLARED
+   footprint — the static analysis walker registers the key's existential id
+   unconditionally, then as now — so Contract C still kept conflicting
+   writers out of the execute window, and checkRetryQueue's sweep still
+   matched on it. But every fold over the LOG was blind to it, and there are
+   two:
 
      TxnLogValid.anyReadChangedSinceRead  — the H1 park-time staleness check
      TxnLogValid.idFootprint              — the dirty path's refinement source
 
    Modelling the staleness check over ActualFP therefore checked a STRONGER
-   guard than the code implements, which is why this spec did not catch it.
+   guard than the pre-fix code implemented, which is why this spec did not
+   catch it.
 
    tm differs from tr in exactly one respect: its read of V1 is not logged.
    Everything else — declared footprint, retry predicate, write set — is
@@ -171,7 +175,7 @@ LoggedFP(t) ==
    footprint then fails the coverage gate at commit and it refines and
    resubmits — which is what opens the H4 window. tr/tw declare accurately.
 
-   WHAT t1 MODELS CHANGED WITH THE H3 FIX (2026-07-11), and the distinction
+   WHAT t1 MODELS CHANGED WITH THE H3 FIX, and the distinction
    matters. It used to model the static-analysis FALLBACK: the walker threw and
    TxnRuntime.commit scheduled on whatever partial footprint it had. That path
    is now FLAGGED (IdFootprint.isUnderApproximated) and the relation makes it
@@ -208,7 +212,6 @@ DeclaredBase(t) ==
    against the fiber's SNAPSHOT (the log's read values), exactly as the
    code's log run decides TxnLogRetry — a write committed after the
    snapshot does not rescue a stale decision (that gap is H1's home). *)
-IsRetryTxn(t) == t \in {"tr", "tm"}
 RetryPred(t, versionsFn) ==
     IF t \in {"tr", "tm"} THEN versionsFn[V1] >= 1 ELSE TRUE
 
@@ -265,11 +268,12 @@ VARIABLES
     version,         \* var id -> commit counter (values abstracted away)
     \* --- retry machinery (park / wake — H1 territory) ---
     parked,          \* retryMap membership: txns parked awaiting a wake
-                     \* (keyed by footprint in code; compat is computed from
-                     \* declared[t], which is stable while parked)
+                     \* (keyed by TxnId in code, each entry carrying its parked
+                     \* footprint and wake; the sweep's compat test is computed
+                     \* from declared[t], which is stable while parked)
     retrySem,        \* retrySemaphore holder: [kind |-> "park"/"sweep",
                      \* t |-> txn] or "none"
-    sweep,           \* checkRetryQueue fibers, two slots per submitting txn:
+    sweep,           \* checkRetryQueue fibers, three slots per submitting txn:
                      \* [ph |-> "none"/"acq"/"scan", pend |-> SUBSET Txns,
                      \*  fp |-> the submitted footprint]. Spawned on EVERY
                      \* submission — a sweep evaluates the retry map only

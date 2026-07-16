@@ -24,7 +24,6 @@ import scala.concurrent.duration._
 
 import cats.effect.IO
 import cats.effect.implicits._
-import cats.effect.unsafe.implicits.global
 import cats.syntax.all._
 import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.should.Matchers
@@ -89,7 +88,7 @@ import bengal.stm.syntax.all._
   * breakage. It is not a substitute for `specs/scheduler/SchedulerRetry.cfg` and its negative controls, and it must not
   * be read as one.
   */
-class RetrySoakSpec extends AnyFreeSpec with Matchers {
+class RetrySoakSpec extends AnyFreeSpec with Matchers with StmSuite {
 
   private val Capacity    = 4
   private val Producers   = 12
@@ -109,74 +108,67 @@ class RetrySoakSpec extends AnyFreeSpec with Matchers {
     // conflate them and the mean would be meaningless.
     val execs = new AtomicIntegerArray(2 * Total + 1)
 
-    STM
-      .runtime[IO]
-      .flatMap { implicit stm =>
-        val buffer = TxnVar.of[IO, Vector[Long]](Vector.empty)
+    val consumed = withRuntimeSync(90.seconds) { implicit stm =>
+      val buffer = TxnVar.of[IO, Vector[Long]](Vector.empty)
 
-        buffer.flatMap { buf =>
-          def count(id: Int): Txn[Unit] =
-            STM[IO].delay {
-              execs.incrementAndGet(id)
-              ()
-            }
-
-          // Parks while the buffer is FULL. The read of `buf` puts it in the
-          // footprint, which is what lets a consumer's commit wake this.
-          def produce(id: Int, tag: Long): Txn[Unit] =
-            for {
-              _ <- count(id)
-              b <- buf.get
-              // Sampled BEFORE the waitFor, so it fires on every body
-              // execution (both passes, and every wake lap) — a thunk placed
-              // after the waitFor runs in NEITHER pass while parked. max is
-              // pass-invariant and the delay adds no footprint entry, so the
-              // parking behaviour under test is unperturbed. Every sample is
-              // a committed buffer size as seen at the park-decision point.
-              _ <- STM[IO].delay {
-                     maxBufSeen.accumulateAndGet(b.size, Math.max(_, _))
-                     ()
-                   }
-              _ <- STM[IO].waitFor(b.size < Capacity)
-              _ <- buf.set(b :+ tag)
-            } yield ()
-
-          // Parks while the buffer is EMPTY.
-          def consume(id: Int): Txn[Long] =
-            for {
-              _ <- count(id)
-              b <- buf.get
-              _ <- STM[IO].waitFor(b.nonEmpty)
-              _ <- buf.set(b.tail)
-            } yield b.head
-
-          val producers = (0 until Producers).toList.flatMap { p =>
-            (0 until PerProducer).toList.map { k =>
-              val txnIdx = (p * PerProducer) + k
-              produce(txnIdx, (round.toLong * 100000L) + (p.toLong * 100L) + k.toLong).commit
-            }
+      buffer.flatMap { buf =>
+        def count(id: Int): Txn[Unit] =
+          STM[IO].delay {
+            execs.incrementAndGet(id)
+            ()
           }
 
-          // Exactly as many takes as there are items, so the run only ends when
-          // every single one has been consumed. If one wakeup is lost, this
-          // never finishes.
-          val consumers = (0 until Total).toList.map { i =>
-            consume(Total + i).commit
-          }
-
+        // Parks while the buffer is FULL. The read of `buf` puts it in the
+        // footprint, which is what lets a consumer's commit wake this.
+        def produce(id: Int, tag: Long): Txn[Unit] =
           for {
-            fibs <- (producers ++ consumers).parTraverse(_.start)
-            got  <- fibs.traverse(_.joinWithNever)
-          } yield got.collect { case l: Long => l }
-        }
-      }
-      .timeout(90.seconds)
-      .unsafeRunSync()
-      .pipe(consumed => Outcome(consumed, (0 until 2 * Total).map(execs.get).toVector))
-  }
+            _ <- count(id)
+            b <- buf.get
+            // Sampled BEFORE the waitFor, so it fires on every body
+            // execution (both passes, and every wake lap) — a thunk placed
+            // after the waitFor runs in NEITHER pass while parked. max is
+            // pass-invariant and the delay adds no footprint entry, so the
+            // parking behaviour under test is unperturbed. Every sample is
+            // a committed buffer size as seen at the park-decision point.
+            _ <- STM[IO].delay {
+                   maxBufSeen.accumulateAndGet(b.size, Math.max(_, _))
+                   ()
+                 }
+            _ <- STM[IO].waitFor(b.size < Capacity)
+            _ <- buf.set(b :+ tag)
+          } yield ()
 
-  implicit private class PipeOps[A](private val a: A) {
-    def pipe[B](f: A => B): B = f(a)
+        // Parks while the buffer is EMPTY.
+        def consume(id: Int): Txn[Long] =
+          for {
+            _ <- count(id)
+            b <- buf.get
+            _ <- STM[IO].waitFor(b.nonEmpty)
+            _ <- buf.set(b.tail)
+          } yield b.head
+
+        val producers = (0 until Producers).toList.flatMap { p =>
+          (0 until PerProducer).toList.map { k =>
+            val txnIdx = (p * PerProducer) + k
+            produce(txnIdx, (round.toLong * 100000L) + (p.toLong * 100L) + k.toLong).commit
+          }
+        }
+
+        // Exactly as many takes as there are items, so the run only ends when
+        // every single one has been consumed. If one wakeup is lost, this
+        // never finishes.
+        val consumers = (0 until Total).toList.map { i =>
+          consume(Total + i).commit
+        }
+
+        for {
+          fibs <- (producers ++ consumers).parTraverse(_.start)
+          got  <- fibs.traverse(_.joinWithNever)
+        } yield got.collect { case l: Long => l }
+      }
+    }
+
+    Outcome(consumed, (0 until 2 * Total).map(execs.get).toVector)
   }
 
   "producer/consumer under a bounded buffer" - {

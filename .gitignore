@@ -1,6 +1,10 @@
 target
 .DS_Store
 .claude/
+
+# Quality-process working files — local logs, never part of the repository
+/QUALITY.md
+/.quality-accepted.jsonl
 /*/*.iml
 /.idea
 /.idea_modules

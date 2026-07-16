@@ -23,7 +23,6 @@ import scala.concurrent.duration._
 
 import cats.effect.IO
 import cats.effect.implicits._
-import cats.effect.unsafe.implicits.global
 import cats.syntax.all._
 import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.should.Matchers
@@ -66,7 +65,7 @@ import bengal.stm.syntax.all._
   * one against peers on disjoint vars and watch whether their execute windows ever overlap. It goes red if the fix is
   * reverted AND it goes red if the shape stops throwing, which is exactly the discrimination the skew counts lost.
   */
-class StaticAnalysisFallbackSpec extends AnyFreeSpec with Matchers {
+class StaticAnalysisFallbackSpec extends AnyFreeSpec with Matchers with StmSuite {
 
   /** The classic write-skew shape — read one var, write the other — behind a read-your-own-write prelude whose
     * continuation is partial. The prelude is what collapses the declared footprint; the skew is what the collapse then
@@ -139,20 +138,16 @@ class StaticAnalysisFallbackSpec extends AnyFreeSpec with Matchers {
   private def runPair(
     build: (TxnVar[IO, Int], TxnVar[IO, Int], TxnVarMap[IO, String, Int]) => STM[IO] => List[Txn[Int]]
   ): Boolean =
-    STM
-      .runtime[IO]
-      .flatMap { implicit stm =>
-        for {
-          x       <- TxnVar.of[IO, Int](0)
-          y       <- TxnVar.of[IO, Int](0)
-          scratch <- TxnVarMap.of[IO, String, Int](Map.empty)
-          obs     <- build(x, y, scratch)(stm).parTraverse(_.commit)
-          fx      <- x.get.commit
-          fy      <- y.get.commit
-        } yield isSkew(obs, fx, fy)
-      }
-      .timeout(30.seconds)
-      .unsafeRunSync()
+    withRuntimeSync(30.seconds) { implicit stm =>
+      for {
+        x       <- TxnVar.of[IO, Int](0)
+        y       <- TxnVar.of[IO, Int](0)
+        scratch <- TxnVarMap.of[IO, String, Int](Map.empty)
+        obs     <- build(x, y, scratch)(stm).parTraverse(_.commit)
+        fx      <- x.get.commit
+        fy      <- y.get.commit
+      } yield isSkew(obs, fx, fy)
+    }
 
   // -------------------------------------------------------------------
   // Control (expected green — isolates the fallback as the cause)
@@ -215,8 +210,9 @@ class StaticAnalysisFallbackSpec extends AnyFreeSpec with Matchers {
      *
      * If this ever goes red again, the fallback lost its flag somewhere — check
      * that getValidated still copies it through and that every under-approximating
-     * handler still calls markUnderApproximated (TxnRuntime.commit has two, and
-     * TxnCompilerContext has three that swallow silently).
+     * handler still calls markUnderApproximated (analyseFootprint in
+     * TxnRuntimeContext has two, and TxnCompilerContext has three that swallow
+     * silently).
      */
     "no rep skews" in {
       val maxReps = 1000
@@ -244,23 +240,19 @@ class StaticAnalysisFallbackSpec extends AnyFreeSpec with Matchers {
     "an under-declared transaction still commits its effects exactly once" in {
       val reps = 100
       val results = (1 to reps).map { _ =>
-        STM
-          .runtime[IO]
-          .flatMap { implicit stm =>
-            for {
-              x       <- TxnVar.of[IO, Int](0)
-              y       <- TxnVar.of[IO, Int](0)
-              scratch <- TxnVarMap.of[IO, String, Int](Map.empty)
-              _ <- List(
-                     skewTxn(x, y, scratch, "a").commit,
-                     skewTxn(y, x, scratch, "b").commit
-                   ).parSequence
-              fx <- x.get.commit
-              fy <- y.get.commit
-            } yield (fx, fy)
-          }
-          .timeout(30.seconds)
-          .unsafeRunSync()
+        withRuntimeSync(30.seconds) { implicit stm =>
+          for {
+            x       <- TxnVar.of[IO, Int](0)
+            y       <- TxnVar.of[IO, Int](0)
+            scratch <- TxnVarMap.of[IO, String, Int](Map.empty)
+            _ <- List(
+                   skewTxn(x, y, scratch, "a").commit,
+                   skewTxn(y, x, scratch, "b").commit
+                 ).parSequence
+            fx <- x.get.commit
+            fy <- y.get.commit
+          } yield (fx, fy)
+        }
       }
       // Serialized either way round, the outcome is one of the two serial orders
       // — never the skewed (1, 1), and never a double-applied effect.
@@ -364,18 +356,14 @@ class StaticAnalysisFallbackSpec extends AnyFreeSpec with Matchers {
   private def overlapsInOneRun(peers: Int): Int = {
     val meter = new OverlapMeter
 
-    STM
-      .runtime[IO]
-      .flatMap { implicit stm =>
-        for {
-          scratch  <- TxnVarMap.of[IO, String, Int](Map.empty)
-          peerVars <- (1 to peers).toList.traverse(_ => TxnVar.of[IO, Int](0))
-          _ <- (underDeclaredTxn(scratch, "u", meter).commit ::
-                 peerVars.map(v => peerTxn(v, meter).commit)).parSequence
-        } yield meter.overlapCount
-      }
-      .timeout(30.seconds)
-      .unsafeRunSync()
+    withRuntimeSync(30.seconds) { implicit stm =>
+      for {
+        scratch  <- TxnVarMap.of[IO, String, Int](Map.empty)
+        peerVars <- (1 to peers).toList.traverse(_ => TxnVar.of[IO, Int](0))
+        _ <- (underDeclaredTxn(scratch, "u", meter).commit ::
+               peerVars.map(v => peerTxn(v, meter).commit)).parSequence
+      } yield meter.overlapCount
+    }
   }
 
   "an under-declaring transaction still reaches the fallback, and therefore runs ALONE" in {
