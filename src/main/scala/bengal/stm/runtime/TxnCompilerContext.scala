@@ -87,14 +87,24 @@ private[stm] trait TxnCompilerContext[F[_]] {
   ) extends RuntimeException
       with NoStackTrace
 
-  // @nowarn on BOTH FunctionK.apply methods below, and not for exhaustivity.
-  // What the annotation suppresses is the free-monad interpreter's unavoidable
-  // Unit casts. A FunctionK must produce a V for every op; where a walk ends
-  // on a Unit-valued path — the errata arms and the analysis walker's
-  // TxnHandleError recovery — those arms hand back ().asInstanceOf[V] (the
-  // setter arms need no cast: their pattern match refines V = Unit), and
-  // Scala 2.13 flags every one as a "dubious usage of asInstanceOf with unit
-  // value". CI compiles both Scala versions, with warnings fatal.
+  // The free-monad interpreters carry unavoidable Unit casts: a FunctionK must
+  // produce a V for every op, and where a walk ends on a Unit-valued path —
+  // the errata arms and the analysis walker's TxnHandleError recovery — those
+  // arms hand back ().asInstanceOf[V] (the setter arms need no cast: their
+  // pattern match refines V = Unit). Scala 2.13 flags each as a "dubious usage
+  // of asInstanceOf with unit value", so exactly those expressions carry
+  // @nowarn — expression-level on purpose, so nothing broader is suppressed.
+  // CI compiles both Scala versions, with warnings fatal.
+  //
+  // TxnAdt is SEALED (all cases live in TxnAdtContext.scala), so no ADT case
+  // can exist outside that file — yet each walker keeps a raising default arm.
+  // The checker cannot verify these matches: the cases are path-dependent
+  // members, and it treats every this-prefixed pattern as failing to cover the
+  // sealed child, reporting all twelve as missing (tried, with the defaults
+  // dropped; both matches were rejected under fatal warnings). The default is
+  // therefore doing two jobs — match totality the checker cannot see, and a
+  // loud MatchError-failed commit for any future case added in-file without
+  // interpreter arms, instead of a silently skipped operation.
   //
   // BOTH walkers stop at a terminal erratum, each in its own way. txnLogCompiler
   // enumerates the errata — TxnRetry schedules a retry (which throws), TxnError
@@ -122,7 +132,6 @@ private[stm] trait TxnCompilerContext[F[_]] {
   private[stm] def staticAnalysisCompiler: FunctionK[TxnOrErr, IdFootprintStore] =
     new FunctionK[TxnOrErr, IdFootprintStore] {
 
-      @nowarn
       def apply[V](fa: TxnOrErr[V]): IdFootprintStore[V] =
         fa match {
           case Right(entry) =>
@@ -240,7 +249,7 @@ private[stm] trait TxnCompilerContext[F[_]] {
                       case e @ StaticAnalysisErratumStopException(_, TxnRetry) =>
                         Async[F].raiseError(e)
                       case _ =>
-                        Async[F].delay((s, ().asInstanceOf[V]))
+                        Async[F].delay((s, ().asInstanceOf[V]: @nowarn))
                     }
                 }
               case unhandled =>
@@ -262,7 +271,6 @@ private[stm] trait TxnCompilerContext[F[_]] {
   private[stm] lazy val txnLogCompiler: FunctionK[TxnOrErr, TxnLogStore] =
     new FunctionK[TxnOrErr, TxnLogStore] {
 
-      @nowarn
       def apply[V](fa: TxnOrErr[V]): TxnLogStore[V] =
         fa match {
           case Right(entry) =>
@@ -356,11 +364,11 @@ private[stm] trait TxnCompilerContext[F[_]] {
             erratum match {
               case TxnRetry =>
                 StateT[F, TxnLog, V](
-                  _.scheduleRetry.map((_, ().asInstanceOf[V]))
+                  _.scheduleRetry.map((_, ().asInstanceOf[V]: @nowarn))
                 )
               case TxnError(ex) =>
                 StateT[F, TxnLog, V](
-                  _.raiseError(ex).map((_, ().asInstanceOf[V]))
+                  _.raiseError(ex).map((_, ().asInstanceOf[V]: @nowarn))
                 )
             }
         }

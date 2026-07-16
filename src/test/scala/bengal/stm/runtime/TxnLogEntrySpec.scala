@@ -686,7 +686,7 @@ class TxnLogEntrySpec extends AsyncFreeSpec with AsyncIOSpec with Matchers with 
         // Nothing has moved yet.
         before <- valid.anyReadChangedSinceRead
         // A conflicting writer creates the key underneath us.
-        _     <- map.set("ghost", 1).commit
+        _     <- stm.commitTxn(stm.setTxnVarMapValue("ghost", 1, map))
         after <- valid.anyReadChangedSinceRead
       } yield {
         before shouldBe false

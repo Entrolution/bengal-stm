@@ -91,8 +91,8 @@ one, because the runtime's own `private[stm]` members shadow the extension metho
 |:--------|-------------|:---------------|:------|
 | `STM.runtime[F]` | Creates a runtime in an `F[_]` container whose transaction results can be lifted into a container `F[_]` via `commit` | `def runtime[F[_]: Async]: F[STM[F]]` | |
 | `txnVar.get.commit` | Commits a transaction and lifts the result into `F[_]` | `def commit: F[V]` | |
-| `TxnVar.of[IO, List[Int]](List())` | Creates a transactional variable | `def of[F[_]: STM: Async, T](value: T): F[TxnVar[F, T]]` | |
-| `TxnVarMap.of[IO, String, Int](Map())` | Creates a transactional map | `def of[F[_]: STM: Async, K, V](valueMap: Map[K, V]): F[TxnVarMap[F, K, V]]` | |
+| `TxnVar.of[IO, List[Int]](List())` | Creates a transactional variable | `def of[F[_]: TxnIdAllocator: Async, T](value: T): F[TxnVar[F, T]]` | The implicit `STM[F]` runtime satisfies the allocator bound |
+| `TxnVarMap.of[IO, String, Int](Map())` | Creates a transactional map | `def of[F[_]: TxnIdAllocator: Async, K, V](valueMap: Map[K, V]): F[TxnVarMap[F, K, V]]` | The implicit `STM[F]` runtime satisfies the allocator bound |
 | `txnVar.get` | Retrieves value of transactional variable | `def get: Txn[V]` | |
 | `txnVarMap.get` | Retrieves an immutable map (i.e. a view) representing transactional map state | `def get: Txn[Map[K, V]]` | Performance-wise it is better to retrieve individual keys instead of acquiring the entire map |
 | `txnVarMap.get("David")` | Retrieves the value for a key, if present | `def get(key: => K): Txn[Option[V]]` | Returns `None` when the key does not exist — whether it was never created, or was deleted earlier in this transaction. It does **not** raise. |
@@ -213,7 +213,9 @@ object BankTransfer extends IOApp.Simple {
 Bengal's scheduler is what makes it different from a blindly optimistic STM: before a
 transaction runs, it works out that transaction's **footprint** — the set of variables and
 map keys it will touch — and uses it to run only transactions that cannot conflict at the
-same time. That is where the concurrency comes from.
+same time. That is where the concurrency comes from. (How the footprint machinery, the
+scheduler, and the commit protocol fit together is narrated in
+[docs/architecture.md](docs/architecture.md).)
 
 To do that, Bengal runs your transaction through a static-analysis pass. It is a real
 execution: reads happen, so values that later steps depend on are available. But **writes
@@ -440,7 +442,8 @@ differs in:
   transaction's footprint up front and schedules around conflicts.
 - **Maps**: `TxnVarMap` tracks conflicts per key, rather than per map.
 - **Implementation**: [Free monads](https://typelevel.org/cats/datatypes/freemonad.html) with two
-  interpreters — one for the static-analysis pass, one for the transaction log.
+  interpreters — one for the static-analysis pass, one for the transaction log
+  ([docs/architecture.md](docs/architecture.md) walks the whole runtime).
 - **API**: cats-stm has `orElse` to bypass a retry; Bengal omits it (see below).
 - **Verification**: Bengal's commit and scheduling protocols are specified in TLA+ and
   model-checked in CI. See [Correctness](#correctness).
